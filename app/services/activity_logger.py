@@ -25,7 +25,11 @@ logger = logging.getLogger(__name__)
 
 # Publish events for other services or system components
 @stamina.retry(
-    on=(aiohttp.ClientError, asyncio.TimeoutError), attempts=5
+    on=(aiohttp.ClientError, asyncio.TimeoutError),
+    attempts=5,
+    wait_initial=1.0,
+    wait_max=30,
+    wait_jitter=3.0
 )
 async def publish_event(event: SystemEventBaseModel, topic_name: str):
     timeout_settings = aiohttp.ClientTimeout(total=10.0)
@@ -86,7 +90,7 @@ def activity_logger(on_start=True, on_completion=True, on_error=True):
             integration_id = str(integration.id) if integration else None
             action_id = func.__name__.replace("action_", "")
             action_config = kwargs.get("action_config")
-            config_data = action_config.data if action_config else {} or {}
+            config_data = action_config.dict() if action_config else {} or {}
             if on_start:
                 await publish_event(
                     event=IntegrationActionStarted(
