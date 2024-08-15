@@ -18,12 +18,13 @@ _portal = GundiClient()
 logger = logging.getLogger(__name__)
 
 
-async def execute_action(integration_id: str, action_id: str, config_overrides: dict = None):
+async def execute_action(integration_id: str, action_id: str, config_overrides: dict = None, config: dict = None):
     """
     Interface for executing actions.
     :param integration_id: The UUID of the integration
     :param action_id: "test_auth", "pull_observations", "pull_events"
     :param config_overrides: Optional dictionary with configuration overrides
+    :param config: Optional dictionary with an already-set configuration (to be passed to action handler as it is)
     :return: action result if any, or raise an exception
     """
     logger.info(f"Executing action '{action_id}' for integration '{integration_id}'...")
