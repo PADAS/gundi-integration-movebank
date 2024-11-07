@@ -17,12 +17,14 @@ async def test_set_integration_state(mocker, mock_redis, integration_v2):
         integration_id=integration_id,
         action_id="pull_observations",
         # No source set
-        state=state
+        state=state,
+        expire=3600
     )
 
     mock_redis.Redis.return_value.set.assert_called_once_with(
         f"integration_state.{integration_id}.pull_observations.no-source",
-        '{"last_execution": "' + execution_timestamp + '"}'
+        '{"last_execution": "' + execution_timestamp + '"}',
+        ex=3600
     )
 
 
@@ -59,12 +61,14 @@ async def test_delete_integration_state(mocker, mock_redis, integration_v2):
         integration_id=integration_id,
         action_id="pull_observations",
         # No source set
-        state=state
+        state=state,
+        expire=3600
     )
 
     mock_redis.Redis.return_value.set.assert_called_once_with(
         f"integration_state.{integration_id}.pull_observations.no-source",
-        '{"last_execution": "' + execution_timestamp + '"}'
+        '{"last_execution": "' + execution_timestamp + '"}',
+        ex=3600
     )
 
     # then delete the state
@@ -91,12 +95,14 @@ async def test_set_source_state(mocker, mock_redis, integration_v2, mock_integra
         integration_id=integration_id,
         action_id="pull_observations",
         source_id=source_id,
-        state=mock_integration_state
+        state=mock_integration_state,
+        expire=3600
     )
 
     mock_redis.Redis.return_value.set.assert_called_once_with(
         f"integration_state.{integration_id}.pull_observations.{source_id}",
-        json.dumps(mock_integration_state, default=str)
+        json.dumps(mock_integration_state, default=str),
+        ex=3600
     )
 
 
@@ -131,12 +137,14 @@ async def test_delete_state_source_state(mocker, mock_redis, integration_v2, moc
         integration_id=integration_id,
         action_id="pull_observations",
         source_id=source_id,
-        state=mock_integration_state
+        state=mock_integration_state,
+        expire=3600
     )
 
     mock_redis.Redis.return_value.set.assert_called_once_with(
         f"integration_state.{integration_id}.pull_observations.{source_id}",
-        json.dumps(mock_integration_state, default=str)
+        json.dumps(mock_integration_state, default=str),
+        ex=3600
     )
 
     # delete state
