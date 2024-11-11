@@ -32,7 +32,7 @@ async def action_auth(integration, action_config: AuthenticateConfig):
 
     if token:
         logger.info(f"Auth successful for integration '{integration.name}'. Token: '{token['api-token']}'")
-        return True
+        return {"valid_credentials": True}
     else:
         logger.error(f"Auth unsuccessful for integration {integration}.")
-        return False
+        return {"valid_credentials": False}
