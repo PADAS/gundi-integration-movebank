@@ -25,7 +25,7 @@ async def action_auth(integration, action_config: AuthenticateConfig):
     mb_client = client.MovebankClient(
         base_url=integration.base_url,
         username=action_config.username,
-        password=action_config.password
+        password=action_config.password.get_secret_value(),
     )
 
     token = await mb_client.get_token()

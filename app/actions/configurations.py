@@ -1,12 +1,12 @@
 from datetime import datetime, timezone
-from pydantic import Field
+from pydantic import Field, SecretStr
 
 from app.actions import AuthActionConfiguration, PullActionConfiguration
 
 
 class AuthenticateConfig(AuthActionConfiguration):
     username: str
-    password: str
+    password: SecretStr = Field(..., format="password")
 
 
 class FetchIndividualEventsConfig(PullActionConfiguration):
