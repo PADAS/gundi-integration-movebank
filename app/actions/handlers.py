@@ -28,7 +28,11 @@ async def action_auth(integration, action_config: AuthenticateConfig):
         password=action_config.password.get_secret_value(),
     )
 
-    token = await mb_client.get_token()
+    try:
+        token = await mb_client.get_token()
+    except Exception as e:
+        logger.exception(f"Auth unsuccessful for integration {integration}. Exception: {e}")
+        return {"valid_credentials": False}
 
     if token:
         logger.info(f"Auth successful for integration '{integration.name}'. Token: '{token['api-token']}'")

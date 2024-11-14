@@ -16,19 +16,26 @@ _portal = GundiClient()
 logger = logging.getLogger(__name__)
 
 
-async def execute_action(integration_id: str, action_id: str, config_overrides: dict = None, config_data: dict = None):
+async def execute_action(
+        integration_id: str,
+        action_id: str,
+        config_overrides: dict = None,
+        config_data: dict = None,
+        use_cache: bool = True
+):
     """
     Interface for executing actions.
     :param integration_id: The UUID of the integration
     :param action_id: "test_auth", "pull_observations", "pull_events"
     :param config_overrides: Optional dictionary with configuration overrides
     :param config_data: Optional dictionary with an already-set configuration (to be passed to action handler as it is)
+    :param use_cache: Whether to use cached integration configuration
     :return: action result if any, or raise an exception
     """
     logger.info(f"Executing action '{action_id}' for integration '{integration_id}'...")
     integration_config_manager = IntegrationConfigurationManager()
     try:  # Get the integration config from cache
-        integration = await integration_config_manager.get_integration_config(str(integration_id))
+        integration = await integration_config_manager.get_integration_config(str(integration_id), use_cache)
     except Exception as e:
         message = f"Error retrieving configuration for integration '{integration_id}': {e}"
         logger.exception(message)

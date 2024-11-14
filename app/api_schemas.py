@@ -7,3 +7,4 @@ class ActionRequest(BaseModel):
     run_in_background: bool = False
     config_overrides: dict = None
     config: dict = None
+    use_cache: bool = True

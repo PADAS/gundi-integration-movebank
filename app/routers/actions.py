@@ -33,7 +33,8 @@ async def execute(
             integration_id=request.integration_id,
             action_id=request.action_id,
             config_overrides=request.config_overrides,
-            config_data=request.config
+            config_data=request.config,
+            use_cache=request.use_cache
         )
         return {"message": "Action execution started in background"}
     else:
@@ -41,5 +42,6 @@ async def execute(
             integration_id=request.integration_id,
             action_id=request.action_id,
             config_overrides=request.config_overrides,
-            config_data=request.config
+            config_data=request.config,
+            use_cache=request.use_cache
         )

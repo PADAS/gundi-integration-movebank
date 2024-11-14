@@ -86,12 +86,16 @@ async def execute(
             integration_id=json_payload.get("integration_id"),
             action_id=json_payload.get("action_id"),
             config_overrides=json_payload.get("config_overrides"),
+            config_data=json_payload.get("config"),
+            use_cache=json_payload.get("use_cache"),
         )
     else:
         await execute_action(
             integration_id=json_payload.get("integration_id"),
             action_id=json_payload.get("action_id"),
             config_overrides=json_payload.get("config_overrides"),
+            config_data=json_payload.get("config"),
+            use_cache=json_payload.get("use_cache"),
         )
     return {}
 
