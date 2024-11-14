@@ -12,10 +12,12 @@ api_client = TestClient(app)
 @pytest.mark.asyncio
 async def test_execute_action_from_pubsub(
         mocker, mock_gundi_client_v2, mock_publish_event, mock_action_handlers,
-        event_v2_cloud_event_headers, event_v2_cloud_event_payload
+        event_v2_cloud_event_headers, event_v2_cloud_event_payload,
+        mock_empty_redis
 ):
+    mocker.patch("app.services.state.redis", mock_empty_redis)
+    mocker.patch("app.services.state._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
-    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
 
@@ -35,9 +37,11 @@ async def test_execute_action_from_pubsub(
 async def test_execute_action_from_api(
         mocker, mock_gundi_client_v2, integration_v2,
         mock_publish_event, mock_action_handlers,
+        mock_empty_redis
 ):
+    mocker.patch("app.services.state.redis", mock_empty_redis)
+    mocker.patch("app.services.state._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
-    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
 
@@ -59,9 +63,11 @@ async def test_execute_action_from_api(
 async def test_execute_action_from_api_with_config_overrides(
         mocker, mock_gundi_client_v2, integration_v2,
         mock_publish_event, mock_action_handlers,
+        mock_empty_redis
 ):
+    mocker.patch("app.services.state.redis", mock_empty_redis)
+    mocker.patch("app.services.state._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
-    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
 
@@ -87,10 +93,12 @@ async def test_execute_action_from_api_with_config_overrides(
 @pytest.mark.asyncio
 async def test_execute_action_from_pubsub_with_config_overrides(
         mocker, mock_gundi_client_v2, mock_publish_event, mock_action_handlers,
-        event_v2_cloud_event_headers, event_v2_cloud_event_payload_with_config_overrides
+        event_v2_cloud_event_headers, event_v2_cloud_event_payload_with_config_overrides,
+        mock_empty_redis
 ):
+    mocker.patch("app.services.state.redis", mock_empty_redis)
+    mocker.patch("app.services.state._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
-    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
 
@@ -116,9 +124,11 @@ async def test_execute_action_from_pubsub_with_config_overrides(
 async def test_execute_action_from_api_with_invalid_config(
         mocker, mock_gundi_client_v2, integration_v2,
         mock_publish_event, mock_action_handlers,
+        mock_empty_redis
 ):
+    mocker.patch("app.services.state.redis", mock_empty_redis)
+    mocker.patch("app.services.state._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
-    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
 
