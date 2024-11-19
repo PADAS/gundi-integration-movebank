@@ -56,16 +56,14 @@ class IntegrationConfigurationManager:
         db = kwargs.get("db", settings.REDIS_STATE_DB)
         self.db_client = redis.Redis(host=host, port=port, db=db)
 
-    async def get_integration_config(self, integration_id: str, use_cache: bool) -> Integration:
-        value = {}
-        if use_cache:
-            for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
-                with attempt:
-                    json_value = await self.db_client.get(f"integration_config.{integration_id}")
+    async def get_integration_config(self, integration_id: str) -> Integration:
+        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
+            with attempt:
+                json_value = await self.db_client.get(f"integration_config.{integration_id}")
 
-            value = json.loads(json_value) if json_value else {}
+        value = json.loads(json_value) if json_value else {}
 
-        if not value or not use_cache:
+        if not value:
             async for attempt in stamina.retry_context(
                     on=httpx.HTTPError,
                     wait_initial=1.0,
