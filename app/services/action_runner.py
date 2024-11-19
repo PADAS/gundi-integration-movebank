@@ -16,11 +16,7 @@ _portal = GundiClient()
 logger = logging.getLogger(__name__)
 
 
-async def execute_action(
-        integration_id: str,
-        action_id: str,
-        config_overrides: dict = None,
-):
+async def execute_action(integration_id: str, action_id: str, config_overrides: dict = None):
     """
     Interface for executing actions.
     :param integration_id: The UUID of the integration
