@@ -1,4 +1,5 @@
 from movebank_client import MovebankClient
+from movebank_client.errors import MBClientError
 
 from app.actions.configurations import AuthenticateConfig
 from app.services.errors import ConfigurationNotFound
