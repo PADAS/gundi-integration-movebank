@@ -85,7 +85,7 @@ idna==3.7
     #   yarl
 marshmallow==3.21.3
     # via environs
-movebank-client==1.1.0
+movebank-client==1.1.1
     # via -r requirements.in
 multidict==6.0.5
     # via

@@ -30,12 +30,12 @@ async def action_auth(integration, action_config: AuthenticateConfig):
 
     try:
         token = await mb_client.get_token()
-    except client.MBClientError:
+    except client.MBForbiddenError:
         logger.exception(f"Auth unsuccessful for integration {str(integration.id)}. MB returned 403 (wrong credentials)")
         return {"valid_credentials": False, "message": "Invalid credentials"}
-    except Exception as e:
+    except client.MBClientError as e:
         logger.exception(f"Auth action failed for integration {str(integration.id)}. Exception: {e}")
-        return {"valid_credentials": False, "exception": e}
+        return {"error": "An internal error occurred while trying to test credentials. Please try again later."}
     else:
         if token:
             logger.info(f"Auth successful for integration '{integration.name}'. Token: '{token['api-token']}'")
