@@ -16,13 +16,12 @@ _portal = GundiClient()
 logger = logging.getLogger(__name__)
 
 
-async def execute_action(integration_id: str, action_id: str, config_overrides: dict = None, config_data: dict = None):
+async def execute_action(integration_id: str, action_id: str, config_overrides: dict = None):
     """
     Interface for executing actions.
     :param integration_id: The UUID of the integration
     :param action_id: "test_auth", "pull_observations", "pull_events"
     :param config_overrides: Optional dictionary with configuration overrides
-    :param config_data: Optional dictionary with an already-set configuration (to be passed to action handler as it is)
     :return: action result if any, or raise an exception
     """
     logger.info(f"Executing action '{action_id}' for integration '{integration_id}'...")
@@ -47,35 +46,31 @@ async def execute_action(integration_id: str, action_id: str, config_overrides: 
             content=jsonable_encoder({"detail": message}),
         )
 
-    # If "config" variable present in the request, we bypass the integration/config retrieval from the portal
-    if config_data:
-        config = config_data
-    else:
-        # Look for the configuration of the action being executed
-        action_config = find_config_for_action(
-            configurations=integration.configurations,
-            action_id=action_id
+    # Look for the configuration of the action being executed
+    action_config = find_config_for_action(
+        configurations=integration.configurations,
+        action_id=action_id
+    )
+    if not action_config and not config_overrides:
+        message = f"Configuration for action '{action_id}' for integration {str(integration.id)} " \
+                  f"is missing. Please fix the integration setup in the portal or include a config to override."
+        logger.error(message)
+        await publish_event(
+            event=IntegrationActionFailed(
+                payload=ActionExecutionFailed(
+                    integration_id=integration_id,
+                    action_id=action_id,
+                    error=f"Configuration missing for action '{action_id}'",
+                    config_data={"configurations": [i.dict() for i in integration.configurations]},
+                )
+            ),
+            topic_name=settings.INTEGRATION_EVENTS_TOPIC,
         )
-        if not action_config:
-            message = f"Configuration for action '{action_id}' for integration {str(integration.id)} " \
-                      f"is missing. Please fix the integration setup in the portal."
-            logger.error(message)
-            await publish_event(
-                event=IntegrationActionFailed(
-                    payload=ActionExecutionFailed(
-                        integration_id=integration_id,
-                        action_id=action_id,
-                        error=f"Configuration missing for action '{action_id}'",
-                        config_data={"configurations": [i.dict() for i in integration.configurations]},
-                    )
-                ),
-                topic_name=settings.INTEGRATION_EVENTS_TOPIC,
-            )
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content=jsonable_encoder({"detail": message}),
-            )
-        config = action_config.data
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=jsonable_encoder({"detail": message}),
+        )
+    config = action_config.data if action_config else {}
     try:  # Execute the action
         handler, config_model = action_handlers[action_id]
         if config_overrides:
