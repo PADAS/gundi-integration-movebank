@@ -1,10 +1,10 @@
 from datetime import datetime, timezone
 from pydantic import Field, SecretStr
 
-from app.actions import AuthActionConfiguration, PullActionConfiguration
+from app.actions import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
 
 
-class AuthenticateConfig(AuthActionConfiguration):
+class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     username: str
     password: SecretStr = Field(..., format="password")
 
