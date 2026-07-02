@@ -1037,6 +1037,7 @@ def mock_pull_observations_action_handler():
     mock_pull_observations_action_handler = AsyncMock()
     mock_pull_observations_action_handler.return_value = {"observations_extracted": 10}
     mock_pull_observations_action_handler.crontab_schedule = CrontabSchedule.parse_obj_from_crontab("*/10 * * * * -5")
+    del mock_pull_observations_action_handler.action_title
     return mock_pull_observations_action_handler
 
 
@@ -1045,6 +1046,7 @@ def mock_pull_observations_by_date_action_handler():
     mock_pull_observations_by_date_action_handler = AsyncMock()
     mock_pull_observations_by_date_action_handler.return_value = {"observations_extracted": 10}
     del mock_pull_observations_by_date_action_handler.crontab_schedule
+    del mock_pull_observations_by_date_action_handler.action_title
     return mock_pull_observations_by_date_action_handler
 
 
@@ -1052,6 +1054,7 @@ def mock_pull_observations_by_date_action_handler():
 def mock_push_observations_handler():
     mock_push_observations_handler = AsyncMock()
     mock_push_observations_handler.return_value = {"observations_pushed": 1}
+    del mock_push_observations_handler.action_title
     return mock_push_observations_handler
 
 
@@ -1146,6 +1149,7 @@ def mock_auth_action_handlers():
         "username": "me@example.com",
         "password": "something-fancy",
     }
+    del mock_action_handler.action_title
     mock_action_handlers = {
         "auth": (mock_action_handler, MockAuthenticateActionConfiguration, None)
     }

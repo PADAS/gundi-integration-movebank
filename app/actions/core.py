@@ -37,6 +37,15 @@ class ExecutableActionMixin:
     pass
 
 
+def action_title(title: str):
+    """Set the display name used when registering the action in Gundi,
+    instead of the default derived from the handler function name."""
+    def decorator(func):
+        setattr(func, "action_title", title)
+        return func
+    return decorator
+
+
 class PushActionConfiguration(ActionConfiguration):
     pass
 
