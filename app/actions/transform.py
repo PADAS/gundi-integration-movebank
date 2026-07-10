@@ -7,8 +7,14 @@ from dateutil.parser import parse as parse_date
 logger = logging.getLogger(__name__)
 
 
+def _ensure_utc(val: datetime) -> datetime:
+    return val.replace(tzinfo=timezone.utc) if val.tzinfo is None else val.astimezone(timezone.utc)
+
+
 def human_friendly_timedelta(td: timedelta) -> str:
     """Format a timedelta as e.g. '2d, 3h, 4m' (sub-minute becomes '0m')."""
+    if td < timedelta(0):
+        return "-" + human_friendly_timedelta(-td)
     days = td.days
     hours, remainder = divmod(td.seconds, 3600)
     minutes, _ = divmod(remainder, 60)
@@ -35,7 +41,7 @@ def build_observation(*, event: dict, device_name: str) -> Optional[dict]:
     or future-dated).
     """
     try:
-        recorded_at = parse_date(event.get("timestamp")).replace(tzinfo=timezone.utc)
+        recorded_at = _ensure_utc(parse_date(event.get("timestamp")))
     except Exception:
         logger.warning(f"unable to parse timestamp: {event.get('timestamp')}")
         return None
@@ -46,7 +52,7 @@ def build_observation(*, event: dict, device_name: str) -> Optional[dict]:
 
     if update_ts := event.get("update_ts"):
         try:
-            updated_at = parse_date(update_ts).replace(tzinfo=timezone.utc)
+            updated_at = _ensure_utc(parse_date(update_ts))
             additional["update_latency"] = human_friendly_timedelta(updated_at - recorded_at)
         except Exception:
             pass
@@ -61,7 +67,11 @@ def build_observation(*, event: dict, device_name: str) -> Optional[dict]:
         x, y = 0.0, 0.0
         recorded_at += timedelta(milliseconds=1)
     else:
-        x, y = float(lon), float(lat)
+        try:
+            x, y = float(lon), float(lat)
+        except (TypeError, ValueError):
+            logger.warning(f"unable to parse coordinates: lon={lon!r} lat={lat!r}")
+            return None
 
     if not individual_id or recorded_at > datetime.now(tz=timezone.utc):
         return None

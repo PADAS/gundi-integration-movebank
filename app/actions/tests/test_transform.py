@@ -64,3 +64,19 @@ def test_human_friendly_timedelta():
 def test_chunks():
     assert list(chunks([1, 2, 3, 4, 5], 2)) == [[1, 2], [3, 4], [5]]
     assert list(chunks([], 2)) == []
+
+
+def test_build_observation_converts_offset_aware_timestamps_to_utc():
+    event = {**GPS_EVENT, "timestamp": "2026-01-01 10:00:00+02:00"}
+    obs = build_observation(event=event, device_name="Aquila")
+    assert obs["recorded_at"] == "2026-01-01T08:00:00+00:00"
+
+
+def test_human_friendly_timedelta_negative():
+    assert human_friendly_timedelta(timedelta(hours=-1)) == "-1h"
+    assert human_friendly_timedelta(timedelta(days=-2, hours=-3)) == "-2d, 3h"
+
+
+def test_build_observation_drops_unparseable_coordinates():
+    event = {**GPS_EVENT, "location_lat": "N/A", "location_long": "N/A"}
+    assert build_observation(event=event, device_name="Aquila") is None
