@@ -5,7 +5,6 @@ from app.actions.client import generate_individuals
 from app.actions.configurations import AuthenticateConfig, PullObservationsConfig, PullEventsForIndividualConfig
 from app.services.action_scheduler import crontab_schedule, trigger_action
 from app.services.activity_logger import activity_logger
-from app.services.state import IntegrationStateManager
 
 
 logger = logging.getLogger(__name__)
