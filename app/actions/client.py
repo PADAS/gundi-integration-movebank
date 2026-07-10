@@ -7,7 +7,6 @@ from dateutil.parser import parse as parse_date
 from movebank_client import MovebankClient
 from movebank_client.errors import MBClientError, MBForbiddenError
 
-from app.actions.configurations import AuthenticateConfig
 from app.services.errors import ConfigurationNotFound
 from app.services.utils import find_config_for_action
 
@@ -15,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 def get_auth_config(integration):
+    from app.actions.configurations import AuthenticateConfig
+
     # Look for the login credentials, needed for any action
     auth_config = find_config_for_action(
         configurations=integration.configurations,

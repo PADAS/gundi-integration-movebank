@@ -1,27 +1,33 @@
-from datetime import datetime, timezone
 from pydantic import Field, SecretStr
 
-from app.actions import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
+from app.actions import AuthActionConfiguration, PullActionConfiguration
+from app.actions.client import Individual
+from app.actions.core import InternalActionConfiguration
 
 
-class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
+class AuthenticateConfig(AuthActionConfiguration):
     username: str
     password: SecretStr = Field(..., format="password")
 
 
-class FetchIndividualEventsConfig(PullActionConfiguration):
-    start_time: datetime
-    study_id: int
-    individual_id: int
-
-
-class FetchStudyIndividualsConfig(PullActionConfiguration):
+class PullObservationsConfig(PullActionConfiguration):
     study_id: str = Field(
-        title='Movebank Study IDs',
-        description='ID of the desired Movebank Study.',
+        ...,
+        title="Movebank Study ID",
+        description="ID of the Movebank study to pull observations from.",
     )
-    start_time: datetime = Field(
-        title='Start Datetime',
-        description='Datetime events are going to be fetched from.',
-        default=datetime.now(tz=timezone.utc)
+    maximum_lookback_hours: int = Field(
+        24,
+        title="Maximum Lookback (hours)",
+        description=(
+            "How far back to fetch events for an individual that has no saved state yet. "
+            "Override this on a manual run to backfill historical data."
+        ),
     )
+
+
+class PullEventsForIndividualConfig(InternalActionConfiguration):
+    """Config for the internal sub-action that pulls events for one individual."""
+    study_id: str
+    individual: Individual
+    maximum_lookback_hours: int = 24

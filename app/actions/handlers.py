@@ -7,7 +7,7 @@ import app.services.gundi as gundi_tools
 import app.settings.integration as settings
 import app.actions.client as client
 
-from app.actions.configurations import AuthenticateConfig, FetchStudyIndividualsConfig, FetchIndividualEventsConfig
+from app.actions.configurations import AuthenticateConfig
 from app.services.activity_logger import activity_logger
 from app.services.state import IntegrationStateManager
 
