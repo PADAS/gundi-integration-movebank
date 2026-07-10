@@ -169,21 +169,70 @@ async def test_pull_events_skips_when_all_sensors_are_current(
     assert result == {"skipped": "no_new_data"}
 
 
+def make_counting_events_generator(events_per_call):
+    calls = {"count": 0}
+
+    async def _gen(**kwargs):
+        base = calls["count"] * 10000
+        calls["count"] += 1
+        for i in range(events_per_call):
+            yield {
+                "event_id": str(base + i),
+                "timestamp": "2026-06-17 00:00:00.000",
+                "location_lat": "1.5",
+                "location_long": "2.5",
+                "individual_id": "111",
+                "sensor_type_id": "653",
+            }
+    return _gen, calls
+
+
 @pytest.mark.asyncio
 async def test_pull_events_respects_max_records_cap(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
-    # 2500 events in one window: cap stops processing at >= 2000.
-    events = [_gps_event(i, "2026-06-30 10:00:00.000") for i in range(2500)]
-    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    # 15-day lookback with the default 5-day window => 3 windows would run,
+    # but 1200 events per window crosses the 2000 cap after window 2.
+    gen, calls = make_counting_events_generator(1200)
+    mock_movebank_client.get_individual_events_by_time = gen
     mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
 
     result = await action_pull_events_for_individual(
         integration=integration,
-        # High-frequency path: number_of_events > 5000 shrinks the window, but a
-        # single window still returned everything here; the cap must still hold
-        # across windows.
-        action_config=_sub_action_config(individual_overrides={"number_of_events": "6000"}),
+        action_config=_sub_action_config(maximum_lookback_hours=360),
     )
-    assert result["observations_sent"] == 2500  # first window completes...
-    # ...but no further windows ran (cap reached after the first).
+    assert result["observations_sent"] == 2400
+    assert calls["count"] == 2  # third window never ran
+
+
+@pytest.mark.asyncio
+async def test_pull_events_zero_range_high_frequency_individual_terminates(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # timestamp_end == timestamp_start would make the density window zero -> guard must fall back.
+    mock_movebank_client.get_individual_events_by_time = make_events_generator([])
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    result = await action_pull_events_for_individual(
+        integration=integration,
+        action_config=_sub_action_config(individual_overrides={
+            "number_of_events": "6000",
+            "timestamp_start": "2026-07-01 00:00:00.000",
+            "timestamp_end": "2026-07-01 00:00:00.000",
+        }),
+    )
+    assert result["observations_sent"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pull_events_does_not_advance_cursor_when_send_fails(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    events = [_gps_event(100, "2026-01-01 10:00:00.000")]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(side_effect=Exception("gundi down")))
+
+    with pytest.raises(Exception):
+        await action_pull_events_for_individual(
+            integration=integration, action_config=_sub_action_config()
+        )
+    assert (str(integration.id), "pull_events_for_individual", "111") not in mock_state_store

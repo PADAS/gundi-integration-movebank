@@ -153,12 +153,16 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     # Size the fetch window by event density: high-frequency individuals get a
     # window that should hold roughly HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD events,
     # assuming an even distribution over the individual's active range.
-    if ind.number_of_events > HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD and ind.timestamp_end:
+    if (ind.number_of_events or 0) > HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD and ind.timestamp_end:
         total_seconds = (ind.timestamp_end - ind.timestamp_start).total_seconds()
         batch_window_size = timedelta(
             seconds=(HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD / ind.number_of_events) * total_seconds
         )
     else:
+        batch_window_size = DEFAULT_BATCH_WINDOW
+    if batch_window_size <= timedelta(0):
+        # A zero/negative window (timestamp_end <= timestamp_start) would never
+        # advance current_window_start and spin the fetch loop forever.
         batch_window_size = DEFAULT_BATCH_WINDOW
 
     logger.info(
@@ -180,12 +184,17 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
         while current_window_start <= highest_date and total_observations_sent < MAXIMUM_RECORDS_PER_INDIVIDUAL:
             end_at = min(highest_date, current_window_start + batch_window_size)
 
-            # One request per sensor type, each from its own cursor.
+            # One request per sensor type, each from its own cursor. Events are
+            # grouped by the requesting sensor (each fetch is already scoped to
+            # one sensor type), so cursor advancement doesn't depend on Movebank
+            # echoing sensor_type_id back on every event.
             events = []
+            events_by_sensor = {}
             for sensor_type_id in sensor_type_ids:
                 sensor_start = sensor_type_timestamps[sensor_type_id]
                 if sensor_start > end_at:
                     continue  # this sensor is already past the window
+                sensor_events = []
                 async for event in mb.get_individual_events_by_time(
                     study_id=action_config.study_id,
                     individual_id=ind.id,
@@ -194,7 +203,15 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                     sensor_type_ids=[sensor_type_id],
                     minimum_event_id=minimum_event_ids[sensor_type_id],
                 ):
-                    events.append(event)
+                    sensor_events.append(event)
+                events_by_sensor[sensor_type_id] = sensor_events
+                events.extend(sensor_events)
+
+            if not events_by_sensor:
+                # Every sensor was already past this window: advance without
+                # touching the quiet flag or the saved cursor (v1 behavior).
+                current_window_start = current_window_start + batch_window_size
+                continue
 
             observations = [
                 obs for event in events
@@ -204,12 +221,6 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                 await send_observations_to_gundi(observations=batch, integration_id=integration_id)
 
             # Advance per-sensor cursors from what actually came back.
-            events_by_sensor = {}
-            for event in events:
-                try:
-                    events_by_sensor.setdefault(int(event.get("sensor_type_id")), []).append(event)
-                except (TypeError, ValueError):
-                    continue
             for sensor_type_id in sensor_type_ids:
                 sensor_events = events_by_sensor.get(sensor_type_id, [])
                 sensor_timestamps = []
