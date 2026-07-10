@@ -33,6 +33,13 @@ def test_individual_tolerates_empty_timestamps():
     assert ind.timestamp_end is None
 
 
+def test_individual_tolerates_none_timestamps():
+    row = {**INDIVIDUAL_ROW, "timestamp_start": None, "timestamp_end": None}
+    ind = Individual.parse_obj(row)
+    assert ind.timestamp_start is None
+    assert ind.timestamp_end is None
+
+
 def test_generate_individuals_skips_bad_rows():
     bad_row = {**INDIVIDUAL_ROW, "number_of_events": "not-a-number"}
     result = list(generate_individuals([INDIVIDUAL_ROW, bad_row]))

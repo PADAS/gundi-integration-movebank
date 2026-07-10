@@ -46,6 +46,8 @@ class Individual(pydantic.BaseModel):
 
     @pydantic.validator('timestamp_start', 'timestamp_end')
     def clean_timestamp(cls, val):
+        if val is None:
+            return None
         if isinstance(val, str):
             try:
                 val = parse_date(val)
