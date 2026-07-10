@@ -46,3 +46,5 @@ def test_pull_events_for_individual_config_is_internal():
 def test_auth_config_unchanged():
     config = AuthenticateConfig(username="u", password="p")
     assert config.password.get_secret_value() == "p"
+    from app.actions.core import ExecutableActionMixin
+    assert issubclass(AuthenticateConfig, ExecutableActionMixin)

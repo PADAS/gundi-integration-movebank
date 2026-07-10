@@ -1,11 +1,11 @@
 from pydantic import Field, SecretStr
 
-from app.actions import AuthActionConfiguration, PullActionConfiguration
+from app.actions import AuthActionConfiguration, ExecutableActionMixin, PullActionConfiguration
 from app.actions.client import Individual
 from app.actions.core import InternalActionConfiguration
 
 
-class AuthenticateConfig(AuthActionConfiguration):
+class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     username: str
     password: SecretStr = Field(..., format="password")
 
