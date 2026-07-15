@@ -95,7 +95,7 @@ async def forward_payload_to_diagnostic_url(
         await _validate_diagnostic_url(destination_url)
         metadata = {
             "integration_id": integration_id,
-            "received_at": datetime.datetime.now(datetime.UTC).isoformat() + "Z",
+            "received_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         if isinstance(json_content, dict):
             body = {**json_content, "__gundi_diagnostic_metadata": metadata}
@@ -149,7 +149,12 @@ async def process_webhook(request: Request):
         # Try to relate the request to an integration
         integration = await get_integration(request=request)
         if not integration:
-            logger.warning(f"No integration found for webhook request: headers: {request.headers}, query_params: {request.query_params}")
+            logger.warning(
+                "No integration found for webhook request: "
+                f"consumer_username: {request.headers.get('x-consumer-username')}, "
+                f"integration_id header: {request.headers.get('x-gundi-integration-id')}, "
+                f"integration_id param: {request.query_params.get('integration_id')}"
+            )
             return {}
         # Look for the handler function in webhooks/handlers.py
         webhook_handler, payload_model, config_model = get_webhook_handler()
