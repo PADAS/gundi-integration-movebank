@@ -5,7 +5,7 @@ import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status, BackgroundTasks
 from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import RequestValidationError, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from app.routers import actions, webhooks, config_events
 import app.settings as settings
@@ -117,15 +117,16 @@ async def push_data(
     logger.debug(f"Attributes: {attributes}")
     destination_id = attributes.get("destination_id")
     if not destination_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing required attribute: 'destination_id'"
-        )
-    return await execute_action(
+        # Ack malformed messages (2xx) — raising here would make PubSub
+        # redeliver a message that can never succeed.
+        logger.error(f"PubSub message missing required attribute 'destination_id': {attributes}")
+        return {}
+    await execute_action(
         integration_id=destination_id,
         data=json_payload,
         metadata=attributes
     )
+    return {}
 
 app.include_router(
     actions.router, prefix="/v1/actions", tags=["actions"], responses={}
