@@ -3,7 +3,6 @@ import datetime
 import importlib
 import ipaddress
 import logging
-import traceback
 from urllib.parse import urlparse
 import httpx
 import stamina

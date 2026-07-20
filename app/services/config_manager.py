@@ -45,7 +45,7 @@ class IntegrationConfigurationManager:
                 await self.db_client.set(webhook_key, webhook_configuration.json(), ttl)
             return integration_details
 
-    async def get_action_configuration(self, integration_id: str, action_id: str, ttl=None) -> IntegrationActionConfiguration:
+    async def get_action_configuration(self, integration_id: str, action_id: str, ttl=None) -> Optional[IntegrationActionConfiguration]:
         key = self._get_action_config_key(integration_id, action_id)
         for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
