@@ -86,6 +86,16 @@ async def _validate_diagnostic_url(url: str) -> None:
             )
 
 
+def _redact_url(url: str) -> str:
+    """Host and path only — diagnostic URLs can carry credentials or tokens
+    in the userinfo or query string, which must not reach the logs."""
+    try:
+        parsed = urlparse(url)
+        return f"{parsed.hostname}{parsed.path}"
+    except Exception:
+        return "<unparseable url>"
+
+
 async def forward_payload_to_diagnostic_url(
     destination_url: str,
     integration_id: str,
@@ -104,12 +114,12 @@ async def forward_payload_to_diagnostic_url(
         response = await _get_diagnostic_client().post(destination_url, json=body)
         response.raise_for_status()
         logger.debug(
-            f"Diagnostic payload forwarded to '{destination_url}' "
+            f"Diagnostic payload forwarded to '{_redact_url(destination_url)}' "
             f"for integration '{integration_id}'. Status: {response.status_code}"
         )
     except Exception as e:
         logger.warning(
-            f"Diagnostic forwarding to '{destination_url}' failed for integration "
+            f"Diagnostic forwarding to '{_redact_url(destination_url)}' failed for integration "
             f"'{integration_id}': {type(e).__name__}: {e}"
         )
 

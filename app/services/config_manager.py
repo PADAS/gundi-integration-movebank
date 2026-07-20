@@ -1,4 +1,6 @@
 import json
+from typing import Optional
+
 import stamina
 import httpx
 import redis.asyncio as redis
@@ -54,7 +56,7 @@ class IntegrationConfigurationManager:
         integration_details = await self._reload_integration_from_gundi(integration_id, ttl)
         return integration_details.get_action_config(action_id)
 
-    async def get_webhook_configuration(self, integration_id: str, ttl=None) -> WebhookConfiguration:
+    async def get_webhook_configuration(self, integration_id: str, ttl=None) -> Optional[WebhookConfiguration]:
         key = self._get_webhook_config_key(integration_id)
         for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
