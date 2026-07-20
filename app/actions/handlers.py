@@ -9,7 +9,7 @@ from movebank_client import MovebankClient
 import app.actions.client as client
 from app.actions.client import IndividualState, generate_individuals
 from app.actions.configurations import AuthenticateConfig, PullObservationsConfig, PullEventsForIndividualConfig
-from app.actions.transform import build_observation, chunks
+from app.actions.transform import _ensure_utc, build_observation, chunks
 from app.services.action_scheduler import crontab_schedule, trigger_action
 from app.services.activity_logger import activity_logger
 from app.services.gundi import send_observations_to_gundi
@@ -21,7 +21,10 @@ state_manager = IntegrationStateManager()
 
 # Ported from the v1 integration — production-proven values.
 HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD = 5000  # events; above this, shrink the fetch window
-MAXIMUM_RECORDS_PER_INDIVIDUAL = 2000  # hard cap per individual per run
+# Per-run cap, checked between windows: once total processed reaches this, no
+# further windows are fetched. A single window may overshoot the cap — everything
+# fetched in a window is sent so its cursors can advance consistently.
+MAXIMUM_RECORDS_PER_INDIVIDUAL = 2000
 DEFAULT_BATCH_WINDOW = timedelta(days=5)
 QUIET_PERIOD_SECONDS = 3600  # skip an individual for this long after an empty window
 OBSERVATIONS_BATCH_SIZE = 200
@@ -227,7 +230,7 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                 sensor_event_ids = []
                 for event in sensor_events:
                     try:
-                        sensor_timestamps.append(parse_date(event.get("timestamp")).replace(tzinfo=timezone.utc))
+                        sensor_timestamps.append(_ensure_utc(parse_date(event.get("timestamp"))))
                     except Exception:
                         pass
                     try:

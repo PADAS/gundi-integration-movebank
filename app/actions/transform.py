@@ -63,7 +63,9 @@ def build_observation(*, event: dict, device_name: str) -> Optional[dict]:
     # Records without coordinates (e.g. accessory-measurements) are stored at
     # (0, 0) with a +1ms shift, so they don't collide with a GPS observation at
     # the same timestamp. Revisit when observations can be updated in EarthRanger.
-    if not lon or not lat:
+    # Only genuinely missing values count as "no coordinates" — Movebank CSV
+    # rows carry coordinates as strings, and a real "0.0" must not be fudged.
+    if lon in (None, "") or lat in (None, ""):
         x, y = 0.0, 0.0
         recorded_at += timedelta(milliseconds=1)
     else:

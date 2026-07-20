@@ -54,7 +54,7 @@ class Individual(pydantic.BaseModel):
                 val = parse_date(val)
             except Exception:
                 return None
-        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+        return val.astimezone(timezone.utc) if val.tzinfo else val.replace(tzinfo=timezone.utc)
 
 
 def generate_individuals(items):

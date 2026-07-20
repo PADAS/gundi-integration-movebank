@@ -56,6 +56,14 @@ def test_build_observation_drops_events_without_individual_id():
     assert build_observation(event={**GPS_EVENT, "individual_id": ""}, device_name="A") is None
 
 
+def test_build_observation_keeps_real_zero_coordinates():
+    event = {**GPS_EVENT, "location_lat": "0.0", "location_long": "0.0"}
+    obs = build_observation(event=event, device_name="Aquila")
+    assert obs["location"] == {"lat": 0.0, "lon": 0.0}
+    # No +1ms missing-coordinate fudge for a genuine (0, 0) fix.
+    assert obs["recorded_at"] == "2026-01-01T10:00:00+00:00"
+
+
 def test_human_friendly_timedelta():
     assert human_friendly_timedelta(timedelta(days=2, hours=3, minutes=4)) == "2d, 3h, 4m"
     assert human_friendly_timedelta(timedelta(seconds=30)) == "0m"

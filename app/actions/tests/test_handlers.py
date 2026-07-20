@@ -1,10 +1,12 @@
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
 
-from app.actions.configurations import PullObservationsConfig
-from app.actions.handlers import action_pull_observations
-from app.actions.tests.conftest import INDIVIDUAL_ROW
+from app.actions.client import IndividualState
+from app.actions.configurations import PullEventsForIndividualConfig, PullObservationsConfig
+from app.actions.handlers import action_pull_events_for_individual, action_pull_observations
+from app.actions.tests.conftest import INDIVIDUAL_ROW, make_events_generator
 
 
 @pytest.mark.asyncio
@@ -45,14 +47,6 @@ async def test_pull_observations_skips_unparseable_individuals(
 
     assert result == {"individuals_found": 1, "sub_actions_triggered": 1}
     assert mock_trigger.await_count == 1
-
-
-from datetime import datetime, timedelta, timezone
-
-from app.actions.client import IndividualState
-from app.actions.configurations import PullEventsForIndividualConfig
-from app.actions.handlers import action_pull_events_for_individual
-from app.actions.tests.conftest import make_events_generator
 
 
 def _sub_action_config(**overrides):

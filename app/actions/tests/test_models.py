@@ -26,6 +26,12 @@ def test_individual_coerces_naive_timestamps_to_utc():
     assert ind.number_of_events == 100
 
 
+def test_individual_normalizes_offset_aware_timestamps_to_utc():
+    row = {**INDIVIDUAL_ROW, "timestamp_start": "2025-01-01 02:00:00+02:00"}
+    ind = Individual.parse_obj(row)
+    assert ind.timestamp_start == datetime(2025, 1, 1, 0, 0, tzinfo=timezone.utc)
+
+
 def test_individual_tolerates_empty_timestamps():
     row = {**INDIVIDUAL_ROW, "timestamp_start": "", "timestamp_end": ""}
     ind = Individual.parse_obj(row)
