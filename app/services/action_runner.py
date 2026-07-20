@@ -5,7 +5,6 @@ import traceback
 from enum import Enum
 from typing import Optional
 
-import httpx
 import pydantic
 import stamina
 from gundi_client_v2 import GundiClient
@@ -20,7 +19,6 @@ from gundi_core.events import IntegrationActionFailed, ActionExecutionFailed, Lo
 from app.actions.core import PullActionConfiguration
 from .config_manager import IntegrationConfigurationManager
 from .state import IntegrationStateManager
-from .utils import find_config_for_action
 from .activity_logger import publish_event, log_action_activity
 
 _portal = GundiClient()
@@ -263,7 +261,7 @@ async def execute_action(
         }
         if parsed_data:
             handler_kwargs["data"] = parsed_data
-        if metadata:
+        if metadata is not None:
             handler_kwargs["metadata"] = metadata
         result = await asyncio.wait_for(
             handler(**handler_kwargs),
