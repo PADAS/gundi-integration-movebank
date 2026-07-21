@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -54,6 +55,38 @@ def _query_start_for_sensor(sensor_type_id: int, sensor_start: datetime) -> date
     if sensor_type_id == MovebankClient.MOVEBANK_SENSOR_TYPE_LABEL_TO_ID["accessory-measurements"]:
         return sensor_start - timedelta(hours=settings.ACCESSORY_SETTLING_HOURS)
     return sensor_start
+
+
+def _advance_watermarks(state, events, sensor_type_ids, sensor_type_timestamps, minimum_event_ids):
+    """Per-sensor cursor advancement shared by the steady-state pull and the
+    backfill sub-action: regroups a flat event list by each event's own
+    sensor_type_id field, then advances the timestamp/event-id cursor for each
+    sensor type from what actually came back (event-id cursor still advances
+    on unparseable timestamps so junk records aren't refetched forever)."""
+    events_by_sensor = {}
+    for e in events:
+        try:
+            events_by_sensor.setdefault(int(e.get("sensor_type_id")), []).append(e)
+        except (TypeError, ValueError):
+            continue
+    for stid in sensor_type_ids:
+        se = events_by_sensor.get(stid, [])
+        stamps, ids = [], []
+        for e in se:
+            try:
+                stamps.append(_ensure_utc(parse_date(e.get("timestamp"))))
+            except Exception:
+                pass
+            try:
+                ids.append(int(e.get("event_id")))
+            except (TypeError, ValueError):
+                pass
+        if stamps or ids:
+            new_latest = max(stamps) if stamps else sensor_type_timestamps[stid]
+            new_max = max(ids) if ids else minimum_event_ids[stid] - 1
+            state.update_sensor_state(stid, new_latest, new_max)
+            sensor_type_timestamps[stid] = new_latest
+            minimum_event_ids[stid] = new_max + 1
 
 
 async def action_auth(integration, action_config: AuthenticateConfig):
@@ -252,29 +285,7 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                 await send_observations_to_gundi(observations=batch, integration_id=integration_id)
 
             # Advance per-sensor cursors from what actually came back.
-            for sensor_type_id in sensor_type_ids:
-                sensor_events = events_by_sensor.get(sensor_type_id, [])
-                sensor_timestamps = []
-                sensor_event_ids = []
-                for event in sensor_events:
-                    try:
-                        sensor_timestamps.append(_ensure_utc(parse_date(event.get("timestamp"))))
-                    except Exception:
-                        pass
-                    try:
-                        sensor_event_ids.append(int(event.get("event_id")))
-                    except (TypeError, ValueError):
-                        pass
-                if sensor_timestamps or sensor_event_ids:
-                    # Events with unparseable timestamps still advance the event-id
-                    # cursor (the client filters on minimum_event_id, so those records
-                    # aren't refetched forever); the timestamp cursor only moves when
-                    # a timestamp actually parsed.
-                    new_latest = max(sensor_timestamps) if sensor_timestamps else sensor_type_timestamps[sensor_type_id]
-                    new_max_event_id = max(sensor_event_ids) if sensor_event_ids else minimum_event_ids[sensor_type_id] - 1
-                    individual_state.update_sensor_state(sensor_type_id, new_latest, new_max_event_id)
-                    sensor_type_timestamps[sensor_type_id] = new_latest
-                    minimum_event_ids[sensor_type_id] = new_max_event_id + 1
+            _advance_watermarks(individual_state, events, sensor_type_ids, sensor_type_timestamps, minimum_event_ids)
 
             logger.info(
                 f"Processed Movebank data for {log_reference}: {len(observations)} observations, "
@@ -362,24 +373,147 @@ async def action_backfill(integration, action_config: BackfillConfig):
 
     logger.info(f"Backfill {job_id} for study {action_config.study_id}: {len(queued)} individuals, range {range_repr}")
 
+    # Store each queued individual's sub-action config up front, so the rolling
+    # dispatch (here and from the sub-action's finalize step) always reads
+    # from the same place regardless of when an individual is popped.
+    for i in queued:
+        start_dt, end_dt = ranges[i.id]
+        await job.put_individual_config(
+            i.id,
+            BackfillEventsForIndividualConfig(
+                study_id=action_config.study_id, individual=i,
+                job_id=job_id, start=start_dt, end=end_dt,
+            ).json(),
+        )
+
     k = action_config.backfill_max_concurrency or settings.BACKFILL_MAX_CONCURRENCY
-    by_id = {i.id: i for i in queued}
     dispatched = 0
     while dispatched < k:
         next_id = await job.next_individual()
         if next_id is None:
             break
-        ind = by_id[next_id]
-        start_dt, end_dt = ranges[next_id]
-        await job.incr_in_flight()
-        await trigger_action(
-            integration_id=integration_id,
-            action_id=BACKFILL_ACTION_ID,
-            config=BackfillEventsForIndividualConfig(
-                study_id=action_config.study_id, individual=ind,
-                job_id=job_id, start=start_dt, end=end_dt,
-            ),
-        )
+        await _dispatch_backfill_individual(integration_id, job, next_id)
         dispatched += 1
 
     return {"job_id": job_id, "individuals": len(queued), "dispatched": dispatched}
+
+
+async def _dispatch_backfill_individual(integration_id, job, individual_id):
+    """Read the stored per-individual config and trigger the sub-action.
+
+    Single dispatch path used both for the backfill action's first wave and
+    for the sub-action's rolling dispatch-next on completion.
+    """
+    blob = await job.get_individual_config(individual_id)
+    if blob is None:
+        logger.warning(f"Backfill {job.job_id}: no stored config for individual {individual_id}; skipping")
+        return
+    cfg = BackfillEventsForIndividualConfig.parse_raw(blob)
+    await job.incr_in_flight()
+    await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=cfg)
+
+
+async def _finalize_backfill_individual(integration_id, job, ind, action_config, *, observations, state=None):
+    # Hand off the FULL cursor (timestamp + highest event id per sensor) to the
+    # steady-state pull, so the pull's event-id filter absorbs the accessory
+    # settling re-read at the boundary without re-emitting backfilled events.
+    if state is not None:
+        existing = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=ind.id)
+        if not existing:
+            await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID,
+                                          json.loads(state.json()), source_id=ind.id)
+    await job.record_completion(observations)
+    await job.decr_in_flight()
+
+    if await job.is_done():
+        snap = await job.snapshot()
+        logger.info(f"Backfill {action_config.job_id} finished: {snap['completed']}/{snap['total']} "
+                    f"individuals, {snap['observations_sent']} observations")
+    else:
+        if await state_manager.set_if_absent(
+            integration_id, f"backfill_progress.{action_config.job_id}", ttl_seconds=BACKFILL_PROGRESS_THROTTLE_SECONDS
+        ):
+            snap = await job.snapshot()
+            logger.info(f"Backfill {action_config.job_id} progress: {snap['completed']}/{snap['total']} "
+                        f"individuals, ~{snap['observations_sent']} observations")
+        next_id = await job.next_individual()
+        if next_id is not None:
+            await _dispatch_backfill_individual(integration_id, job, next_id)
+
+    return {"status": "completed", "observations_sent": observations}
+
+
+@activity_logger()
+async def action_backfill_events_for_individual(integration, action_config: BackfillEventsForIndividualConfig):
+    ind = action_config.individual
+    integration_id = str(integration.id)
+    job = BackfillJob(integration_id, action_config.job_id)
+    watermark_source = f"{action_config.job_id}.{ind.id}"
+    log_reference = f"job:{action_config.job_id},individual:{ind.id}"
+
+    sensor_type_labels = [label.strip().lower() for label in ind.sensor_type_ids.split(",")]
+    sensor_type_ids = [
+        MovebankClient.MOVEBANK_SENSOR_TYPE_LABEL_TO_ID[label]
+        for label in sensor_type_labels
+        if label in MovebankClient.MOVEBANK_SENSOR_TYPE_LABEL_TO_ID
+    ]
+    if not sensor_type_ids:
+        return await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=0)
+
+    saved = await state_manager.get_state(integration_id, BACKFILL_WATERMARK_ACTION_ID, source_id=watermark_source)
+    state = IndividualState.parse_obj(saved) if saved else IndividualState(
+        individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
+    )
+    sensor_type_timestamps, minimum_event_ids = {}, {}
+    for stid in sensor_type_ids:
+        ss = state.get_sensor_state(stid)
+        sensor_type_timestamps[stid] = ss.latest_timestamp or action_config.start
+        minimum_event_ids[stid] = (ss.highest_event_id or 0) + 1
+
+    auth_config = client.get_auth_config(integration)
+    deadline = time.monotonic() + 0.8 * settings.MAX_ACTION_EXECUTION_TIME
+    window = DEFAULT_BATCH_WINDOW
+    observations_sent = 0
+    current = min(sensor_type_timestamps.values())
+
+    mb_client = client.MovebankClient(
+        base_url=integration.base_url, username=auth_config.username,
+        password=auth_config.password.get_secret_value(),
+    )
+    async with mb_client as mb:
+        while current < action_config.end and time.monotonic() < deadline:
+            end_at = min(action_config.end, current + window)
+            events = []
+            for stid in sensor_type_ids:
+                sensor_start = sensor_type_timestamps[stid]
+                if sensor_start > end_at:
+                    continue
+                query_start = _query_start_for_sensor(stid, sensor_start)
+                async with movebank_slot(auth_config.username):
+                    async for event in mb.get_individual_events_by_time(
+                        study_id=action_config.study_id, individual_id=ind.id,
+                        timestamp_start=query_start, timestamp_end=end_at,
+                        sensor_type_ids=[stid], minimum_event_id=minimum_event_ids[stid],
+                    ):
+                        events.append(event)
+
+            device_name = ind.nick_name or ind.local_identifier or ind.ring_id
+            observations = [o for e in events if (o := build_observation(event=e, device_name=device_name)) is not None]
+            for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
+                await send_observations_to_gundi(observations=batch, integration_id=integration_id)
+
+            _advance_watermarks(state, events, sensor_type_ids, sensor_type_timestamps, minimum_event_ids)
+            observations_sent += len(observations)
+            current = current + window
+            await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
+                                          json.loads(state.json()), source_id=watermark_source)
+
+    if current < action_config.end:
+        # Budget exhausted mid-range: continue THIS individual on the next step.
+        await trigger_action(
+            integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=action_config,
+        )
+        logger.info(f"Backfill {log_reference} continued at {current.isoformat()} ({observations_sent} obs this step)")
+        return {"status": "continued", "observations_sent": observations_sent}
+
+    return await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=observations_sent, state=state)

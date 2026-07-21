@@ -5,7 +5,12 @@ import pytest
 
 from app.actions.client import IndividualState
 from app.actions.configurations import PullEventsForIndividualConfig, PullObservationsConfig
-from app.actions.handlers import action_backfill, action_pull_events_for_individual, action_pull_observations
+from app.actions.handlers import (
+    action_backfill,
+    action_backfill_events_for_individual,
+    action_pull_events_for_individual,
+    action_pull_observations,
+)
 from app.actions.tests.conftest import INDIVIDUAL_ROW, make_events_generator
 
 
@@ -382,6 +387,7 @@ async def test_backfill_seeds_queue_and_dispatches_up_to_k(
     rows = [{**INDIVIDUAL_ROW, "id": str(i)} for i in range(5)]
     mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=rows)
     seen = {}
+    configs = {}
 
     async def fake_seed(self, individual_ids, *, total, range_repr):
         seen["seeded"] = list(individual_ids); seen["total"] = total
@@ -389,9 +395,15 @@ async def test_backfill_seeds_queue_and_dispatches_up_to_k(
         return seen["seeded"].pop(0) if seen.get("seeded") else None
     async def fake_incr(self, n=1):
         return n
+    async def fake_put_config(self, individual_id, config_json):
+        configs[individual_id] = config_json
+    async def fake_get_config(self, individual_id):
+        return configs.get(individual_id)
     mocker.patch("app.actions.backfill_queue.BackfillJob.seed", fake_seed)
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", fake_next)
     mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", fake_incr)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", fake_put_config)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.get_individual_config", fake_get_config)
     mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
     mocker.patch("app.actions.handlers.settings.BACKFILL_MAX_CONCURRENCY", 3)
 
@@ -421,6 +433,7 @@ async def test_backfill_respects_individual_filter(
     mocker.patch("app.actions.backfill_queue.BackfillJob.seed", fake_seed)
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
     mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=1))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
     mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
 
     await action_backfill(
@@ -441,3 +454,71 @@ async def test_backfill_acquires_connection_slot(
     slot = mocker.patch("app.actions.handlers.movebank_slot")
     await action_backfill(integration=integration, action_config=BackfillConfig(study_id="12345", start="all"))
     slot.assert_called_with("user")
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_finalizes_and_dispatches_next(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from app.actions.client import IndividualState
+    from datetime import datetime, timezone
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    # One small window of GPS events fully inside [start, end): the step reaches
+    # `end` in a single pass and finalizes.
+    events = [_gps_event(10, "2024-01-02 00:00:00.000")]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 1, "in_flight": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "completed"
+    # The steady-state pull cursor was written from the backfill watermark (ts + event id).
+    handed = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    st = IndividualState.parse_obj(handed)
+    assert st.get_sensor_state(653).highest_event_id == 10
+    # Queue empty -> no next dispatch.
+    assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_retriggers_self_when_budget_exhausted(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from datetime import datetime, timezone
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 1, tzinfo=timezone.utc)   # huge range
+    events = [_gps_event(i, "2024-01-02 00:00:00.000") for i in range(3)]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    # Force the time budget to zero so the step stops after the first window.
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 0)
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "continued"
+    # It re-triggered ITSELF (same individual), not the next one.
+    assert mock_trigger.await_count == 1
+    _, kwargs = mock_trigger.await_args_list[0]
+    assert kwargs["action_id"] == "backfill_events_for_individual"
+    assert kwargs["config"].individual.id == "111"

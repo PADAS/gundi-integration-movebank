@@ -8,19 +8,26 @@ from app.actions.backfill_queue import BackfillJob
 @pytest.fixture
 def fake_redis():
     # Minimal in-memory stand-in for the subset of redis.asyncio used here.
-    store = {"hash": {}, "list": []}
+    # Hashes are keyed by their Redis key so distinct hashes (meta vs. the
+    # per-individual configs hash) don't collide on field names.
+    store = {"hashes": {}, "list": []}
 
     client = MagicMock()
 
     async def hincrby(key, field, n):
-        store["hash"][field] = int(store["hash"].get(field, 0)) + n
-        return store["hash"][field]
+        h = store["hashes"].setdefault(key, {})
+        h[field] = int(h.get(field, 0)) + n
+        return h[field]
 
     async def hset(key, mapping=None, **kw):
-        store["hash"].update(mapping or kw)
+        h = store["hashes"].setdefault(key, {})
+        h.update(mapping or kw)
 
     async def hgetall(key):
-        return {k: str(v) for k, v in store["hash"].items()}
+        return {k: str(v) for k, v in store["hashes"].get(key, {}).items()}
+
+    async def hget(key, field):
+        return store["hashes"].get(key, {}).get(field)
 
     async def rpush(key, *vals):
         store["list"].extend(vals)
@@ -35,6 +42,7 @@ def fake_redis():
     client.hincrby = AsyncMock(side_effect=hincrby)
     client.hset = AsyncMock(side_effect=hset)
     client.hgetall = AsyncMock(side_effect=hgetall)
+    client.hget = AsyncMock(side_effect=hget)
     client.rpush = AsyncMock(side_effect=rpush)
     client.lpop = AsyncMock(side_effect=lpop)
     client.llen = AsyncMock(side_effect=llen)
@@ -85,3 +93,25 @@ async def test_pending_remaining_in_snapshot(job):
     await job.next_individual()
     snap = await job.snapshot()
     assert snap["pending_remaining"] == 2
+
+
+@pytest.mark.asyncio
+async def test_put_and_get_individual_config(job):
+    await job.put_individual_config("a", '{"foo": "bar"}')
+    assert await job.get_individual_config("a") == '{"foo": "bar"}'
+
+
+@pytest.mark.asyncio
+async def test_get_individual_config_missing_returns_none(job):
+    assert await job.get_individual_config("missing-id") is None
+
+
+@pytest.mark.asyncio
+async def test_individual_configs_do_not_collide_with_meta_hash(job):
+    # Meta hash and configs hash are distinct Redis keys, so an individual id
+    # that happens to match a meta field name must not leak/overwrite it.
+    await job.seed(["a"], total=1, range_repr="r")
+    await job.put_individual_config("total", '{"total-config": true}')
+    snap = await job.snapshot()
+    assert snap["total"] == 1
+    assert await job.get_individual_config("total") == '{"total-config": true}'

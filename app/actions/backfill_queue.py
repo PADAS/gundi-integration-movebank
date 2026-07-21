@@ -59,6 +59,13 @@ class BackfillJob:
     async def incr_attempts(self, individual_id: str) -> int:
         return await self.db.hincrby(self._meta, f"attempts.{individual_id}", 1)
 
+    async def put_individual_config(self, individual_id: str, config_json: str) -> None:
+        await self.db.hset(f"{self._meta}.configs", mapping={individual_id: config_json})
+
+    async def get_individual_config(self, individual_id: str) -> Optional[str]:
+        raw = await self.db.hget(f"{self._meta}.configs", individual_id)
+        return (raw.decode() if isinstance(raw, bytes) else raw) if raw else None
+
     async def is_done(self) -> bool:
         remaining = await self.db.llen(self._pending)
         snap = await self.snapshot()
