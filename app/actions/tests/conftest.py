@@ -24,6 +24,15 @@ def mock_connection_slot(mocker):
     return mocker.patch("app.actions.handlers.movebank_slot", side_effect=_noop_slot)
 
 
+@pytest.fixture(autouse=True)
+def mock_state_manager_redis(mocker):
+    """Stub the state manager's Redis calls so handler tests don't need a live
+    Redis. Tests that care about specific saved state re-patch state_manager
+    explicitly (e.g. the mock_state_store fixture below)."""
+    mocker.patch("app.actions.handlers.state_manager.get_state", AsyncMock(return_value={}))
+    mocker.patch("app.actions.handlers.state_manager.set_state", AsyncMock(return_value=None))
+
+
 @pytest.fixture
 def integration():
     integration = MagicMock()

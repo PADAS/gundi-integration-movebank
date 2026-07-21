@@ -5,7 +5,7 @@ import pytest
 
 from app.actions.client import IndividualState
 from app.actions.configurations import PullEventsForIndividualConfig, PullObservationsConfig
-from app.actions.handlers import action_pull_events_for_individual, action_pull_observations
+from app.actions.handlers import action_backfill, action_pull_events_for_individual, action_pull_observations
 from app.actions.tests.conftest import INDIVIDUAL_ROW, make_events_generator
 
 
@@ -372,3 +372,59 @@ async def test_pull_acquires_connection_slot(
     # keyed by the integration's Movebank username.
     assert slot.called
     slot.assert_called_with("user")
+
+
+@pytest.mark.asyncio
+async def test_backfill_seeds_queue_and_dispatches_up_to_k(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    from app.actions.configurations import BackfillConfig
+    rows = [{**INDIVIDUAL_ROW, "id": str(i)} for i in range(5)]
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=rows)
+    seen = {}
+
+    async def fake_seed(self, individual_ids, *, total, range_repr):
+        seen["seeded"] = list(individual_ids); seen["total"] = total
+    async def fake_next(self):
+        return seen["seeded"].pop(0) if seen.get("seeded") else None
+    async def fake_incr(self, n=1):
+        return n
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", fake_seed)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", fake_next)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", fake_incr)
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mocker.patch("app.actions.handlers.settings.BACKFILL_MAX_CONCURRENCY", 3)
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["individuals"] == 5
+    assert result["dispatched"] == 3            # K, not all 5
+    assert mock_trigger.await_count == 3
+    _, kwargs = mock_trigger.await_args_list[0]
+    assert kwargs["action_id"] == "backfill_events_for_individual"
+    assert kwargs["config"].job_id == result["job_id"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_respects_individual_filter(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    from app.actions.configurations import BackfillConfig
+    rows = [{**INDIVIDUAL_ROW, "id": str(i)} for i in range(5)]
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=rows)
+    captured = {}
+    async def fake_seed(self, individual_ids, *, total, range_repr):
+        captured["ids"] = list(individual_ids)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", fake_seed)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=1))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", individual_ids=["2", "4"]),
+    )
+    assert set(captured["ids"]) == {"2", "4"}

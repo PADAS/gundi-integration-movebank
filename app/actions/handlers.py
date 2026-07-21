@@ -1,6 +1,8 @@
+import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pydantic
 from dateutil.parser import parse as parse_date
@@ -8,8 +10,15 @@ from movebank_client import MovebankClient
 
 import app.actions.client as client
 from app import settings
+from app.actions.backfill_queue import BackfillJob
 from app.actions.client import IndividualState, generate_individuals
-from app.actions.configurations import AuthenticateConfig, PullObservationsConfig, PullEventsForIndividualConfig
+from app.actions.configurations import (
+    AuthenticateConfig,
+    BackfillConfig,
+    BackfillEventsForIndividualConfig,
+    PullObservationsConfig,
+    PullEventsForIndividualConfig,
+)
 from app.actions.transform import _ensure_utc, build_observation, chunks
 from app.services.action_scheduler import crontab_schedule, trigger_action
 from app.services.activity_logger import activity_logger
@@ -33,6 +42,10 @@ OBSERVATIONS_BATCH_SIZE = 200
 
 CURSOR_STATE_ACTION_ID = "pull_events_for_individual"
 QUIET_STATE_ACTION_ID = "pull_events_for_individual_quiet"
+
+BACKFILL_ACTION_ID = "backfill_events_for_individual"
+BACKFILL_WATERMARK_ACTION_ID = "backfill_watermark"
+BACKFILL_PROGRESS_THROTTLE_SECONDS = 300
 
 
 def _query_start_for_sensor(sensor_type_id: int, sensor_start: datetime) -> datetime:
@@ -292,3 +305,80 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
             current_window_start = current_window_start + batch_window_size
 
     return {"observations_sent": total_observations_sent}
+
+
+def _resolve_start(start, ind) -> datetime:
+    """A concrete datetime for this individual: the operator's date, or for
+    'all' the individual's earliest record (falling back to the lookback floor)."""
+    if isinstance(start, datetime):
+        return start
+    # start == "all"
+    if ind.timestamp_start:
+        return ind.timestamp_start
+    return datetime.now(tz=timezone.utc) - timedelta(days=3650)  # ~10y floor
+
+
+async def _resolve_end(integration_id: str, ind, now: datetime) -> datetime:
+    """Freeze the boundary where backfill meets the steady-state pull: the
+    individual's existing pull cursor if any, else now (and the pull is seeded
+    to now by the individual sub-action on completion)."""
+    saved = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=ind.id)
+    if saved:
+        state = IndividualState.parse_obj(saved)
+        stamps = [s.latest_timestamp for s in state.sensor_states.values() if s.latest_timestamp]
+        if stamps:
+            return min(stamps)
+    return now
+
+
+@activity_logger()
+async def action_backfill(integration, action_config: BackfillConfig):
+    integration_id = str(integration.id)
+    now = datetime.now(tz=timezone.utc)
+    auth_config = client.get_auth_config(integration)
+    mb_client = client.MovebankClient(
+        base_url=integration.base_url,
+        username=auth_config.username,
+        password=auth_config.password.get_secret_value(),
+    )
+    async with mb_client as mb:
+        rows = await mb.get_individuals_by_study(study_id=action_config.study_id)
+    individuals = list(generate_individuals(rows))
+    if action_config.individual_ids:
+        wanted = set(action_config.individual_ids)
+        individuals = [i for i in individuals if i.id in wanted]
+
+    # Deterministic job id: a redelivered backfill command resumes the same job.
+    job_seed = f"{action_config.study_id}:{sorted(i.id for i in individuals)}:{action_config.start}"
+    job_id = "job-" + hashlib.sha256(job_seed.encode()).hexdigest()[:12]
+    job = BackfillJob(integration_id, job_id)
+
+    ranges = {i.id: (_resolve_start(action_config.start, i), await _resolve_end(integration_id, i, now)) for i in individuals}
+    # Only individuals with a non-empty range are worth queuing.
+    queued = [i for i in individuals if ranges[i.id][0] < ranges[i.id][1]]
+    range_repr = f"[{action_config.start} .. {now.isoformat()})"
+    await job.seed([i.id for i in queued], total=len(queued), range_repr=range_repr)
+
+    logger.info(f"Backfill {job_id} for study {action_config.study_id}: {len(queued)} individuals, range {range_repr}")
+
+    k = action_config.backfill_max_concurrency or settings.BACKFILL_MAX_CONCURRENCY
+    by_id = {i.id: i for i in queued}
+    dispatched = 0
+    while dispatched < k:
+        next_id = await job.next_individual()
+        if next_id is None:
+            break
+        ind = by_id[next_id]
+        start_dt, end_dt = ranges[next_id]
+        await job.incr_in_flight()
+        await trigger_action(
+            integration_id=integration_id,
+            action_id=BACKFILL_ACTION_ID,
+            config=BackfillEventsForIndividualConfig(
+                study_id=action_config.study_id, individual=ind,
+                job_id=job_id, start=start_dt, end=end_dt,
+            ),
+        )
+        dispatched += 1
+
+    return {"job_id": job_id, "individuals": len(queued), "dispatched": dispatched}
