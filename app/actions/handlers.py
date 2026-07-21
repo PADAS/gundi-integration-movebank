@@ -156,8 +156,10 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     # Size the fetch window by event density: high-frequency individuals get a
     # window that should hold roughly HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD events,
     # assuming an even distribution over the individual's active range.
-    if (ind.number_of_events or 0) > HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD and ind.timestamp_end:
-        total_seconds = (ind.timestamp_end - ind.timestamp_start).total_seconds()
+    if (ind.number_of_events or 0) > HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD:
+        # resolved_individual_timestamp_end falls back to now when the individual
+        # omits timestamp_end, so density sizing works for those individuals too.
+        total_seconds = (resolved_individual_timestamp_end - ind.timestamp_start).total_seconds()
         batch_window_size = timedelta(
             seconds=(HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD / ind.number_of_events) * total_seconds
         )
@@ -249,8 +251,10 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                 f"events by sensor: { {k: len(v) for k, v in events_by_sensor.items()} }"
             )
 
-            if observations:
-                # Observations were sent above — only now is it safe to advance the saved cursor.
+            if events:
+                # Persist cursors whenever events were processed — sends happened
+                # above, and even if the transform dropped every record, advancing
+                # keeps unusable events from being refetched on the next run.
                 await state_manager.set_state(
                     integration_id,
                     CURSOR_STATE_ACTION_ID,
@@ -258,7 +262,7 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                     source_id=ind.id,
                 )
             else:
-                # Nothing in this window: back off from this individual for a while.
+                # No events in this window: back off from this individual for a while.
                 await state_manager.set_state(
                     integration_id,
                     QUIET_STATE_ACTION_ID,

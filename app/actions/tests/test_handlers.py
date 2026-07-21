@@ -230,3 +230,53 @@ async def test_pull_events_does_not_advance_cursor_when_send_fails(
             integration=integration, action_config=_sub_action_config()
         )
     assert (str(integration.id), "pull_events_for_individual", "111") not in mock_state_store
+
+
+@pytest.mark.asyncio
+async def test_pull_events_density_window_applies_without_timestamp_end(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # 60k events over ~30 days => ~2.5-day density window. With a 10-day lookback
+    # that means 4 fetch windows; the old 5-day fallback would only run 2.
+    start = (datetime.now(tz=timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S.000")
+    gen, calls = make_counting_events_generator(0)
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    result = await action_pull_events_for_individual(
+        integration=integration,
+        action_config=_sub_action_config(
+            maximum_lookback_hours=240,
+            individual_overrides={
+                "timestamp_start": start,
+                "timestamp_end": "",
+                "number_of_events": "60000",
+            },
+        ),
+    )
+
+    assert result["observations_sent"] == 0
+    assert calls["count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_pull_events_advances_cursor_when_all_events_are_unusable(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Valid timestamps but no individual_id: the transform drops every record.
+    events = [{**_gps_event(100, "2026-01-01 10:00:00.000"), "individual_id": ""}]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    result = await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config()
+    )
+
+    assert result["observations_sent"] == 0
+    assert mock_send.await_count == 0
+    # Cursors advanced past the unusable events so they aren't refetched forever...
+    saved = mock_state_store.get((str(integration.id), "pull_events_for_individual", "111"))
+    assert saved is not None
+    assert IndividualState.parse_obj(saved).get_sensor_state(653).highest_event_id == 100
+    # ...and no quiet period, because the window did return events.
+    assert (str(integration.id), "pull_events_for_individual_quiet", "111") not in mock_state_store
