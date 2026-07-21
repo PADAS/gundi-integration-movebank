@@ -5,6 +5,8 @@ from typing import Dict, Optional, Union
 import pydantic
 from dateutil.parser import parse as parse_date
 from movebank_client import MovebankClient
+# Not used in this module directly — re-exported for consumers that access them
+# through this namespace (e.g. `client.MBForbiddenError` in app/actions/handlers.py).
 from movebank_client.errors import MBClientError, MBForbiddenError
 
 from app.services.errors import ConfigurationNotFound

@@ -30,6 +30,8 @@ def human_friendly_timedelta(td: timedelta) -> str:
 
 
 def chunks(items: list, n: int):
+    if n <= 0:
+        raise ValueError(f"chunk size must be a positive integer, got {n}")
     for i in range(0, len(items), n):
         yield items[i:i + n]
 

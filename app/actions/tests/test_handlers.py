@@ -300,3 +300,24 @@ async def test_pull_events_tolerates_whitespace_in_sensor_type_labels(
     )
 
     assert calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_pull_events_advances_event_id_cursor_when_timestamps_unparseable(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Garbage timestamp, valid event_id: the transform drops the record and the
+    # timestamp cursor can't move, but the event-id cursor must still advance so
+    # the same junk isn't refetched every run.
+    events = [{**_gps_event(100, "garbage-timestamp")}]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    result = await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config()
+    )
+
+    assert result["observations_sent"] == 0
+    saved = mock_state_store.get((str(integration.id), "pull_events_for_individual", "111"))
+    assert saved is not None
+    assert IndividualState.parse_obj(saved).get_sensor_state(653).highest_event_id == 100

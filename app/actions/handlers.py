@@ -239,8 +239,12 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                         sensor_event_ids.append(int(event.get("event_id")))
                     except (TypeError, ValueError):
                         pass
-                if sensor_timestamps:
-                    new_latest = max(sensor_timestamps)
+                if sensor_timestamps or sensor_event_ids:
+                    # Events with unparseable timestamps still advance the event-id
+                    # cursor (the client filters on minimum_event_id, so those records
+                    # aren't refetched forever); the timestamp cursor only moves when
+                    # a timestamp actually parsed.
+                    new_latest = max(sensor_timestamps) if sensor_timestamps else sensor_type_timestamps[sensor_type_id]
                     new_max_event_id = max(sensor_event_ids) if sensor_event_ids else minimum_event_ids[sensor_type_id] - 1
                     individual_state.update_sensor_state(sensor_type_id, new_latest, new_max_event_id)
                     sensor_type_timestamps[sensor_type_id] = new_latest
