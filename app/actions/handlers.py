@@ -47,6 +47,7 @@ QUIET_STATE_ACTION_ID = "pull_events_for_individual_quiet"
 BACKFILL_ACTION_ID = "backfill_events_for_individual"
 BACKFILL_WATERMARK_ACTION_ID = "backfill_watermark"
 BACKFILL_PROGRESS_THROTTLE_SECONDS = 300
+BACKFILL_MAX_ATTEMPTS = 5
 
 
 def _query_start_for_sensor(sensor_type_id: int, sensor_start: datetime) -> datetime:
@@ -501,84 +502,102 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     ind = action_config.individual
     integration_id = str(integration.id)
     job = BackfillJob(integration_id, action_config.job_id)
-    watermark_source = f"{action_config.job_id}.{ind.id}"
-    log_reference = f"job:{action_config.job_id},individual:{ind.id}"
+    try:
+        watermark_source = f"{action_config.job_id}.{ind.id}"
+        log_reference = f"job:{action_config.job_id},individual:{ind.id}"
 
-    sensor_type_ids = _supported_sensor_type_ids(ind)
-    if not sensor_type_ids:
-        return await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=0)
+        sensor_type_ids = _supported_sensor_type_ids(ind)
+        if not sensor_type_ids:
+            return await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=0)
 
-    saved = await state_manager.get_state(integration_id, BACKFILL_WATERMARK_ACTION_ID, source_id=watermark_source)
-    state = IndividualState.parse_obj(saved) if saved else IndividualState(
-        individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
-    )
-    sensor_type_timestamps, minimum_event_ids = {}, {}
-    for stid in sensor_type_ids:
-        ss = state.get_sensor_state(stid)
-        sensor_type_timestamps[stid] = ss.latest_timestamp or action_config.start
-        minimum_event_ids[stid] = (ss.highest_event_id or 0) + 1
-
-    # The scan position is a DURABLE floor, persisted every window regardless
-    # of whether events came back. Windows are anchored to it (below), not to
-    # the per-sensor event cursor above — otherwise a sensor that returns
-    # nothing for the whole range would never move its own cursor, and a
-    # re-trigger after a budget-exhausted step would recompute `current` from
-    # that unmoved cursor and rescan the same empty span forever (livelock).
-    persisted_scan_from = None
-    if saved and saved.get("scan_from"):
-        try:
-            persisted_scan_from = _ensure_utc(parse_date(saved["scan_from"]))
-        except Exception:
-            persisted_scan_from = None
-
-    auth_config = client.get_auth_config(integration)
-    deadline = time.monotonic() + 0.8 * settings.MAX_ACTION_EXECUTION_TIME
-    window = DEFAULT_BATCH_WINDOW
-    observations_sent = 0
-    current = persisted_scan_from if persisted_scan_from is not None else min(sensor_type_timestamps.values())
-
-    mb_client = client.MovebankClient(
-        base_url=integration.base_url, username=auth_config.username,
-        password=auth_config.password.get_secret_value(),
-    )
-    async with mb_client as mb:
-        while current < action_config.end and time.monotonic() < deadline:
-            end_at = min(action_config.end, current + window)
-            # All sensors sweep the same [current, end_at) window together —
-            # anchored to the scan floor, not each sensor's own cursor.
-            events = []
-            for stid in sensor_type_ids:
-                query_start = _query_start_for_sensor(stid, current)
-                async with movebank_slot(auth_config.username):
-                    async for event in mb.get_individual_events_by_time(
-                        study_id=action_config.study_id, individual_id=ind.id,
-                        timestamp_start=query_start, timestamp_end=end_at,
-                        sensor_type_ids=[stid], minimum_event_id=minimum_event_ids[stid],
-                    ):
-                        events.append(event)
-
-            device_name = ind.nick_name or ind.local_identifier or ind.ring_id
-            observations = [o for e in events if (o := build_observation(event=e, device_name=device_name)) is not None]
-            for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
-                await send_observations_to_gundi(observations=batch, integration_id=integration_id)
-
-            _advance_watermarks(state, events, sensor_type_ids, sensor_type_timestamps, minimum_event_ids)
-            observations_sent += len(observations)
-            current = current + window
-
-            # Persist the scan floor together with the sensor states in a
-            # single call, every window, regardless of whether events came back.
-            blob = json.loads(state.json())
-            blob["scan_from"] = current.isoformat()
-            await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
-                                          blob, source_id=watermark_source)
-
-    if current < action_config.end:
-        # Budget exhausted mid-range: continue THIS individual on the next step.
-        await trigger_action(
-            integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=action_config,
+        saved = await state_manager.get_state(integration_id, BACKFILL_WATERMARK_ACTION_ID, source_id=watermark_source)
+        state = IndividualState.parse_obj(saved) if saved else IndividualState(
+            individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
         )
-        logger.info(f"Backfill {log_reference} continued at {current.isoformat()} ({observations_sent} obs this step)")
-        return {"status": "continued", "observations_sent": observations_sent}
+        sensor_type_timestamps, minimum_event_ids = {}, {}
+        for stid in sensor_type_ids:
+            ss = state.get_sensor_state(stid)
+            sensor_type_timestamps[stid] = ss.latest_timestamp or action_config.start
+            minimum_event_ids[stid] = (ss.highest_event_id or 0) + 1
 
-    return await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=observations_sent, state=state)
+        # The scan position is a DURABLE floor, persisted every window regardless
+        # of whether events came back. Windows are anchored to it (below), not to
+        # the per-sensor event cursor above — otherwise a sensor that returns
+        # nothing for the whole range would never move its own cursor, and a
+        # re-trigger after a budget-exhausted step would recompute `current` from
+        # that unmoved cursor and rescan the same empty span forever (livelock).
+        persisted_scan_from = None
+        if saved and saved.get("scan_from"):
+            try:
+                persisted_scan_from = _ensure_utc(parse_date(saved["scan_from"]))
+            except Exception:
+                persisted_scan_from = None
+
+        auth_config = client.get_auth_config(integration)
+        deadline = time.monotonic() + 0.8 * settings.MAX_ACTION_EXECUTION_TIME
+        window = DEFAULT_BATCH_WINDOW
+        observations_sent = 0
+        current = persisted_scan_from if persisted_scan_from is not None else min(sensor_type_timestamps.values())
+
+        mb_client = client.MovebankClient(
+            base_url=integration.base_url, username=auth_config.username,
+            password=auth_config.password.get_secret_value(),
+        )
+        async with mb_client as mb:
+            while current < action_config.end and time.monotonic() < deadline:
+                end_at = min(action_config.end, current + window)
+                # All sensors sweep the same [current, end_at) window together —
+                # anchored to the scan floor, not each sensor's own cursor.
+                events = []
+                for stid in sensor_type_ids:
+                    query_start = _query_start_for_sensor(stid, current)
+                    async with movebank_slot(auth_config.username):
+                        async for event in mb.get_individual_events_by_time(
+                            study_id=action_config.study_id, individual_id=ind.id,
+                            timestamp_start=query_start, timestamp_end=end_at,
+                            sensor_type_ids=[stid], minimum_event_id=minimum_event_ids[stid],
+                        ):
+                            events.append(event)
+
+                device_name = ind.nick_name or ind.local_identifier or ind.ring_id
+                observations = [o for e in events if (o := build_observation(event=e, device_name=device_name)) is not None]
+                for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
+                    await send_observations_to_gundi(observations=batch, integration_id=integration_id)
+
+                _advance_watermarks(state, events, sensor_type_ids, sensor_type_timestamps, minimum_event_ids)
+                observations_sent += len(observations)
+                current = current + window
+
+                # Persist the scan floor together with the sensor states in a
+                # single call, every window, regardless of whether events came back.
+                blob = json.loads(state.json())
+                blob["scan_from"] = current.isoformat()
+                await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
+                                              blob, source_id=watermark_source)
+
+        if current < action_config.end:
+            # Budget exhausted mid-range: continue THIS individual on the next step.
+            await trigger_action(
+                integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=action_config,
+            )
+            logger.info(f"Backfill {log_reference} continued at {current.isoformat()} ({observations_sent} obs this step)")
+            return {"status": "continued", "observations_sent": observations_sent}
+
+        return await _finalize_backfill_individual(
+            integration_id, job, ind, action_config, observations=observations_sent, state=state
+        )
+    except NoConnectionSlot:
+        # No connection slot available: re-trigger THIS individual (same in-flight
+        # unit continues) rather than losing the step or double-counting in-flight.
+        await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=action_config)
+        logger.info(f"Backfill {action_config.job_id}/{ind.id}: no connection slot, backing off")
+        return {"status": "backoff"}
+    except Exception as exc:
+        attempts = await job.incr_attempts(ind.id)
+        if attempts <= BACKFILL_MAX_ATTEMPTS:
+            await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=action_config)
+            logger.info(f"Backfill {action_config.job_id}/{ind.id}: attempt {attempts} failed ({exc}); retrying")
+            return {"status": "retry", "attempts": attempts}
+        logger.warning(f"Backfill {action_config.job_id}/{ind.id}: abandoned after {attempts} attempts: {exc}")
+        result = await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=0)
+        return {"status": "abandoned", **{k: v for k, v in result.items() if k != "status"}}

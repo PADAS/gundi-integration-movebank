@@ -672,3 +672,54 @@ async def test_backfill_seeds_pull_cursor_at_end_and_finalize_merges_forward(
     # ...but the pull cursor's timestamp never moves backward past what it
     # already claimed at seed time.
     assert merged_ss.latest_timestamp == seeded_ss.latest_timestamp
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_backs_off_when_no_slot(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from app.services.movebank_connections import NoConnectionSlot
+    from datetime import datetime, timezone
+    def _raise(*a, **k):
+        raise NoConnectionSlot("full")
+    mocker.patch("app.actions.handlers.movebank_slot", _raise)
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+    assert result["status"] == "backoff"
+    # Re-triggered self to retry later; did not finalize.
+    assert mock_trigger.await_count == 1
+    assert mock_trigger.await_args_list[0].kwargs["config"].individual.id == "111"
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_abandoned_after_max_attempts(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from datetime import datetime, timezone
+    mock_movebank_client.get_individual_events_by_time = mocker.MagicMock(side_effect=RuntimeError("mb down"))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_attempts", AsyncMock(return_value=6))  # over the max
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0, "in_flight": 0, "range": "r"}))
+    warn = mocker.patch("app.actions.handlers.logger.warning")
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+    assert result["status"] == "abandoned"
+    assert warn.called
