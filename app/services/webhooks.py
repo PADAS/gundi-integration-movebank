@@ -96,7 +96,10 @@ def _redact_url(url: str) -> str:
     in the userinfo or query string, which must not reach the logs."""
     try:
         parsed = urlparse(url)
-        return f"{parsed.hostname}{parsed.path}"
+        host = parsed.hostname or "<no-host>"
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return f"{host}{parsed.path}"
     except Exception:
         return "<unparseable url>"
 
