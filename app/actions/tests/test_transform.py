@@ -88,3 +88,11 @@ def test_human_friendly_timedelta_negative():
 def test_build_observation_drops_unparseable_coordinates():
     event = {**GPS_EVENT, "location_lat": "N/A", "location_long": "N/A"}
     assert build_observation(event=event, device_name="Aquila") is None
+
+
+def test_chunks_rejects_non_positive_size():
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="positive integer"):
+        list(chunks([1, 2, 3], 0))
+    with _pytest.raises(ValueError, match="positive integer"):
+        list(chunks([1, 2, 3], -1))
