@@ -46,7 +46,11 @@ class BackfillJob:
         return await self.db.hincrby(self._meta, "in_flight", n)
 
     async def decr_in_flight(self) -> int:
-        return await self.db.hincrby(self._meta, "in_flight", -1)
+        value = await self.db.hincrby(self._meta, "in_flight", -1)
+        if value < 0:
+            await self.db.hset(self._meta, mapping={"in_flight": 0})
+            return 0
+        return value
 
     async def record_completion(self, observations: int) -> None:
         await self.db.hincrby(self._meta, "completed", 1)
@@ -69,5 +73,6 @@ class BackfillJob:
             "completed": int(data.get("completed", 0)),
             "observations_sent": int(data.get("observations_sent", 0)),
             "in_flight": int(data.get("in_flight", 0)),
+            "pending_remaining": await self.db.llen(self._pending),
             "range": data.get("range", ""),
         }

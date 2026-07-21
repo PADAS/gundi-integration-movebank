@@ -75,3 +75,13 @@ async def test_attempts_counter(job):
     await job.seed(["a"], total=1, range_repr="r")
     assert await job.incr_attempts("a") == 1
     assert await job.incr_attempts("a") == 2
+
+
+@pytest.mark.asyncio
+async def test_pending_remaining_in_snapshot(job):
+    await job.seed(["a", "b", "c"], total=3, range_repr="r")
+    snap = await job.snapshot()
+    assert snap["pending_remaining"] == 3
+    await job.next_individual()
+    snap = await job.snapshot()
+    assert snap["pending_remaining"] == 2
