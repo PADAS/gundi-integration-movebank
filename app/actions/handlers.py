@@ -502,47 +502,54 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     ind = action_config.individual
     integration_id = str(integration.id)
     job = BackfillJob(integration_id, action_config.job_id)
+    watermark_source = f"{action_config.job_id}.{ind.id}"
+    log_reference = f"job:{action_config.job_id},individual:{ind.id}"
+
+    sensor_type_ids = _supported_sensor_type_ids(ind)
+    if not sensor_type_ids:
+        return await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=0)
+
+    saved = await state_manager.get_state(integration_id, BACKFILL_WATERMARK_ACTION_ID, source_id=watermark_source)
+    state = IndividualState.parse_obj(saved) if saved else IndividualState(
+        individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
+    )
+    sensor_type_timestamps, minimum_event_ids = {}, {}
+    for stid in sensor_type_ids:
+        ss = state.get_sensor_state(stid)
+        sensor_type_timestamps[stid] = ss.latest_timestamp or action_config.start
+        minimum_event_ids[stid] = (ss.highest_event_id or 0) + 1
+
+    # The scan position is a DURABLE floor, persisted every window regardless
+    # of whether events came back. Windows are anchored to it (below), not to
+    # the per-sensor event cursor above — otherwise a sensor that returns
+    # nothing for the whole range would never move its own cursor, and a
+    # re-trigger after a budget-exhausted step would recompute `current` from
+    # that unmoved cursor and rescan the same empty span forever (livelock).
+    persisted_scan_from = None
+    if saved and saved.get("scan_from"):
+        try:
+            persisted_scan_from = _ensure_utc(parse_date(saved["scan_from"]))
+        except Exception:
+            persisted_scan_from = None
+
+    auth_config = client.get_auth_config(integration)
+    deadline = time.monotonic() + 0.8 * settings.MAX_ACTION_EXECUTION_TIME
+    window = DEFAULT_BATCH_WINDOW
+    observations_sent = 0
+    current = persisted_scan_from if persisted_scan_from is not None else min(sensor_type_timestamps.values())
+
+    mb_client = client.MovebankClient(
+        base_url=integration.base_url, username=auth_config.username,
+        password=auth_config.password.get_secret_value(),
+    )
+    # Only the fetch/send cascade (and its pre-finalize watermark bookkeeping) is
+    # guarded here: NoConnectionSlot and Movebank/transform errors originate in
+    # this loop. The completion decision below (continue vs. finalize) must stay
+    # OUTSIDE the try — if finalize's own post-processing (dispatch-next PubSub
+    # publish, is_done, snapshot) raised while wrapped in this try, an already
+    # -completed individual would be retried/abandoned and _finalize would run a
+    # second time, double-counting record_completion/decr_in_flight.
     try:
-        watermark_source = f"{action_config.job_id}.{ind.id}"
-        log_reference = f"job:{action_config.job_id},individual:{ind.id}"
-
-        sensor_type_ids = _supported_sensor_type_ids(ind)
-        if not sensor_type_ids:
-            return await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=0)
-
-        saved = await state_manager.get_state(integration_id, BACKFILL_WATERMARK_ACTION_ID, source_id=watermark_source)
-        state = IndividualState.parse_obj(saved) if saved else IndividualState(
-            individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
-        )
-        sensor_type_timestamps, minimum_event_ids = {}, {}
-        for stid in sensor_type_ids:
-            ss = state.get_sensor_state(stid)
-            sensor_type_timestamps[stid] = ss.latest_timestamp or action_config.start
-            minimum_event_ids[stid] = (ss.highest_event_id or 0) + 1
-
-        # The scan position is a DURABLE floor, persisted every window regardless
-        # of whether events came back. Windows are anchored to it (below), not to
-        # the per-sensor event cursor above — otherwise a sensor that returns
-        # nothing for the whole range would never move its own cursor, and a
-        # re-trigger after a budget-exhausted step would recompute `current` from
-        # that unmoved cursor and rescan the same empty span forever (livelock).
-        persisted_scan_from = None
-        if saved and saved.get("scan_from"):
-            try:
-                persisted_scan_from = _ensure_utc(parse_date(saved["scan_from"]))
-            except Exception:
-                persisted_scan_from = None
-
-        auth_config = client.get_auth_config(integration)
-        deadline = time.monotonic() + 0.8 * settings.MAX_ACTION_EXECUTION_TIME
-        window = DEFAULT_BATCH_WINDOW
-        observations_sent = 0
-        current = persisted_scan_from if persisted_scan_from is not None else min(sensor_type_timestamps.values())
-
-        mb_client = client.MovebankClient(
-            base_url=integration.base_url, username=auth_config.username,
-            password=auth_config.password.get_secret_value(),
-        )
         async with mb_client as mb:
             while current < action_config.end and time.monotonic() < deadline:
                 end_at = min(action_config.end, current + window)
@@ -574,18 +581,6 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 blob["scan_from"] = current.isoformat()
                 await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
                                               blob, source_id=watermark_source)
-
-        if current < action_config.end:
-            # Budget exhausted mid-range: continue THIS individual on the next step.
-            await trigger_action(
-                integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=action_config,
-            )
-            logger.info(f"Backfill {log_reference} continued at {current.isoformat()} ({observations_sent} obs this step)")
-            return {"status": "continued", "observations_sent": observations_sent}
-
-        return await _finalize_backfill_individual(
-            integration_id, job, ind, action_config, observations=observations_sent, state=state
-        )
     except NoConnectionSlot:
         # No connection slot available: re-trigger THIS individual (same in-flight
         # unit continues) rather than losing the step or double-counting in-flight.
@@ -601,3 +596,15 @@ async def action_backfill_events_for_individual(integration, action_config: Back
         logger.warning(f"Backfill {action_config.job_id}/{ind.id}: abandoned after {attempts} attempts: {exc}")
         result = await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=0)
         return {"status": "abandoned", **{k: v for k, v in result.items() if k != "status"}}
+
+    if current < action_config.end:
+        # Budget exhausted mid-range: continue THIS individual on the next step.
+        await trigger_action(
+            integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=action_config,
+        )
+        logger.info(f"Backfill {log_reference} continued at {current.isoformat()} ({observations_sent} obs this step)")
+        return {"status": "continued", "observations_sent": observations_sent}
+
+    return await _finalize_backfill_individual(
+        integration_id, job, ind, action_config, observations=observations_sent, state=state
+    )

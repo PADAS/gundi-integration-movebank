@@ -707,8 +707,8 @@ async def test_backfill_individual_abandoned_after_max_attempts(
     from datetime import datetime, timezone
     mock_movebank_client.get_individual_events_by_time = mocker.MagicMock(side_effect=RuntimeError("mb down"))
     mocker.patch("app.actions.backfill_queue.BackfillJob.incr_attempts", AsyncMock(return_value=6))  # over the max
-    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
-    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mock_record_completion = mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mock_decr_in_flight = mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
     mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
     mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
                  AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0, "in_flight": 0, "range": "r"}))
@@ -723,3 +723,56 @@ async def test_backfill_individual_abandoned_after_max_attempts(
     )
     assert result["status"] == "abandoned"
     assert warn.called
+    # Finalize ran exactly once on the abandon path — no double-counting.
+    assert mock_record_completion.await_count == 1
+    assert mock_decr_in_flight.await_count == 1
+    # Abandoned with observations=0 and no state: no pull cursor handed off.
+    assert (str(integration.id), "pull_events_for_individual", "111") not in mock_state_store
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_finalize_error_is_not_misclassified_as_this_individuals_failure(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A clean fetch/send loop reaches `end` and finalizes; if the dispatch-next
+    # trigger_action (part of finalize's post-processing) raises, that error must
+    # propagate rather than being caught by this individual's except-Exception —
+    # otherwise an already-completed individual would be retried/abandoned and
+    # _finalize_backfill_individual would run a second time (double
+    # record_completion / decr_in_flight).
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    events = [_gps_event(10, "2024-01-02 00:00:00.000")]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mock_record_completion = mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 2, "completed": 1, "observations_sent": 1, "in_flight": 1, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value="222"))
+    # A real stored config for the NEXT individual, so dispatch-next actually
+    # reaches trigger_action (rather than short-circuiting on a missing blob).
+    next_config = BackfillEventsForIndividualConfig(
+        study_id="12345", individual={**INDIVIDUAL_ROW, "id": "222"}, job_id="job-1", start=start, end=end,
+    )
+    mocker.patch("app.actions.backfill_queue.BackfillJob.get_individual_config",
+                 AsyncMock(return_value=next_config.json()))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=2))
+    mocker.patch("app.actions.handlers.state_manager.set_if_absent", AsyncMock(return_value=True))
+    # The dispatch-next trigger_action (inside finalize, via _dispatch_backfill_individual)
+    # raises once the fetch loop has already completed successfully.
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock(side_effect=RuntimeError("pubsub down")))
+
+    with pytest.raises(RuntimeError, match="pubsub down"):
+        await action_backfill_events_for_individual(
+            integration=integration,
+            action_config=BackfillEventsForIndividualConfig(
+                study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+            ),
+        )
+
+    # This individual's own completion was recorded exactly once — the finalize
+    # error was NOT treated as this individual's failure (no retry/abandon).
+    assert mock_record_completion.await_count == 1
