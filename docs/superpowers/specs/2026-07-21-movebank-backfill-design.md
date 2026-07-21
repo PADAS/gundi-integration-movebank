@@ -148,7 +148,7 @@ Job metadata (Redis, per `job_id`) drives Activity Log records via the existing 
 - **Transient Movebank errors** (429/5xx/timeouts): the client already retries with bounded backoff; a step that still fails re-triggers itself up to a bounded `attempts` counter in job state, then logs the abandon warning and removes the individual from `in_flight` (dequeuing the next so the job keeps progressing).
 - **Semaphore leak protection**: slot TTL (above) plus `finally`-release.
 - **At-least-once redelivery**: watermark advancement is idempotent (a redelivered step re-fetches from the same watermark; the event-id filter dedups), and queue hand-off uses atomic Redis ops so an individual is not double-dequeued or double-triggered.
-- **One active job per integration**: re-triggering `backfill` while a job is in flight is guarded (new job refused, or explicitly supersedes) rather than clobbering live job state. A fresh `job_id` per accepted run.
+- **Job identity / redelivery**: the `job_id` is derived deterministically from `(study_id, individual set, start)`, so a redelivered `backfill` command resumes the same job rather than starting a second. A stricter guard that *refuses a concurrent distinct backfill* is deferred: the connection semaphore already bounds the shared Movebank resource, so two jobs at once are safe (bounded by `MOVEBANK_MAX_CONNECTIONS`) if impolite. Listed in Deferred.
 - **`MAX_ACTION_EXECUTION_TIME` retuning**: the step time budget is derived as ≈80% of the setting, so it tracks changes to the ack deadline.
 
 ## Testing
@@ -168,3 +168,5 @@ All in the Docker `mb-runner-test` image, `respx`-mocked Movebank, mocked Redis/
 - A dedicated progress surface in the Gundi UI (Activity Log records for now).
 - Cross-username coordination (semaphore is per-username; different usernames are independent budgets).
 - Sensor types beyond GPS and accessory-measurements.
+- Refusing concurrent *distinct* backfill jobs for one integration (redelivery of the same job is handled via the deterministic `job_id`; the semaphore keeps concurrent jobs safe, so a hard guard is a follow-up).
+- Jittered delay on the `NoConnectionSlot` backoff re-trigger (immediate re-trigger for now; add a delay marker if stage smoke-testing shows churn).
