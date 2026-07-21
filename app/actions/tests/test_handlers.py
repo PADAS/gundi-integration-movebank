@@ -428,3 +428,16 @@ async def test_backfill_respects_individual_filter(
         action_config=BackfillConfig(study_id="12345", start="all", individual_ids=["2", "4"]),
     )
     assert set(captured["ids"]) == {"2", "4"}
+
+
+@pytest.mark.asyncio
+async def test_backfill_acquires_connection_slot(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    from app.actions.configurations import BackfillConfig
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    slot = mocker.patch("app.actions.handlers.movebank_slot")
+    await action_backfill(integration=integration, action_config=BackfillConfig(study_id="12345", start="all"))
+    slot.assert_called_with("user")

@@ -342,7 +342,8 @@ async def action_backfill(integration, action_config: BackfillConfig):
         password=auth_config.password.get_secret_value(),
     )
     async with mb_client as mb:
-        rows = await mb.get_individuals_by_study(study_id=action_config.study_id)
+        async with movebank_slot(auth_config.username):
+            rows = await mb.get_individuals_by_study(study_id=action_config.study_id)
     individuals = list(generate_individuals(rows))
     if action_config.individual_ids:
         wanted = set(action_config.individual_ids)
