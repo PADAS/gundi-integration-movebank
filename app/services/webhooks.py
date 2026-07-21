@@ -46,6 +46,8 @@ _BLOCKED_NETWORKS = [
     ipaddress.ip_network("100.64.0.0/10"),    # carrier-grade NAT
     ipaddress.ip_network("224.0.0.0/4"),      # multicast
     ipaddress.ip_network("240.0.0.0/4"),      # reserved
+    ipaddress.ip_network("::/128"),           # IPv6 unspecified
+    ipaddress.ip_network("ff00::/8"),         # IPv6 multicast
 ]
 
 
@@ -78,6 +80,10 @@ async def _validate_diagnostic_url(url: str) -> None:
         raise ValueError(f"Cannot resolve diagnostic URL hostname '{hostname}': {e}")
     for _, _, _, _, sockaddr in addr_infos:
         ip = ipaddress.ip_address(sockaddr[0])
+        # An IPv4-mapped IPv6 address (::ffff:a.b.c.d) parses as IPv6 and would
+        # sail past the IPv4 blocklist entries; check the embedded IPv4 instead.
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
         if any(ip in net for net in _BLOCKED_NETWORKS):
             raise ValueError(
                 f"Diagnostic URL resolves to a private or reserved address ({ip}), "
