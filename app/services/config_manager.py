@@ -9,6 +9,11 @@ from gundi_client_v2 import GundiClient
 from app import settings
 
 
+# Cached marker meaning "this integration has no webhook configuration", so a
+# cold cache doesn't trigger a Gundi API reload on every webhook-config lookup.
+_NO_WEBHOOK_CONFIG_SENTINEL = "null"
+
+
 class IntegrationConfigurationManager:
     # ToDo: Add support for webhook configs
 
@@ -39,10 +44,13 @@ class IntegrationConfigurationManager:
             for config in integration_details.configurations:
                 config_key = self._get_action_config_key(integration_id, config.action.value)
                 await self.db_client.set(config_key, config.json(), ttl)
-            # Save webhook configuration if present
+            # Save the webhook configuration — or a sentinel marking its absence, so
+            # integrations without one don't reload from the Gundi API on every lookup
+            webhook_key = self._get_webhook_config_key(integration_id)
             if webhook_configuration := integration_details.webhook_configuration:
-                webhook_key = self._get_webhook_config_key(integration_id)
                 await self.db_client.set(webhook_key, webhook_configuration.json(), ttl)
+            else:
+                await self.db_client.set(webhook_key, _NO_WEBHOOK_CONFIG_SENTINEL, ttl)
             return integration_details
 
     async def get_action_configuration(self, integration_id: str, action_id: str, ttl=None) -> Optional[IntegrationActionConfiguration]:
@@ -62,6 +70,8 @@ class IntegrationConfigurationManager:
             with attempt:
                 data = await self.db_client.get(key)
         if data:
+            if data in (_NO_WEBHOOK_CONFIG_SENTINEL, _NO_WEBHOOK_CONFIG_SENTINEL.encode()):
+                return None  # cached absence — this integration has no webhook config
             return WebhookConfiguration.parse_raw(data)
         # If not found in the redis db, try reloading data from Gundi API
         integration_details = await self._reload_integration_from_gundi(integration_id, ttl)
