@@ -368,5 +368,7 @@ async def test_pull_acquires_connection_slot(
         integration=integration, action_config=_sub_action_config()
     )
 
-    # The pull opened at least one connection under the shared semaphore.
+    # The pull opened at least one connection under the shared semaphore,
+    # keyed by the integration's Movebank username.
     assert slot.called
+    slot.assert_called_with("user")

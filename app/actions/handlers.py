@@ -84,7 +84,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         password=auth_config.password.get_secret_value(),
     )
     async with mb_client as mb:
-        individual_rows = await mb.get_individuals_by_study(study_id=action_config.study_id)
+        async with movebank_slot(auth_config.username):
+            individual_rows = await mb.get_individuals_by_study(study_id=action_config.study_id)
 
     individuals = list(generate_individuals(individual_rows))
     logger.info(f"{len(individuals)} individuals found for study {action_config.study_id}")
