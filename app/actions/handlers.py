@@ -7,12 +7,14 @@ from dateutil.parser import parse as parse_date
 from movebank_client import MovebankClient
 
 import app.actions.client as client
+from app import settings
 from app.actions.client import IndividualState, generate_individuals
 from app.actions.configurations import AuthenticateConfig, PullObservationsConfig, PullEventsForIndividualConfig
 from app.actions.transform import _ensure_utc, build_observation, chunks
 from app.services.action_scheduler import crontab_schedule, trigger_action
 from app.services.activity_logger import activity_logger
 from app.services.gundi import send_observations_to_gundi
+from app.services.movebank_connections import movebank_slot, NoConnectionSlot
 from app.services.state import IntegrationStateManager
 
 
@@ -31,6 +33,14 @@ OBSERVATIONS_BATCH_SIZE = 200
 
 CURSOR_STATE_ACTION_ID = "pull_events_for_individual"
 QUIET_STATE_ACTION_ID = "pull_events_for_individual_quiet"
+
+
+def _query_start_for_sensor(sensor_type_id: int, sensor_start: datetime) -> datetime:
+    """Accessory-measurements can arrive hours late, so its query re-reads back
+    ACCESSORY_SETTLING_HOURS; GPS is prompt and uses its exact cursor."""
+    if sensor_type_id == MovebankClient.MOVEBANK_SENSOR_TYPE_LABEL_TO_ID["accessory-measurements"]:
+        return sensor_start - timedelta(hours=settings.ACCESSORY_SETTLING_HOURS)
+    return sensor_start
 
 
 async def action_auth(integration, action_config: AuthenticateConfig):
@@ -199,16 +209,18 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                 sensor_start = sensor_type_timestamps[sensor_type_id]
                 if sensor_start > end_at:
                     continue  # this sensor is already past the window
+                query_start = _query_start_for_sensor(sensor_type_id, sensor_start)
                 sensor_events = []
-                async for event in mb.get_individual_events_by_time(
-                    study_id=action_config.study_id,
-                    individual_id=ind.id,
-                    timestamp_start=sensor_start,
-                    timestamp_end=end_at,
-                    sensor_type_ids=[sensor_type_id],
-                    minimum_event_id=minimum_event_ids[sensor_type_id],
-                ):
-                    sensor_events.append(event)
+                async with movebank_slot(auth_config.username):
+                    async for event in mb.get_individual_events_by_time(
+                        study_id=action_config.study_id,
+                        individual_id=ind.id,
+                        timestamp_start=query_start,
+                        timestamp_end=end_at,
+                        sensor_type_ids=[sensor_type_id],
+                        minimum_event_id=minimum_event_ids[sensor_type_id],
+                    ):
+                        sensor_events.append(event)
                 events_by_sensor[sensor_type_id] = sensor_events
                 events.extend(sensor_events)
 

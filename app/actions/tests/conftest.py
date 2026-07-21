@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -10,6 +11,17 @@ from app.actions.configurations import AuthenticateConfig
 def mock_activity_publish(mocker):
     """Keep @activity_logger from touching PubSub in tests."""
     mocker.patch("app.services.activity_logger.publish_event", AsyncMock(return_value=None))
+
+
+@pytest.fixture(autouse=True)
+def mock_connection_slot(mocker):
+    """Stub the Redis-backed connection semaphore so handler tests don't need a
+    live Redis. Tests that care about slot acquisition re-patch it explicitly."""
+    @asynccontextmanager
+    async def _noop_slot(username, *, ttl_seconds=600):
+        yield
+
+    return mocker.patch("app.actions.handlers.movebank_slot", side_effect=_noop_slot)
 
 
 @pytest.fixture

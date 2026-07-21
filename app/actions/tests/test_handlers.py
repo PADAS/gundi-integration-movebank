@@ -321,3 +321,52 @@ async def test_pull_events_advances_event_id_cursor_when_timestamps_unparseable(
     saved = mock_state_store.get((str(integration.id), "pull_events_for_individual", "111"))
     assert saved is not None
     assert IndividualState.parse_obj(saved).get_sensor_state(653).highest_event_id == 100
+
+
+@pytest.mark.asyncio
+async def test_pull_accessory_query_applies_settling_margin(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # An accessory-only individual with a saved cursor: the query start must be
+    # pushed back by ACCESSORY_SETTLING_HOURS so multi-hour-late records are caught.
+    from app.actions.client import IndividualState
+    from datetime import datetime, timezone
+    cursor_ts = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    state = IndividualState(individual_id="111", study_id="12345")
+    state.update_sensor_state(7842954, cursor_ts, 500)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = state.dict()
+
+    captured = {}
+
+    async def _gen(**kwargs):
+        captured.update(kwargs)
+        if False:
+            yield {}
+    mock_movebank_client.get_individual_events_by_time = _gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    await action_pull_events_for_individual(
+        integration=integration,
+        action_config=_sub_action_config(individual_overrides={"sensor_type_ids": "accessory-measurements"}),
+    )
+
+    # First fetch for the accessory sensor starts >= 12h before the cursor.
+    assert captured["sensor_type_ids"] == [7842954]
+    assert captured["timestamp_start"] <= cursor_ts - timedelta(hours=12)
+
+
+@pytest.mark.asyncio
+async def test_pull_acquires_connection_slot(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    events = [_gps_event(100, "2026-01-01 10:00:00.000")]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    slot = mocker.patch("app.actions.handlers.movebank_slot")
+
+    await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config()
+    )
+
+    # The pull opened at least one connection under the shared semaphore.
+    assert slot.called
