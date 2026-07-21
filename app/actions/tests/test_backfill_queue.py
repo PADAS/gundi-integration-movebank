@@ -29,6 +29,14 @@ def fake_redis():
     async def hget(key, field):
         return store["hashes"].get(key, {}).get(field)
 
+    async def hdel(key, *fields):
+        h = store["hashes"].get(key, {})
+        for f in fields:
+            h.pop(f, None)
+
+    async def exists(key):
+        return 1 if store["hashes"].get(key) else 0
+
     async def rpush(key, *vals):
         store["list"].extend(vals)
         return len(store["list"])
@@ -43,6 +51,8 @@ def fake_redis():
     client.hset = AsyncMock(side_effect=hset)
     client.hgetall = AsyncMock(side_effect=hgetall)
     client.hget = AsyncMock(side_effect=hget)
+    client.hdel = AsyncMock(side_effect=hdel)
+    client.exists = AsyncMock(side_effect=exists)
     client.rpush = AsyncMock(side_effect=rpush)
     client.lpop = AsyncMock(side_effect=lpop)
     client.llen = AsyncMock(side_effect=llen)
@@ -115,3 +125,27 @@ async def test_individual_configs_do_not_collide_with_meta_hash(job):
     snap = await job.snapshot()
     assert snap["total"] == 1
     assert await job.get_individual_config("total") == '{"total-config": true}'
+
+
+@pytest.mark.asyncio
+async def test_reset_attempts_clears_the_counter(job):
+    await job.seed(["a"], total=1, range_repr="r")
+    assert await job.incr_attempts("a") == 1
+    assert await job.incr_attempts("a") == 2
+    await job.reset_attempts("a")
+    # A fresh incr after reset starts back at 1, not 3.
+    assert await job.incr_attempts("a") == 1
+
+
+@pytest.mark.asyncio
+async def test_reset_attempts_is_a_noop_when_never_incremented(job):
+    await job.seed(["a"], total=1, range_repr="r")
+    await job.reset_attempts("a")  # must not raise
+    assert await job.incr_attempts("a") == 1
+
+
+@pytest.mark.asyncio
+async def test_exists_false_before_seed_true_after(job):
+    assert await job.exists() is False
+    await job.seed(["a"], total=1, range_repr="r")
+    assert await job.exists() is True

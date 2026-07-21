@@ -5,10 +5,19 @@ import redis.asyncio as redis
 from app import settings
 
 
+# Lazily-created module-level singleton (mirrors app.services.movebank_connections'
+# _client pattern): one Redis connection shared across every BackfillJob instance
+# instead of a new one per instantiation.
+_shared_client = None
+
+
 def _client() -> redis.Redis:
-    return redis.Redis(
-        host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_STATE_DB
-    )
+    global _shared_client
+    if _shared_client is None:
+        _shared_client = redis.Redis(
+            host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_STATE_DB
+        )
+    return _shared_client
 
 
 class BackfillJob:
@@ -58,6 +67,15 @@ class BackfillJob:
 
     async def incr_attempts(self, individual_id: str) -> int:
         return await self.db.hincrby(self._meta, f"attempts.{individual_id}", 1)
+
+    async def reset_attempts(self, individual_id: str) -> None:
+        await self.db.hdel(self._meta, f"attempts.{individual_id}")
+
+    async def exists(self) -> bool:
+        """Whether this job has already been seeded (i.e. is active). Used to
+        make action_backfill's seed step idempotent against a redelivered or
+        double-clicked command hashing to the same job_id."""
+        return bool(await self.db.exists(self._meta))
 
     async def put_individual_config(self, individual_id: str, config_json: str) -> None:
         await self.db.hset(f"{self._meta}.configs", mapping={individual_id: config_json})

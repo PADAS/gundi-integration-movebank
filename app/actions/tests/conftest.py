@@ -31,6 +31,7 @@ def mock_state_manager_redis(mocker):
     explicitly (e.g. the mock_state_store fixture below)."""
     mocker.patch("app.actions.handlers.state_manager.get_state", AsyncMock(return_value={}))
     mocker.patch("app.actions.handlers.state_manager.set_state", AsyncMock(return_value=None))
+    mocker.patch("app.actions.handlers.state_manager.delete_state", AsyncMock(return_value=None))
 
 
 @pytest.fixture

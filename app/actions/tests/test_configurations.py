@@ -73,6 +73,20 @@ def test_backfill_config_dated_and_filtered():
     assert config.backfill_max_concurrency == 4
 
 
+def test_backfill_config_rejects_malformed_start_string():
+    from app.actions.configurations import BackfillConfig
+    # A garbage string must not silently fall through to full-history "all" —
+    # only a real datetime or the literal "all" is accepted.
+    with pytest.raises(ValidationError):
+        BackfillConfig(study_id="12345", start="not-a-real-date")
+
+
+def test_backfill_config_rejects_zero_concurrency():
+    from app.actions.configurations import BackfillConfig
+    with pytest.raises(ValidationError):
+        BackfillConfig(study_id="12345", start="all", backfill_max_concurrency=0)
+
+
 def test_backfill_individual_config_is_internal_and_roundtrips():
     from app.actions.configurations import BackfillEventsForIndividualConfig
     from app.actions.core import InternalActionConfiguration

@@ -81,9 +81,13 @@ def mock_state_store(mocker):
     async def set_state(integration_id, action_id, state, source_id="no-source", expire=None):
         store[(str(integration_id), action_id, source_id)] = state
 
+    async def delete_state(integration_id, action_id, source_id="no-source"):
+        store.pop((str(integration_id), action_id, source_id), None)
+
     manager = mocker.patch("app.actions.handlers.state_manager")
     manager.get_state = AsyncMock(side_effect=get_state)
     manager.set_state = AsyncMock(side_effect=set_state)
+    manager.delete_state = AsyncMock(side_effect=delete_state)
     return store
 
 
@@ -404,6 +408,10 @@ async def test_backfill_seeds_queue_and_dispatches_up_to_k(
     mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", fake_incr)
     mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", fake_put_config)
     mocker.patch("app.actions.backfill_queue.BackfillJob.get_individual_config", fake_get_config)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 5, "completed": 0, "observations_sent": 0, "in_flight": 0,
+                                          "pending_remaining": 0, "range": "r"}))
     mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
     mocker.patch("app.actions.handlers.settings.BACKFILL_MAX_CONCURRENCY", 3)
 
@@ -434,6 +442,7 @@ async def test_backfill_respects_individual_filter(
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
     mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=1))
     mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
     mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
 
     await action_backfill(
@@ -451,6 +460,7 @@ async def test_backfill_acquires_connection_slot(
     mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[])
     mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
     slot = mocker.patch("app.actions.handlers.movebank_slot")
     await action_backfill(integration=integration, action_config=BackfillConfig(study_id="12345", start="all"))
     slot.assert_called_with("user")
@@ -476,6 +486,7 @@ async def test_backfill_individual_finalizes_and_dispatches_next(
                  AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 1, "in_flight": 0, "range": "r"}))
     mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
     mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
 
     result = await action_backfill_events_for_individual(
@@ -492,6 +503,8 @@ async def test_backfill_individual_finalizes_and_dispatches_next(
     assert st.get_sensor_state(653).highest_event_id == 10
     # Queue empty -> no next dispatch.
     assert not mock_trigger.called
+    # The backfill watermark is cleaned up after a successful finalize.
+    assert (str(integration.id), "backfill_watermark", "job-1.111") not in mock_state_store
 
 
 @pytest.mark.asyncio
@@ -507,6 +520,7 @@ async def test_backfill_individual_retriggers_self_when_budget_exhausted(
     mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
     # Force the time budget to zero so the step stops after the first window.
     mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 0)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
     mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
 
     result = await action_backfill_events_for_individual(
@@ -534,7 +548,6 @@ async def test_backfill_individual_sparse_sensor_reaches_end_without_livelock(
     # `end` and finalizes instead of restarting at `start` forever.
     from app.actions.configurations import BackfillEventsForIndividualConfig
     from datetime import datetime, timezone
-    from dateutil.parser import parse as parse_date
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2024, 1, 20, tzinfo=timezone.utc)  # 19 days -> multiple 5-day windows
     mock_movebank_client.get_individual_events_by_time = make_events_generator([])
@@ -545,6 +558,7 @@ async def test_backfill_individual_sparse_sensor_reaches_end_without_livelock(
                  AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0, "in_flight": 0, "range": "r"}))
     mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
     mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
     # Real-ish budget (not 0): plenty for a handful of mocked, near-instant windows.
 
@@ -557,8 +571,10 @@ async def test_backfill_individual_sparse_sensor_reaches_end_without_livelock(
 
     assert result["status"] == "completed"
     assert not mock_trigger.called  # no self re-trigger: bounded, not livelocked
-    watermark = mock_state_store[(str(integration.id), "backfill_watermark", "job-1.111")]
-    assert parse_date(watermark["scan_from"]) >= end
+    # The watermark is deleted on a successful finalize (see MINOR-4 fix) — its
+    # absence here is proof the scan floor actually reached `end` in-bounds
+    # rather than getting stuck mid-range.
+    assert (str(integration.id), "backfill_watermark", "job-1.111") not in mock_state_store
 
 
 @pytest.mark.asyncio
@@ -595,6 +611,7 @@ async def test_backfill_individual_resumes_scan_from_persisted_floor(
                  AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0, "in_flight": 0, "range": "r"}))
     mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
     mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
 
     result = await action_backfill_events_for_individual(
@@ -627,6 +644,7 @@ async def test_backfill_seeds_pull_cursor_at_end_and_finalize_merges_forward(
     mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
     mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
     mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
 
     before = datetime.now(tz=timezone.utc)
@@ -652,6 +670,7 @@ async def test_backfill_seeds_pull_cursor_at_end_and_finalize_merges_forward(
     mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
                  AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 1, "in_flight": 0, "range": "r"}))
     mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
 
     start = datetime(2025, 1, 1, tzinfo=timezone.utc)
     end = datetime(2025, 1, 3, tzinfo=timezone.utc)
@@ -750,7 +769,9 @@ async def test_backfill_individual_finalize_error_is_not_misclassified_as_this_i
     mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
     mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=False))
     mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
-                 AsyncMock(return_value={"total": 2, "completed": 1, "observations_sent": 1, "in_flight": 1, "range": "r"}))
+                 AsyncMock(return_value={"total": 2, "completed": 1, "observations_sent": 1, "in_flight": 1,
+                                          "pending_remaining": 1, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value="222"))
     # A real stored config for the NEXT individual, so dispatch-next actually
     # reaches trigger_action (rather than short-circuiting on a missing blob).
@@ -776,3 +797,306 @@ async def test_backfill_individual_finalize_error_is_not_misclassified_as_this_i
     # This individual's own completion was recorded exactly once — the finalize
     # error was NOT treated as this individual's failure (no retry/abandon).
     assert mock_record_completion.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pull_accessory_query_not_widened_without_prior_events(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A freshly-seeded accessory cursor (highest_event_id == 0 — e.g. right
+    # after _seed_pull_cursor_at_end at backfill start) must NOT be widened:
+    # doing so would re-read [T-settling, T) with minimum_event_id=1 and
+    # re-emit duplicates of everything already sent in that span.
+    from app.actions.client import IndividualState
+    from datetime import datetime, timezone
+    cursor_ts = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    state = IndividualState(individual_id="111", study_id="12345")
+    state.update_sensor_state(7842954, cursor_ts, 0)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = state.dict()
+
+    captured = {}
+
+    async def _gen(**kwargs):
+        captured.update(kwargs)
+        if False:
+            yield {}
+    mock_movebank_client.get_individual_events_by_time = _gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    await action_pull_events_for_individual(
+        integration=integration,
+        action_config=_sub_action_config(individual_overrides={"sensor_type_ids": "accessory-measurements"}),
+    )
+
+    assert captured["sensor_type_ids"] == [7842954]
+    # No widening: query starts exactly at the cursor, not settling hours before it.
+    assert captured["timestamp_start"] == cursor_ts
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_density_window_applies(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A high-frequency individual must get a narrower, density-sized window in
+    # backfill too (mirroring the pull's _compute_batch_window), not always
+    # the 5-day default.
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from datetime import datetime, timezone
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, tzinfo=timezone.utc)  # 30-day range
+    gen, calls = make_counting_events_generator(0)
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0, "in_flight": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345",
+            individual={**INDIVIDUAL_ROW, "number_of_events": "60000"},
+            job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "completed"
+    # 30-day range at a ~2.5-day density window => 12 windows, not the 6 the
+    # 5-day default would take.
+    assert calls["count"] == 12
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_stops_at_per_step_record_backstop(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A dense window can return far more than density sizing expects. The
+    # per-step backstop must stop taking more windows once this step's total
+    # crosses it, persisting progress and re-triggering rather than risking
+    # the invocation running past its execution budget.
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from datetime import datetime, timezone
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2025, 1, 1, tzinfo=timezone.utc)  # huge range, many windows available
+    gen, calls = make_counting_events_generator(3000)  # 3000 events/window, GPS-only
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "continued"
+    # 4 windows * 3000 = 12000 >= the 10000 backstop: stopped rather than
+    # continuing to sweep the (still huge) remaining range in one invocation.
+    assert calls["count"] == 4
+    assert result["observations_sent"] == 12000
+    assert mock_trigger.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_checks_deadline_between_sensor_fetches(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # The deadline must be checked BETWEEN per-sensor fetches within a window,
+    # not only between windows: a dense window's own fetches can exceed the
+    # budget, and there is no PubSub redelivery to recover a killed step.
+    # Uses a real (tiny) deadline and a real sleep on the first sensor's fetch
+    # rather than mocking time.monotonic, which asyncio's own loop internals
+    # also call (mocking it globally breaks the event loop itself).
+    import asyncio
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from datetime import datetime, timezone
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    calls = {"gps": 0, "accessory": 0}
+
+    async def _gen(**kwargs):
+        if kwargs["sensor_type_ids"] == [653]:
+            calls["gps"] += 1
+            await asyncio.sleep(0.1)  # simulate a slow first-sensor request
+        else:
+            calls["accessory"] += 1
+        if False:
+            yield {}
+    mock_movebank_client.get_individual_events_by_time = _gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    # A tiny real budget: comfortably survives until after the GPS fetch is
+    # requested, but is exhausted by the time the 0.1s sleep completes.
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 0.01)
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345",
+            individual={**INDIVIDUAL_ROW, "sensor_type_ids": "gps, accessory-measurements"},
+            job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "continued"
+    assert calls["gps"] == 1
+    assert calls["accessory"] == 0  # deadline hit before this sensor's fetch
+    assert mock_trigger.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_resets_attempts_after_successful_step(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from datetime import datetime, timezone
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    events = [_gps_event(10, "2024-01-02 00:00:00.000")]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 1, "in_flight": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mock_reset = mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "completed"
+    mock_reset.assert_awaited_once_with("111")
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_individuals_with_existing_cursor(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.configurations import BackfillConfig
+    from app.actions.client import IndividualState
+    from datetime import datetime, timezone
+    rows = [{**INDIVIDUAL_ROW, "id": str(i)} for i in range(3)]
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=rows)
+    # Individual "1" already has a steady-state pull cursor: backfill is for
+    # initial load only, so it must be skipped, not queued.
+    existing_state = IndividualState(individual_id="1", study_id="12345")
+    existing_state.update_sensor_state(653, datetime(2026, 1, 1, tzinfo=timezone.utc), 5)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "1")] = existing_state.dict()
+
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    warn = mocker.patch("app.actions.handlers.logger.warning")
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["individuals"] == 2       # "1" excluded
+    assert result["skipped_existing"] == 1
+    assert warn.call_count == 1             # exactly one summary warning
+    assert "skipped 1 individuals" in warn.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_reseed_when_job_already_active(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    # A redelivered/double-clicked backfill command hashes to the SAME job_id.
+    # If that job is already active, action_backfill must not re-seed (which
+    # would re-zero counters and re-RPUSH/double-dispatch individuals already
+    # in flight).
+    from app.actions.configurations import BackfillConfig
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mock_seed = mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mock_put_config = mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
+    mock_next = mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["already_active"] is True
+    assert "job_id" in result
+    assert mock_seed.await_count == 0
+    assert mock_put_config.await_count == 0
+    assert mock_next.await_count == 0
+    assert mock_trigger.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_backfill_individual_skips_missing_config_to_next_pending(mocker):
+    # If the first individual's stored config is missing (e.g. a lost/evicted
+    # Redis entry), the dispatch driver must advance to the next pending
+    # individual instead of silently stalling the cascade.
+    from app.actions.handlers import _dispatch_backfill_individual
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from datetime import datetime, timezone
+
+    job = mocker.MagicMock()
+    job.job_id = "job-1"
+    job.snapshot = AsyncMock(return_value={
+        "pending_remaining": 1, "total": 2, "completed": 0,
+        "observations_sent": 0, "in_flight": 0, "range": "r",
+    })
+    good_config = BackfillEventsForIndividualConfig(
+        study_id="12345", individual={**INDIVIDUAL_ROW, "id": "222"}, job_id="job-1",
+        start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2024, 1, 3, tzinfo=timezone.utc),
+    )
+    # "111"'s config is missing; "222" (next in the pending queue) has one.
+    job.get_individual_config = AsyncMock(side_effect=[None, good_config.json()])
+    job.next_individual = AsyncMock(return_value="222")
+    job.incr_in_flight = AsyncMock(return_value=1)
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    await _dispatch_backfill_individual("int-1", job, "111")
+
+    job.get_individual_config.assert_any_call("111")
+    job.get_individual_config.assert_any_call("222")
+    assert mock_trigger.await_count == 1
+    _, kwargs = mock_trigger.await_args_list[0]
+    assert kwargs["config"].individual.id == "222"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_backfill_individual_gives_up_after_exhausting_queue(mocker):
+    # Every stored config is missing (e.g. the whole configs hash was lost):
+    # the fallback loop must be bounded by the queue's length, not spin forever.
+    from app.actions.handlers import _dispatch_backfill_individual
+
+    job = mocker.MagicMock()
+    job.job_id = "job-1"
+    job.snapshot = AsyncMock(return_value={
+        "pending_remaining": 2, "total": 3, "completed": 0,
+        "observations_sent": 0, "in_flight": 0, "range": "r",
+    })
+    job.get_individual_config = AsyncMock(return_value=None)
+    job.next_individual = AsyncMock(side_effect=["222", "333", None])
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    await _dispatch_backfill_individual("int-1", job, "111")
+
+    assert mock_trigger.await_count == 0
+    # Bounded: pending_remaining(2) + 1 for the passed-in id == 3 attempts max.
+    assert job.get_individual_config.await_count <= 3

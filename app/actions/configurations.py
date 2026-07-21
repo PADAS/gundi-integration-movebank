@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union
 
 from pydantic import Field, SecretStr
 
@@ -45,7 +45,7 @@ class BackfillConfig(GenericActionConfiguration, ExecutableActionMixin):
         title="Individual IDs",
         description="Leave empty to backfill the whole study, or list specific individual IDs.",
     )
-    start: Union[datetime, str] = Field(
+    start: Union[datetime, Literal["all"]] = Field(
         "all",
         title="Start",
         description="Earliest datetime to backfill from, or 'all' to fetch from each individual's earliest record.",
@@ -54,6 +54,7 @@ class BackfillConfig(GenericActionConfiguration, ExecutableActionMixin):
         None,
         title="Max Concurrency",
         description="Individuals processed in parallel. Defaults to the service's BACKFILL_MAX_CONCURRENCY.",
+        ge=1,
     )
 
 

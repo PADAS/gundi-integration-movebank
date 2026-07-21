@@ -48,14 +48,42 @@ BACKFILL_ACTION_ID = "backfill_events_for_individual"
 BACKFILL_WATERMARK_ACTION_ID = "backfill_watermark"
 BACKFILL_PROGRESS_THROTTLE_SECONDS = 300
 BACKFILL_MAX_ATTEMPTS = 5
+# Per-step backstop for the backfill cascade: once a single invocation's
+# observations reach this, it stops taking more windows, persists its scan
+# position, and re-triggers — bounding how long one PubSub-ack'd invocation
+# can run even if window sizing (below) underestimates event density.
+MAX_RECORDS_PER_BACKFILL_STEP = 10000
 
 
-def _query_start_for_sensor(sensor_type_id: int, sensor_start: datetime) -> datetime:
+def _query_start_for_sensor(sensor_type_id: int, sensor_start: datetime, minimum_event_id: int) -> datetime:
     """Accessory-measurements can arrive hours late, so its query re-reads back
-    ACCESSORY_SETTLING_HOURS; GPS is prompt and uses its exact cursor."""
-    if sensor_type_id == MovebankClient.MOVEBANK_SENSOR_TYPE_LABEL_TO_ID["accessory-measurements"]:
+    ACCESSORY_SETTLING_HOURS — but only once there's a real prior cursor for
+    this sensor (minimum_event_id > 1, i.e. at least one event already
+    recorded). Widening a freshly-seeded cursor (minimum_event_id == 1, no
+    prior events — e.g. right after _seed_pull_cursor_at_end) would re-read
+    [T-settling, T) with minimum_event_id=1 and re-emit duplicates of
+    everything already sent in that span. GPS is prompt and always uses its
+    exact cursor."""
+    if (sensor_type_id == MovebankClient.MOVEBANK_SENSOR_TYPE_LABEL_TO_ID["accessory-measurements"]
+            and minimum_event_id > 1):
         return sensor_start - timedelta(hours=settings.ACCESSORY_SETTLING_HOURS)
     return sensor_start
+
+
+def _compute_batch_window(number_of_events, span_seconds) -> timedelta:
+    """Shared window-sizing logic for the steady-state pull and backfill:
+    high-frequency individuals get a window sized to hold roughly
+    HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD events over the given span, assuming
+    an even distribution; falls back to DEFAULT_BATCH_WINDOW otherwise, or
+    when the computed window would be non-positive (which would never
+    advance the scan position and spin forever)."""
+    if (number_of_events or 0) > HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD:
+        window = timedelta(seconds=(HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD / number_of_events) * span_seconds)
+    else:
+        window = DEFAULT_BATCH_WINDOW
+    if window <= timedelta(0):
+        window = DEFAULT_BATCH_WINDOW
+    return window
 
 
 def _supported_sensor_type_ids(ind) -> list:
@@ -217,22 +245,14 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
         logger.info(f"Skip Movebank {log_reference} for no new data.")
         return {"skipped": "no_new_data"}
 
-    # Size the fetch window by event density: high-frequency individuals get a
-    # window that should hold roughly HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD events,
-    # assuming an even distribution over the individual's active range.
-    if (ind.number_of_events or 0) > HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD:
-        # resolved_individual_timestamp_end falls back to now when the individual
-        # omits timestamp_end, so density sizing works for those individuals too.
-        total_seconds = (resolved_individual_timestamp_end - ind.timestamp_start).total_seconds()
-        batch_window_size = timedelta(
-            seconds=(HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD / ind.number_of_events) * total_seconds
-        )
-    else:
-        batch_window_size = DEFAULT_BATCH_WINDOW
-    if batch_window_size <= timedelta(0):
-        # A zero/negative window (timestamp_end <= timestamp_start) would never
-        # advance current_window_start and spin the fetch loop forever.
-        batch_window_size = DEFAULT_BATCH_WINDOW
+    # Size the fetch window by event density (shared with backfill via
+    # _compute_batch_window): high-frequency individuals get a window that
+    # should hold roughly HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD events, assuming
+    # an even distribution over the individual's active range.
+    # resolved_individual_timestamp_end falls back to now when the individual
+    # omits timestamp_end, so density sizing works for those individuals too.
+    total_seconds = (resolved_individual_timestamp_end - ind.timestamp_start).total_seconds()
+    batch_window_size = _compute_batch_window(ind.number_of_events, total_seconds)
 
     logger.info(
         f"For individual {ind.id} ({ind.nick_name}), using a window size of {batch_window_size} "
@@ -264,7 +284,7 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                 sensor_start = sensor_type_timestamps[sensor_type_id]
                 if sensor_start > end_at:
                     continue  # this sensor is already past the window
-                query_start = _query_start_for_sensor(sensor_type_id, sensor_start)
+                query_start = _query_start_for_sensor(sensor_type_id, sensor_start, minimum_event_ids[sensor_type_id])
                 sensor_events = []
                 async with movebank_slot(auth_config.username):
                     async for event in mb.get_individual_events_by_time(
@@ -393,6 +413,34 @@ async def action_backfill(integration, action_config: BackfillConfig):
     job_id = "job-" + hashlib.sha256(job_seed.encode()).hexdigest()[:12]
     job = BackfillJob(integration_id, job_id)
 
+    # Idempotent seed: a redelivered/double-clicked backfill command hashes to
+    # the SAME job_id. If that job is already active, re-seeding would
+    # re-zero its counters and re-RPUSH individuals that are already in
+    # flight or already dispatched — double-dispatching them. Bail out early.
+    if await job.exists():
+        logger.info(f"Backfill {job_id}: job already active, skipping re-seed")
+        return {"job_id": job_id, "already_active": True}
+
+    # Backfill is for INITIAL load only: an individual that already has a
+    # steady-state pull cursor is skipped entirely (not queued) — filling
+    # history behind an existing cursor isn't supported yet, and attempting it
+    # would duplicate data the pull has already collected.
+    candidates = []
+    skipped_existing = []
+    for i in individuals:
+        saved = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=i.id)
+        if saved:
+            skipped_existing.append(i.id)
+        else:
+            candidates.append(i)
+    if skipped_existing:
+        logger.warning(
+            f"Backfill {job_id}: skipped {len(skipped_existing)} individuals that already have "
+            "collection history (backfill is for initial load; filling history behind an "
+            "existing cursor is not yet supported)"
+        )
+    individuals = candidates
+
     ranges = {}
     had_cursor = {}
     for i in individuals:
@@ -434,22 +482,36 @@ async def action_backfill(integration, action_config: BackfillConfig):
         await _dispatch_backfill_individual(integration_id, job, next_id)
         dispatched += 1
 
-    return {"job_id": job_id, "individuals": len(queued), "dispatched": dispatched}
+    return {
+        "job_id": job_id, "individuals": len(queued), "dispatched": dispatched,
+        "skipped_existing": len(skipped_existing),
+    }
 
 
 async def _dispatch_backfill_individual(integration_id, job, individual_id):
     """Read the stored per-individual config and trigger the sub-action.
 
     Single dispatch path used both for the backfill action's first wave and
-    for the sub-action's rolling dispatch-next on completion.
+    for the sub-action's rolling dispatch-next on completion. If an
+    individual's config is missing (e.g. a lost/evicted Redis entry), this
+    advances to the next pending individual instead of stalling the driver
+    chain — bounded by the queue's length at call time so a fully-missing
+    configs hash can't loop forever.
     """
-    blob = await job.get_individual_config(individual_id)
-    if blob is None:
+    snap = await job.snapshot()
+    max_attempts = snap["pending_remaining"] + 1  # +1 for the individual_id passed in
+    for _ in range(max_attempts):
+        if individual_id is None:
+            return
+        blob = await job.get_individual_config(individual_id)
+        if blob is not None:
+            cfg = BackfillEventsForIndividualConfig.parse_raw(blob)
+            await job.incr_in_flight()
+            await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=cfg)
+            return
         logger.warning(f"Backfill {job.job_id}: no stored config for individual {individual_id}; skipping")
-        return
-    cfg = BackfillEventsForIndividualConfig.parse_raw(blob)
-    await job.incr_in_flight()
-    await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=cfg)
+        individual_id = await job.next_individual()
+    logger.warning(f"Backfill {job.job_id}: exhausted pending queue looking for a valid config to dispatch")
 
 
 async def _finalize_backfill_individual(integration_id, job, ind, action_config, *, observations, state=None):
@@ -476,6 +538,14 @@ async def _finalize_backfill_individual(integration_id, job, ind, action_config,
                 existing_state.update_sensor_state(stid, new_ts, new_event_id)
         await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID,
                                       json.loads(existing_state.json()), source_id=ind.id)
+        # Success path only: the watermark has served its purpose (merged
+        # into the pull cursor above) and would otherwise never be cleaned up.
+        # NOT deleted on the abandon path (state is None) — that watermark
+        # must survive so a later re-run of this individual resumes instead
+        # of restarting from scratch.
+        await state_manager.delete_state(
+            integration_id, BACKFILL_WATERMARK_ACTION_ID, source_id=f"{action_config.job_id}.{ind.id}"
+        )
     await job.record_completion(observations)
     await job.decr_in_flight()
 
@@ -534,7 +604,8 @@ async def action_backfill_events_for_individual(integration, action_config: Back
 
     auth_config = client.get_auth_config(integration)
     deadline = time.monotonic() + 0.8 * settings.MAX_ACTION_EXECUTION_TIME
-    window = DEFAULT_BATCH_WINDOW
+    span_seconds = (action_config.end - action_config.start).total_seconds()
+    window = _compute_batch_window(ind.number_of_events, span_seconds)
     observations_sent = 0
     current = persisted_scan_from if persisted_scan_from is not None else min(sensor_type_timestamps.values())
 
@@ -556,8 +627,18 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 # All sensors sweep the same [current, end_at) window together —
                 # anchored to the scan floor, not each sensor's own cursor.
                 events = []
+                window_interrupted = False
                 for stid in sensor_type_ids:
-                    query_start = _query_start_for_sensor(stid, current)
+                    # Check BETWEEN per-sensor fetches too, not just between
+                    # windows: a dense window's fetches alone can exceed the
+                    # budget, and an uncaught CancelledError from a killed
+                    # task would leak in_flight and leave a permanent data gap
+                    # (main.py's PubSub endpoint always acks — there is no
+                    # redelivery to recover a killed step).
+                    if time.monotonic() >= deadline:
+                        window_interrupted = True
+                        break
+                    query_start = _query_start_for_sensor(stid, current, minimum_event_ids[stid])
                     async with movebank_slot(auth_config.username):
                         async for event in mb.get_individual_events_by_time(
                             study_id=action_config.study_id, individual_id=ind.id,
@@ -573,7 +654,12 @@ async def action_backfill_events_for_individual(integration, action_config: Back
 
                 _advance_watermarks(state, events, sensor_type_ids, sensor_type_timestamps, minimum_event_ids)
                 observations_sent += len(observations)
-                current = current + window
+                if not window_interrupted:
+                    # Only advance past this window if EVERY sensor was fetched
+                    # for it; an interrupted window is retried in full next
+                    # step (safe: per-sensor minimum_event_id already advanced
+                    # for whichever sensors DID get fetched, so no duplicates).
+                    current = current + window
 
                 # Persist the scan floor together with the sensor states in a
                 # single call, every window, regardless of whether events came back.
@@ -581,6 +667,13 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 blob["scan_from"] = current.isoformat()
                 await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
                                               blob, source_id=watermark_source)
+
+                # Per-step backstop: a dense window can return far more than
+                # expected even with density-based sizing. Stop taking more
+                # windows once this step's total crosses the cap, rather than
+                # risking the invocation running past its execution budget.
+                if window_interrupted or observations_sent >= MAX_RECORDS_PER_BACKFILL_STEP:
+                    break
     except NoConnectionSlot:
         # No connection slot available: re-trigger THIS individual (same in-flight
         # unit continues) rather than losing the step or double-counting in-flight.
@@ -596,6 +689,12 @@ async def action_backfill_events_for_individual(integration, action_config: Back
         logger.warning(f"Backfill {action_config.job_id}/{ind.id}: abandoned after {attempts} attempts: {exc}")
         result = await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=0)
         return {"status": "abandoned", **{k: v for k, v in result.items() if k != "status"}}
+
+    # A successful step (fetch/send loop completed without raising) resets the
+    # attempts counter — so transient errors spread thinly across a long
+    # cascade don't accumulate toward abandonment; only CONSECUTIVE failures
+    # count against BACKFILL_MAX_ATTEMPTS.
+    await job.reset_attempts(ind.id)
 
     if current < action_config.end:
         # Budget exhausted mid-range: continue THIS individual on the next step.
