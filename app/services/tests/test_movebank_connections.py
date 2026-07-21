@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.services import movebank_connections
 from app.services.movebank_connections import (
     NoConnectionSlot,
     connection_key,
@@ -21,13 +22,19 @@ def test_connection_key_hashes_username():
 
 @pytest.fixture
 def mock_redis(mocker):
+    # Reset singleton before each test so the mock can intercept client creation
+    movebank_connections._shared_client = None
+
     client = MagicMock()
     client.eval = AsyncMock(return_value=1)      # acquired by default
     client.zrem = AsyncMock(return_value=1)
     redis_module = MagicMock()
     redis_module.Redis.return_value = client
     mocker.patch("app.services.movebank_connections.redis", redis_module)
-    return client
+
+    # Clean up after test
+    yield client
+    movebank_connections._shared_client = None
 
 
 @pytest.mark.asyncio

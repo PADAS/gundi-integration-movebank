@@ -30,10 +30,16 @@ def connection_key(username: str) -> str:
     return f"movebank:connections:{digest}"
 
 
+_shared_client = None
+
+
 def _client() -> redis.Redis:
-    return redis.Redis(
-        host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_STATE_DB
-    )
+    global _shared_client
+    if _shared_client is None:
+        _shared_client = redis.Redis(
+            host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_STATE_DB
+        )
+    return _shared_client
 
 
 @asynccontextmanager
