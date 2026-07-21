@@ -280,3 +280,23 @@ async def test_pull_events_advances_cursor_when_all_events_are_unusable(
     assert IndividualState.parse_obj(saved).get_sensor_state(653).highest_event_id == 100
     # ...and no quiet period, because the window did return events.
     assert (str(integration.id), "pull_events_for_individual_quiet", "111") not in mock_state_store
+
+
+@pytest.mark.asyncio
+async def test_pull_events_tolerates_whitespace_in_sensor_type_labels(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # "gps, accessory-measurements" (space after comma) must yield BOTH sensors:
+    # one fetch call each in the single catch-up window.
+    gen, calls = make_counting_events_generator(0)
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    await action_pull_events_for_individual(
+        integration=integration,
+        action_config=_sub_action_config(
+            individual_overrides={"sensor_type_ids": "gps, accessory-measurements"},
+        ),
+    )
+
+    assert calls["count"] == 2

@@ -118,7 +118,7 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     resolved_individual_timestamp_end = ind.timestamp_end or now
     highest_date = min(now, resolved_individual_timestamp_end)
 
-    sensor_type_labels = [label.lower() for label in ind.sensor_type_ids.split(",")]
+    sensor_type_labels = [label.strip().lower() for label in ind.sensor_type_ids.split(",")]
     sensor_type_ids = [
         MovebankClient.MOVEBANK_SENSOR_TYPE_LABEL_TO_ID[label]
         for label in sensor_type_labels
