@@ -239,6 +239,7 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     except pydantic.ValidationError:
         logger.exception(f"Failed parsing saved state for {log_reference}; starting fresh.")
         individual_state = None
+    was_fresh = individual_state is None
     if individual_state is None:
         individual_state = IndividualState(
             individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
@@ -246,6 +247,10 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
 
     # Build per-sensor cursors from state; new sensors start at the lookback window.
     default_start = resolved_individual_timestamp_end - timedelta(hours=action_config.maximum_lookback_hours)
+    if was_fresh:
+        # First-ever cursor for this individual: record the oldest point the pull
+        # will cover, so a later backfill knows where to stop (fills [start, this)).
+        individual_state.coverage_start = default_start
     sensor_type_timestamps = {}
     minimum_event_ids = {}
     for sensor_type_id in sensor_type_ids:

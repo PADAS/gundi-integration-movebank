@@ -1247,3 +1247,47 @@ async def test_dispatch_rolls_back_and_requeues_on_trigger_failure(mocker):
     assert calls["incr"] == 1
     assert calls["decr"] == 1              # rolled back
     assert calls["requeued"] == ["111"]    # not lost
+
+
+@pytest.mark.asyncio
+async def test_pull_first_run_stamps_coverage_start(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Fresh individual (no saved cursor): after the first run that persists a
+    # cursor, coverage_start must equal default_start = timestamp_end - lookback.
+    events = [_gps_event(100, "2026-06-30 10:00:00.000")]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    await action_pull_events_for_individual(
+        integration=integration,
+        action_config=_sub_action_config(
+            maximum_lookback_hours=24,
+            individual_overrides={"timestamp_end": "2026-07-01 00:00:00.000"},
+        ),
+    )
+
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    state = IndividualState.parse_obj(saved)
+    assert state.coverage_start == datetime(2026, 6, 30, 0, 0, tzinfo=timezone.utc)  # end - 24h
+
+
+@pytest.mark.asyncio
+async def test_pull_second_run_preserves_coverage_start(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A saved cursor with an existing coverage_start must not be overwritten.
+    prior = IndividualState(individual_id="111", study_id="12345")
+    prior.update_sensor_state(653, datetime(2026, 6, 1, tzinfo=timezone.utc), 50)
+    prior.coverage_start = datetime(2020, 1, 1, tzinfo=timezone.utc)  # far-back floor
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = prior.dict()
+    events = [_gps_event(100, "2026-06-30 10:00:00.000")]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config()
+    )
+
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    assert IndividualState.parse_obj(saved).coverage_start == datetime(2020, 1, 1, tzinfo=timezone.utc)
