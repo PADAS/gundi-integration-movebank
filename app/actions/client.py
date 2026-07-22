@@ -81,6 +81,10 @@ class IndividualState(pydantic.BaseModel):
     local_identifier: Optional[str] = None
     # Per-sensor-type cursors (key = sensor_type_id as string, because JSON keys are strings)
     sensor_states: Dict[str, SensorState] = pydantic.Field(default_factory=dict)
+    # Oldest timestamp this individual's steady-state coverage begins at. Set once
+    # (pull first run, or backfill seed/finalize); never advanced forward. Backfill
+    # fills [start, coverage_start) for an already-cursored individual.
+    coverage_start: Optional[datetime] = None
 
     def get_sensor_state(self, sensor_type_id: int) -> SensorState:
         key = str(sensor_type_id)

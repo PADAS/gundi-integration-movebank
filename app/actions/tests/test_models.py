@@ -70,3 +70,11 @@ def test_individual_state_update_and_roundtrip():
     assert restored.get_sensor_state(653).latest_timestamp == ts
     # An unrelated sensor still gets a fresh default state.
     assert restored.get_sensor_state(7842954).highest_event_id == 0
+
+
+def test_individual_state_coverage_start_roundtrips():
+    state = IndividualState(individual_id="111", study_id="12345")
+    assert state.coverage_start is None
+    state.coverage_start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    restored = IndividualState.parse_obj(state.dict())
+    assert restored.coverage_start == datetime(2024, 1, 1, tzinfo=timezone.utc)
