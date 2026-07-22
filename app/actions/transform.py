@@ -87,6 +87,7 @@ def build_observation(*, event: dict, device_name: str) -> Optional[dict]:
         "source": individual_id,
         "source_name": device_name,
         "type": "tracking-device",
+        "subject_type": "unassigned",
         "recorded_at": recorded_at.isoformat(),
         "location": {"lat": y, "lon": x},
         "additional": additional,
