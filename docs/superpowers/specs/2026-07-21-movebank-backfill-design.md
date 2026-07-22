@@ -1,6 +1,6 @@
 # Movebank Backfill — Design
 
-**Status:** approved design, pre-implementation
+**Status:** implemented (PR #14)
 **Date:** 2026-07-21
 
 ## Goal

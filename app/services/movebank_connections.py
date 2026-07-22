@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -6,6 +7,8 @@ from contextlib import asynccontextmanager
 import redis.asyncio as redis
 
 from app import settings
+
+logger = logging.getLogger(__name__)
 
 
 class NoConnectionSlot(Exception):
@@ -63,4 +66,11 @@ async def movebank_slot(username: str, *, ttl_seconds: int = 600):
     try:
         yield
     finally:
-        await client.zrem(key, token)
+        # Best-effort release: a failed zrem must not turn an otherwise-successful
+        # Movebank call into an action failure (spurious retry). The slot is
+        # time-bounded and purged on the next acquire, so a missed release
+        # self-heals via TTL.
+        try:
+            await client.zrem(key, token)
+        except Exception as exc:
+            logger.warning(f"Failed to release Movebank connection slot (will expire via TTL): {exc}")

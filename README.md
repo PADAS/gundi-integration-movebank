@@ -14,7 +14,7 @@ This is Gundi's integration for pulling data from Movebank Studies.
   State lives in Redis keyed by integration/action/individual.
 - **backfill** (executable) — operator-triggered historical load for a study.
   Config: `study_id`, optional `individual_ids` (whole study if empty), `start`
-  (a datetime or `"all"`), optional `backfill_max_concurrency`. Seeds a rolling
+  (a date string, e.g. `2024-01-01`, or `"all"`), optional `backfill_max_concurrency`. Seeds a rolling
   work-queue and dispatches per-individual sub-actions.
 - **backfill_events_for_individual** (internal) — self-cascading worker for one
   individual: fetches `[start, end)` in time-budgeted steps under the shared

@@ -548,16 +548,22 @@ async def _finalize_backfill_individual(integration_id, job, ind, action_config,
                 existing_state.update_sensor_state(stid, new_ts, new_event_id)
         await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID,
                                       json.loads(existing_state.json()), source_id=ind.id)
-        # Success path only: the watermark has served its purpose (merged
-        # into the pull cursor above) and would otherwise never be cleaned up.
-        # NOT deleted on the abandon path (state is None) — that watermark
-        # must survive so a later re-run of this individual resumes instead
-        # of restarting from scratch.
-        await state_manager.delete_state(
-            integration_id, BACKFILL_WATERMARK_ACTION_ID, source_id=f"{action_config.job_id}.{ind.id}"
-        )
     await job.record_completion(observations)
     await job.decr_in_flight()
+
+    if state is not None:
+        # Best-effort watermark cleanup, AFTER the job counters are updated:
+        # the watermark has served its purpose (merged into the pull cursor
+        # above), but a Redis hiccup here must not leave in_flight un-decremented
+        # and the job stuck. A leftover watermark is harmless (this individual
+        # is done; a re-run is refused by the idempotent-seed guard). NOT deleted
+        # on the abandon path (state is None) so a re-run resumes from it.
+        try:
+            await state_manager.delete_state(
+                integration_id, BACKFILL_WATERMARK_ACTION_ID, source_id=f"{action_config.job_id}.{ind.id}"
+            )
+        except Exception as exc:
+            logger.warning(f"Backfill {action_config.job_id}/{ind.id}: watermark cleanup failed (harmless): {exc}")
 
     if await job.is_done():
         snap = await job.snapshot()
