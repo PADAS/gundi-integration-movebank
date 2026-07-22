@@ -462,34 +462,45 @@ async def action_backfill(integration, action_config: BackfillConfig):
         logger.info(f"Backfill {job_id}: job already active, skipping re-seed")
         return {"job_id": job_id, "already_active": True}
 
-    # Backfill is for INITIAL load only: an individual that already has a
-    # steady-state pull cursor is skipped entirely (not queued) — filling
-    # history behind an existing cursor isn't supported yet, and attempting it
-    # would duplicate data the pull has already collected.
-    candidates = []
+    # Resolve each individual's backfill end from its steady-state coverage
+    # floor. Backfill fills [start, end); the pull owns [end, +inf).
+    #   - no cursor            -> end = now, and seed the pull cursor at now
+    #   - coverage_start set   -> end = coverage_start (fill history behind the pull)
+    #   - legacy seed (all event_id 0, no coverage_start) -> end = its timestamp
+    #   - legacy real cursor (event_id > 0, no coverage_start) -> skip (unknown floor)
+    ranges = {}
+    seed_needed = set()
     skipped_existing = []
     for i in individuals:
         saved = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=i.id)
-        if saved:
-            skipped_existing.append(i.id)
+        if not saved:
+            end_dt = now
+            seed_needed.add(i.id)
         else:
-            candidates.append(i)
+            state = IndividualState.parse_obj(saved)
+            if state.coverage_start is not None:
+                end_dt = state.coverage_start
+            elif all((ss.highest_event_id or 0) == 0 for ss in state.sensor_states.values()):
+                stamps = [ss.latest_timestamp for ss in state.sensor_states.values() if ss.latest_timestamp]
+                end_dt = min(stamps) if stamps else now
+            else:
+                skipped_existing.append(i.id)
+                continue
+            latest = max((ss.latest_timestamp for ss in state.sensor_states.values() if ss.latest_timestamp), default=None)
+            if latest and end_dt > latest - timedelta(hours=settings.ACCESSORY_SETTLING_HOURS):
+                logger.warning(
+                    f"Backfill {job_id}/{i.id}: coverage span is below the accessory settling "
+                    "margin; accessory rows near the boundary may duplicate."
+                )
+        ranges[i.id] = (_resolve_start(action_config.start, i), end_dt)
     if skipped_existing:
         logger.warning(
-            f"Backfill {job_id}: skipped {len(skipped_existing)} individuals that already have "
-            "collection history (backfill is for initial load; filling history behind an "
-            "existing cursor is not yet supported)"
+            f"Backfill {job_id}: skipped {len(skipped_existing)} individuals with existing collection "
+            "history but no recorded coverage floor; clear their cursor to force a full backfill."
         )
-    individuals = candidates
-
-    # Every candidate reaching here has NO existing pull cursor (the filter
-    # above skipped those that did), so each individual's boundary is simply
-    # `now`: backfill covers [start, now) and the pull will cover [now, +inf)
-    # once its cursor is claimed below.
-    ranges = {i.id: (_resolve_start(action_config.start, i), now) for i in individuals}
 
     # Only individuals with a non-empty range are worth queuing.
-    queued = [i for i in individuals if ranges[i.id][0] < ranges[i.id][1]]
+    queued = [i for i in individuals if i.id in ranges and ranges[i.id][0] < ranges[i.id][1]]
     range_repr = f"[{action_config.start} .. {now.isoformat()})"
     await job.seed([i.id for i in queued], total=len(queued), range_repr=range_repr)
 
@@ -503,9 +514,10 @@ async def action_backfill(integration, action_config: BackfillConfig):
     # backfill is about to cover (see _seed_pull_cursor_at_end).
     for i in queued:
         start_dt, end_dt = ranges[i.id]
-        # No prior cursor (guaranteed by the skip filter) — claim the boundary
-        # so a concurrent */10 pull can't reach back into backfill's range.
-        await _seed_pull_cursor_at_end(integration_id, action_config.study_id, i, end_dt)
+        # Only fresh individuals need a boundary-claim seed; an already-cursored
+        # individual's cursor already owns [coverage_start, +inf).
+        if i.id in seed_needed:
+            await _seed_pull_cursor_at_end(integration_id, action_config.study_id, i, end_dt)
         await job.put_individual_config(
             i.id,
             BackfillEventsForIndividualConfig(

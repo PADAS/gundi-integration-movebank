@@ -4,7 +4,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.actions.client import IndividualState
-from app.actions.configurations import PullEventsForIndividualConfig, PullObservationsConfig
+from app.actions.configurations import (
+    BackfillConfig,
+    BackfillEventsForIndividualConfig,
+    PullEventsForIndividualConfig,
+    PullObservationsConfig,
+)
 from app.actions.handlers import (
     action_backfill,
     action_backfill_events_for_individual,
@@ -1335,3 +1340,100 @@ async def test_finalize_sets_coverage_start_to_backfill_start(
 
     saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
     assert IndividualState.parse_obj(saved).coverage_start == start
+
+
+@pytest.mark.asyncio
+async def test_backfill_fills_behind_existing_coverage_start(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # An individual WITH a real cursor (coverage_start recorded) must be queued,
+    # with end == coverage_start (not skipped).
+    from app.actions.configurations import BackfillConfig
+    cov = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    st = IndividualState(individual_id="111", study_id="12345")
+    st.update_sensor_state(653, datetime(2026, 6, 1, tzinfo=timezone.utc), 500)
+    st.coverage_start = cov
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = st.dict()
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    seeded = {}
+    async def fake_seed(self, ids, *, total, range_repr): seeded["ids"] = list(ids)
+    async def fake_put(self, iid, blob): seeded.setdefault("configs", {})[iid] = blob
+    async def fake_next(self): return (seeded.get("ids") or []).pop(0) if seeded.get("ids") else None
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", fake_seed)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", fake_put)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", fake_next)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=1))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.get_individual_config",
+                 AsyncMock(side_effect=lambda iid: seeded["configs"][iid]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 0, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration, action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["individuals"] == 1          # queued, not skipped
+    cfg = BackfillEventsForIndividualConfig.parse_raw(seeded["configs"]["111"])
+    assert cfg.end == cov                       # end == coverage_start
+
+
+@pytest.mark.asyncio
+async def test_backfill_legacy_seed_placeholder_full_backfill(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Legacy cursor: all sensors event_id == 0, no coverage_start -> treat its
+    # timestamp as the floor (full backfill), do NOT skip.
+    seed_ts = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    st = IndividualState(individual_id="111", study_id="12345")
+    st.update_sensor_state(653, seed_ts, 0)     # event_id 0 => placeholder
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = st.dict()
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    seeded = {}
+    async def fake_seed(self, ids, *, total, range_repr): seeded["ids"] = list(ids)
+    async def fake_put(self, iid, blob): seeded.setdefault("configs", {})[iid] = blob
+    async def fake_next(self): return (seeded.get("ids") or []).pop(0) if seeded.get("ids") else None
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", fake_seed)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", fake_put)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", fake_next)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=1))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.get_individual_config",
+                 AsyncMock(side_effect=lambda iid: seeded["configs"][iid]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 0, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration, action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["individuals"] == 1
+    cfg = BackfillEventsForIndividualConfig.parse_raw(seeded["configs"]["111"])
+    assert cfg.end == seed_ts
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_legacy_real_cursor_unknown_floor(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Legacy real coverage (event_id > 0) with no coverage_start -> skip with warning.
+    st = IndividualState(individual_id="111", study_id="12345")
+    st.update_sensor_state(653, datetime(2026, 6, 1, tzinfo=timezone.utc), 500)  # real events, no coverage_start
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = st.dict()
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration, action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["individuals"] == 0
+    assert result["skipped_existing"] == 1
+    assert not mock_trigger.called
