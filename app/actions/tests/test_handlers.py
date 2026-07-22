@@ -1515,9 +1515,9 @@ async def test_backfill_settling_warning_gated_by_real_coverage(
 
 def test_display_name_precedence():
     from app.actions.handlers import _display_name
-    # nick_name wins when present
-    assert _display_name(_make_individual()) == "Aquila"
-    # empty nick_name falls back to local_identifier
-    assert _display_name(_make_individual(nick_name="")) == "tag-1"
-    # empty nick_name and local_identifier fall back to ring_id
-    assert _display_name(_make_individual(nick_name="", local_identifier="")) == "R1"
+    # local_identifier wins when present
+    assert _display_name(_make_individual()) == "tag-1"
+    # empty local_identifier falls back to nick_name
+    assert _display_name(_make_individual(local_identifier="")) == "Aquila"
+    # empty local_identifier and nick_name fall back to ring_id
+    assert _display_name(_make_individual(local_identifier="", nick_name="")) == "R1"

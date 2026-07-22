@@ -89,9 +89,9 @@ def _compute_batch_window(number_of_events, span_seconds) -> timedelta:
 
 def _display_name(ind) -> str:
     """Human-facing name for an individual, used as the observation's
-    subject_name/source_name. Prefers the nick_name, falling back to the
-    tag's local_identifier and then the ring_id (matches the v1 integration)."""
-    return ind.nick_name or ind.local_identifier or ind.ring_id
+    subject_name/source_name. Prefers the tag's local_identifier, falling
+    back to the nick_name and then the ring_id."""
+    return ind.local_identifier or ind.nick_name or ind.ring_id
 
 
 def _supported_sensor_type_ids(ind) -> list:
