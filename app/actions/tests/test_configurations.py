@@ -48,3 +48,54 @@ def test_auth_config_unchanged():
     assert config.password.get_secret_value() == "p"
     from app.actions.core import ExecutableActionMixin
     assert issubclass(AuthenticateConfig, ExecutableActionMixin)
+
+
+def test_backfill_config_whole_study_all_data():
+    from app.actions.configurations import BackfillConfig
+    from app.actions.core import ExecutableActionMixin
+    config = BackfillConfig(study_id="12345", start="all")
+    assert config.individual_ids is None
+    assert config.start == "all"
+    assert issubclass(BackfillConfig, ExecutableActionMixin)
+
+
+def test_backfill_config_dated_and_filtered():
+    from app.actions.configurations import BackfillConfig
+    config = BackfillConfig(
+        study_id="12345",
+        individual_ids=["111", "222"],
+        start="2024-01-01",
+        backfill_max_concurrency=4,
+    )
+    assert config.individual_ids == ["111", "222"]
+    assert config.start == "2024-01-01"
+    assert config.backfill_max_concurrency == 4
+
+
+def test_backfill_config_rejects_malformed_start_string():
+    from app.actions.configurations import BackfillConfig
+    # A garbage string must not silently fall through to full-history "all" —
+    # only a real datetime or the literal "all" is accepted.
+    with pytest.raises(ValidationError):
+        BackfillConfig(study_id="12345", start="not-a-real-date")
+
+
+def test_backfill_config_rejects_zero_concurrency():
+    from app.actions.configurations import BackfillConfig
+    with pytest.raises(ValidationError):
+        BackfillConfig(study_id="12345", start="all", backfill_max_concurrency=0)
+
+
+def test_backfill_individual_config_is_internal_and_roundtrips():
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from app.actions.core import InternalActionConfiguration
+    from datetime import datetime, timezone
+    cfg = BackfillEventsForIndividualConfig(
+        study_id="12345", individual=INDIVIDUAL, job_id="job-1",
+        start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    assert isinstance(cfg, InternalActionConfiguration)
+    restored = BackfillEventsForIndividualConfig.parse_obj(cfg.dict())
+    assert restored.individual.id == "111"
+    assert restored.job_id == "job-1"
