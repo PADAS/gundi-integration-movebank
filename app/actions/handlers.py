@@ -487,7 +487,8 @@ async def action_backfill(integration, action_config: BackfillConfig):
                 skipped_existing.append(i.id)
                 continue
             latest = max((ss.latest_timestamp for ss in state.sensor_states.values() if ss.latest_timestamp), default=None)
-            if latest and end_dt > latest - timedelta(hours=settings.ACCESSORY_SETTLING_HOURS):
+            has_real_coverage = any((ss.highest_event_id or 0) > 0 for ss in state.sensor_states.values())
+            if has_real_coverage and latest and end_dt > latest - timedelta(hours=settings.ACCESSORY_SETTLING_HOURS):
                 logger.warning(
                     f"Backfill {job_id}/{i.id}: coverage span is below the accessory settling "
                     "margin; accessory rows near the boundary may duplicate."
@@ -501,7 +502,7 @@ async def action_backfill(integration, action_config: BackfillConfig):
 
     # Only individuals with a non-empty range are worth queuing.
     queued = [i for i in individuals if i.id in ranges and ranges[i.id][0] < ranges[i.id][1]]
-    range_repr = f"[{action_config.start} .. {now.isoformat()})"
+    range_repr = f"[{action_config.start} .. per-individual coverage floor)"
     await job.seed([i.id for i in queued], total=len(queued), range_repr=range_repr)
 
     logger.info(f"Backfill {job_id} for study {action_config.study_id}: {len(queued)} individuals, range {range_repr}")

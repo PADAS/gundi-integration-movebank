@@ -1437,3 +1437,77 @@ async def test_backfill_skips_legacy_real_cursor_unknown_floor(
     assert result["individuals"] == 0
     assert result["skipped_existing"] == 1
     assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_individual_with_empty_range(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # An already-covered individual whose coverage_start is at or behind its
+    # resolved start produces an empty [start, end) range. It must be neither
+    # queued nor counted as skipped_existing (that counter is reserved for the
+    # legacy real-cursor-without-floor case).
+    resolved_start = datetime(2025, 1, 1, tzinfo=timezone.utc)  # INDIVIDUAL_ROW's timestamp_start
+    st = IndividualState(individual_id="111", study_id="12345")
+    st.update_sensor_state(653, datetime(2026, 6, 1, tzinfo=timezone.utc), 500)
+    st.coverage_start = resolved_start
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = st.dict()
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration, action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["individuals"] == 0
+    assert result["skipped_existing"] == 0
+    assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_settling_warning_gated_by_real_coverage(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store, caplog
+):
+    # The settling-margin warning should only fire when the cursor reflects
+    # real prior coverage (highest_event_id > 0 on at least one sensor). A
+    # freshly-seeded/legacy-placeholder cursor (all event_id == 0) always has
+    # end_dt == latest, which would otherwise trip the warning spuriously.
+    from app import settings
+
+    async def run_backfill():
+        mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+        mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+        mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
+        mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+        mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+        return await action_backfill(
+            integration=integration, action_config=BackfillConfig(study_id="12345", start="all"),
+        )
+
+    warning_text = "accessory rows near the boundary may duplicate"
+
+    # Real cursor, span below the settling margin -> warning IS logged.
+    latest = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    real_st = IndividualState(individual_id="111", study_id="12345")
+    real_st.update_sensor_state(653, latest, 500)  # real events
+    real_st.coverage_start = latest - timedelta(hours=settings.ACCESSORY_SETTLING_HOURS - 1)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = real_st.dict()
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        await run_backfill()
+    assert any(warning_text in rec.message for rec in caplog.records)
+
+    # Zero-span placeholder cursor (all sensors event_id == 0) -> warning is NOT logged.
+    placeholder_st = IndividualState(individual_id="111", study_id="12345")
+    placeholder_st.update_sensor_state(653, latest, 0)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = placeholder_st.dict()
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        await run_backfill()
+    assert not any(warning_text in rec.message for rec in caplog.records)
