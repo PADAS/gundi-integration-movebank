@@ -149,3 +149,14 @@ async def test_exists_false_before_seed_true_after(job):
     assert await job.exists() is False
     await job.seed(["a"], total=1, range_repr="r")
     assert await job.exists() is True
+
+
+@pytest.mark.asyncio
+async def test_requeue_returns_individual_to_pending(job):
+    await job.seed(["a", "b"], total=2, range_repr="r")
+    assert await job.next_individual() == "a"      # pop a
+    await job.requeue("a")                          # put it back
+    # a is now at the tail: b comes first, then a.
+    assert await job.next_individual() == "b"
+    assert await job.next_individual() == "a"
+    assert await job.next_individual() is None

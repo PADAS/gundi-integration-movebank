@@ -772,6 +772,10 @@ async def test_backfill_individual_finalize_error_is_not_misclassified_as_this_i
                  AsyncMock(return_value={"total": 2, "completed": 1, "observations_sent": 1, "in_flight": 1,
                                           "pending_remaining": 1, "range": "r"}))
     mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    # dispatch-next rolls back + requeues the next individual when trigger fails,
+    # then re-raises — mock both so the RuntimeError (not a Redis error) surfaces.
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=2))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.requeue", AsyncMock())
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value="222"))
     # A real stored config for the NEXT individual, so dispatch-next actually
     # reaches trigger_action (rather than short-circuiting on a missing blob).
@@ -1206,3 +1210,40 @@ async def test_pull_events_skips_on_no_connection_slot(
     )
 
     assert result["skipped"] == "no_connection_slot"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rolls_back_and_requeues_on_trigger_failure(mocker):
+    # If trigger_action raises, in_flight must be rolled back and the individual
+    # re-queued (not lost) — otherwise in_flight stays inflated and the resume
+    # path can never fire.
+    from app.actions.backfill_queue import BackfillJob
+    from app.actions.handlers import _dispatch_backfill_individual
+    calls = {"incr": 0, "decr": 0, "requeued": []}
+
+    async def fake_snapshot(self):
+        return {"total": 1, "completed": 0, "observations_sent": 0, "in_flight": 0,
+                "pending_remaining": 0, "range": "r"}
+    async def fake_get_config(self, iid):
+        return ('{"study_id":"12345","individual":' + __import__("json").dumps(INDIVIDUAL_ROW) +
+                ',"job_id":"job-x","start":"2024-01-01T00:00:00+00:00","end":"2024-02-01T00:00:00+00:00"}')
+    async def fake_incr(self, n=1):
+        calls["incr"] += 1; return 1
+    async def fake_decr(self):
+        calls["decr"] += 1; return 0
+    async def fake_requeue(self, iid):
+        calls["requeued"].append(iid)
+    mocker.patch.object(BackfillJob, "snapshot", fake_snapshot)
+    mocker.patch.object(BackfillJob, "get_individual_config", fake_get_config)
+    mocker.patch.object(BackfillJob, "incr_in_flight", fake_incr)
+    mocker.patch.object(BackfillJob, "decr_in_flight", fake_decr)
+    mocker.patch.object(BackfillJob, "requeue", fake_requeue)
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock(side_effect=RuntimeError("pubsub down")))
+
+    job = BackfillJob("int-1", "job-x")
+    with pytest.raises(RuntimeError, match="pubsub down"):
+        await _dispatch_backfill_individual("int-1", job, "111")
+
+    assert calls["incr"] == 1
+    assert calls["decr"] == 1              # rolled back
+    assert calls["requeued"] == ["111"]    # not lost

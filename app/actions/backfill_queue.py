@@ -51,6 +51,11 @@ class BackfillJob:
             return None
         return value.decode() if isinstance(value, bytes) else value
 
+    async def requeue(self, individual_id: str) -> None:
+        """Return a popped individual to the pending queue (e.g. when its
+        dispatch failed to publish), so it isn't lost."""
+        await self.db.rpush(self._pending, individual_id)
+
     async def incr_in_flight(self, n: int = 1) -> int:
         return await self.db.hincrby(self._meta, "in_flight", n)
 

@@ -561,7 +561,18 @@ async def _dispatch_backfill_individual(integration_id, job, individual_id):
         if blob is not None:
             cfg = BackfillEventsForIndividualConfig.parse_raw(blob)
             await job.incr_in_flight()
-            await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=cfg)
+            try:
+                await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=cfg)
+            except Exception:
+                # Publish failed (e.g. commands topic unset, transient PubSub
+                # error). Roll back the increment and return the individual to
+                # the queue so it isn't lost — an inflated in_flight would also
+                # block the resume path (which keys on in_flight == 0). Re-raise
+                # so a persistent failure stays visible; state is now consistent
+                # for a later resume.
+                await job.decr_in_flight()
+                await job.requeue(individual_id)
+                raise
             return
         logger.warning(f"Backfill {job.job_id}: no stored config for individual {individual_id}; skipping")
         individual_id = await job.next_individual()
