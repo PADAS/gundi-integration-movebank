@@ -6,11 +6,15 @@ from pydantic import Field, SecretStr
 from app.actions import AuthActionConfiguration, ExecutableActionMixin, PullActionConfiguration
 from app.actions.client import Individual
 from app.actions.core import GenericActionConfiguration, InternalActionConfiguration
+from app.services.utils import GlobalUISchemaOptions
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     username: str
     password: SecretStr = Field(..., format="password")
+    ui_global_options = GlobalUISchemaOptions(
+        order=["username", "password"],
+    )
 
 
 class PullObservationsConfig(PullActionConfiguration):
