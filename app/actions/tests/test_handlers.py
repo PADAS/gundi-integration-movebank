@@ -1511,3 +1511,13 @@ async def test_backfill_settling_warning_gated_by_real_coverage(
     with caplog.at_level("WARNING"):
         await run_backfill()
     assert not any(warning_text in rec.message for rec in caplog.records)
+
+
+def test_display_name_precedence():
+    from app.actions.handlers import _display_name
+    # nick_name wins when present
+    assert _display_name(_make_individual()) == "Aquila"
+    # empty nick_name falls back to local_identifier
+    assert _display_name(_make_individual(nick_name="")) == "tag-1"
+    # empty nick_name and local_identifier fall back to ring_id
+    assert _display_name(_make_individual(nick_name="", local_identifier="")) == "R1"

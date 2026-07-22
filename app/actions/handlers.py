@@ -87,6 +87,13 @@ def _compute_batch_window(number_of_events, span_seconds) -> timedelta:
     return window
 
 
+def _display_name(ind) -> str:
+    """Human-facing name for an individual, used as the observation's
+    subject_name/source_name. Prefers the nick_name, falling back to the
+    tag's local_identifier and then the ring_id (matches the v1 integration)."""
+    return ind.nick_name or ind.local_identifier or ind.ring_id
+
+
 def _supported_sensor_type_ids(ind) -> list:
     """Movebank sensor-type labels this individual reports, mapped to the
     numeric sensor_type_ids this integration knows how to handle."""
@@ -277,7 +284,7 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
         f"({ind.number_of_events} events on record)."
     )
 
-    device_name = ind.nick_name or ind.local_identifier or ind.ring_id
+    device_name = _display_name(ind)
     auth_config = client.get_auth_config(integration)
     total_observations_sent = 0
     current_window_start = earliest_start
@@ -722,7 +729,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                         ):
                             events.append(event)
 
-                device_name = ind.nick_name or ind.local_identifier or ind.ring_id
+                device_name = _display_name(ind)
                 observations = [o for e in events if (o := build_observation(event=e, device_name=device_name)) is not None]
                 for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
                     await send_observations_to_gundi(observations=batch, integration_id=integration_id)
