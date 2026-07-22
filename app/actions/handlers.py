@@ -172,9 +172,19 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         username=auth_config.username,
         password=auth_config.password.get_secret_value(),
     )
-    async with mb_client as mb:
-        async with movebank_slot(auth_config.username):
-            individual_rows = await mb.get_individuals_by_study(study_id=action_config.study_id)
+    try:
+        async with mb_client as mb:
+            async with movebank_slot(auth_config.username):
+                individual_rows = await mb.get_individuals_by_study(study_id=action_config.study_id)
+    except NoConnectionSlot:
+        # Movebank connection budget exhausted (e.g. a backfill is saturating it).
+        # This is a scheduled tick — skip cleanly and let the next one retry,
+        # rather than surfacing an action failure and triggering no sub-actions.
+        logger.info(
+            f"Skipping pull for study {action_config.study_id}: Movebank connection budget "
+            "exhausted; the next scheduled tick will retry."
+        )
+        return {"skipped": "no_connection_slot"}
 
     individuals = list(generate_individuals(individual_rows))
     logger.info(f"{len(individuals)} individuals found for study {action_config.study_id}")
@@ -289,17 +299,30 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                     continue  # this sensor is already past the window
                 query_start = _query_start_for_sensor(sensor_type_id, sensor_start, minimum_event_ids[sensor_type_id])
                 count = 0
-                async with movebank_slot(auth_config.username):
-                    async for event in mb.get_individual_events_by_time(
-                        study_id=action_config.study_id,
-                        individual_id=ind.id,
-                        timestamp_start=query_start,
-                        timestamp_end=end_at,
-                        sensor_type_ids=[sensor_type_id],
-                        minimum_event_id=minimum_event_ids[sensor_type_id],
-                    ):
-                        events.append(event)  # single combined list; no per-sensor copy
-                        count += 1
+                try:
+                    async with movebank_slot(auth_config.username):
+                        async for event in mb.get_individual_events_by_time(
+                            study_id=action_config.study_id,
+                            individual_id=ind.id,
+                            timestamp_start=query_start,
+                            timestamp_end=end_at,
+                            sensor_type_ids=[sensor_type_id],
+                            minimum_event_id=minimum_event_ids[sensor_type_id],
+                        ):
+                            events.append(event)  # single combined list; no per-sensor copy
+                            count += 1
+                except NoConnectionSlot:
+                    # Budget exhausted (e.g. a backfill is saturating it). Prior
+                    # windows already persisted their cursors, so skip cleanly and
+                    # resume from the saved cursor on the next scheduled tick —
+                    # rather than raising a noisy action failure. This window's
+                    # partial fetch is discarded (not yet sent) and re-fetched next
+                    # tick; the event-id filter dedups.
+                    logger.info(
+                        f"Skipping {log_reference}: Movebank connection budget exhausted; "
+                        "resuming from the saved cursor on the next tick."
+                    )
+                    return {"skipped": "no_connection_slot", "observations_sent": total_observations_sent}
                 sensor_event_counts[sensor_type_id] = count
 
             if not sensor_event_counts:

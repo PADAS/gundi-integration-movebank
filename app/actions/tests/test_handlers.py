@@ -1167,3 +1167,42 @@ async def test_backfill_bails_when_job_genuinely_active(
 
     assert result.get("already_active") is True
     assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_pull_observations_skips_on_no_connection_slot(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    # A saturated Movebank connection budget must NOT fail the scheduled tick;
+    # it skips cleanly and no sub-actions are triggered (next tick retries).
+    from app.services.movebank_connections import NoConnectionSlot
+    def _raise(*a, **k):
+        raise NoConnectionSlot("full")
+    mocker.patch("app.actions.handlers.movebank_slot", _raise)
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_pull_observations(
+        integration=integration,
+        action_config=PullObservationsConfig(study_id="12345"),
+    )
+
+    assert result == {"skipped": "no_connection_slot"}
+    assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_pull_events_skips_on_no_connection_slot(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # NoConnectionSlot during the per-sensor fetch is a clean skip, not a failure.
+    from app.services.movebank_connections import NoConnectionSlot
+    def _raise(*a, **k):
+        raise NoConnectionSlot("full")
+    mocker.patch("app.actions.handlers.movebank_slot", _raise)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    result = await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config()
+    )
+
+    assert result["skipped"] == "no_connection_slot"
