@@ -1,6 +1,6 @@
 # Backfill on Already-Cursored Integrations (`coverage_start`) — Design
 
-**Status:** approved design, pre-implementation
+**Status:** implemented (PR #14)
 **Date:** 2026-07-22
 **Branch:** movebank-backfill (extends PR #14)
 
