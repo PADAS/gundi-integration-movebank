@@ -282,13 +282,13 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
             # to a single sensor_type_id, Movebank reliably echoes that same id
             # back on every event it returns.
             events = []
-            events_by_sensor = {}
+            sensor_event_counts = {}  # per-sensor counts for logging + the fetched-any check
             for sensor_type_id in sensor_type_ids:
                 sensor_start = sensor_type_timestamps[sensor_type_id]
                 if sensor_start > end_at:
                     continue  # this sensor is already past the window
                 query_start = _query_start_for_sensor(sensor_type_id, sensor_start, minimum_event_ids[sensor_type_id])
-                sensor_events = []
+                count = 0
                 async with movebank_slot(auth_config.username):
                     async for event in mb.get_individual_events_by_time(
                         study_id=action_config.study_id,
@@ -298,11 +298,11 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                         sensor_type_ids=[sensor_type_id],
                         minimum_event_id=minimum_event_ids[sensor_type_id],
                     ):
-                        sensor_events.append(event)
-                events_by_sensor[sensor_type_id] = sensor_events
-                events.extend(sensor_events)
+                        events.append(event)  # single combined list; no per-sensor copy
+                        count += 1
+                sensor_event_counts[sensor_type_id] = count
 
-            if not events_by_sensor:
+            if not sensor_event_counts:
                 # Every sensor was already past this window: advance without
                 # touching the quiet flag or the saved cursor (v1 behavior).
                 current_window_start = current_window_start + batch_window_size
@@ -320,7 +320,7 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
 
             logger.info(
                 f"Processed Movebank data for {log_reference}: {len(observations)} observations, "
-                f"events by sensor: { {k: len(v) for k, v in events_by_sensor.items()} }"
+                f"events by sensor: {sensor_event_counts}"
             )
 
             if events:
@@ -428,6 +428,27 @@ async def action_backfill(integration, action_config: BackfillConfig):
     # re-zero its counters and re-RPUSH individuals that are already in
     # flight or already dispatched — double-dispatching them. Bail out early.
     if await job.exists():
+        snap = await job.snapshot()
+        if snap["in_flight"] == 0 and snap["pending_remaining"] > 0:
+            # A prior invocation seeded the job (meta + pending) but crashed
+            # before/while dispatching — nothing is in flight yet work is still
+            # queued. There's no PubSub redelivery to restart it, so a re-run
+            # would otherwise return already_active forever. Resume instead:
+            # dispatch up to K from the pending queue (configs were stored at
+            # seed time; _dispatch_backfill_individual skips any that are missing).
+            logger.info(
+                f"Backfill {job_id}: resuming stalled job "
+                f"({snap['pending_remaining']} pending, none in flight)"
+            )
+            k = action_config.backfill_max_concurrency or settings.BACKFILL_MAX_CONCURRENCY
+            dispatched = 0
+            while dispatched < k:
+                next_id = await job.next_individual()
+                if next_id is None:
+                    break
+                await _dispatch_backfill_individual(integration_id, job, next_id)
+                dispatched += 1
+            return {"job_id": job_id, "resumed": True, "dispatched": dispatched}
         logger.info(f"Backfill {job_id}: job already active, skipping re-seed")
         return {"job_id": job_id, "already_active": True}
 

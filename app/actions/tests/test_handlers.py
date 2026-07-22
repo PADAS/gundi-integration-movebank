@@ -1027,6 +1027,10 @@ async def test_backfill_skips_reseed_when_job_already_active(
     from app.actions.configurations import BackfillConfig
     mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
     mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    # Genuinely active: work is in flight, so this must bail (not resume).
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 2, "completed": 0, "observations_sent": 0,
+                                          "in_flight": 2, "pending_remaining": 0, "range": "r"}))
     mock_seed = mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
     mock_put_config = mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
     mock_next = mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
@@ -1038,6 +1042,8 @@ async def test_backfill_skips_reseed_when_job_already_active(
     )
 
     assert result["already_active"] is True
+    assert not mock_seed.called
+    assert not mock_trigger.called
     assert "job_id" in result
     assert mock_seed.await_count == 0
     assert mock_put_config.await_count == 0
@@ -1100,3 +1106,64 @@ async def test_dispatch_backfill_individual_gives_up_after_exhausting_queue(mock
     assert mock_trigger.await_count == 0
     # Bounded: pending_remaining(2) + 1 for the passed-in id == 3 attempts max.
     assert job.get_individual_config.await_count <= 3
+
+
+@pytest.mark.asyncio
+async def test_backfill_resumes_stalled_job_when_nothing_in_flight(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    # A prior invocation seeded the job but crashed before dispatching: the job
+    # exists, has pending work, and nothing is in flight. A re-run must RESUME
+    # (dispatch from the queue), not bail out with already_active.
+    from app.actions.configurations import BackfillConfig
+    rows = [{**INDIVIDUAL_ROW, "id": str(i)} for i in range(3)]
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=rows)
+    pending = ["0", "1", "2"]
+
+    async def fake_next(self):
+        return pending.pop(0) if pending else None
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 3, "completed": 0, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 3, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", fake_next)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=1))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.get_individual_config",
+                 AsyncMock(return_value='{"study_id":"12345","individual":' +
+                           __import__("json").dumps(INDIVIDUAL_ROW) +
+                           ',"job_id":"job-x","start":"2024-01-01T00:00:00+00:00","end":"2024-02-01T00:00:00+00:00"}'))
+    mock_seed = mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mocker.patch("app.actions.handlers.settings.BACKFILL_MAX_CONCURRENCY", 2)
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result.get("resumed") is True
+    assert result["dispatched"] == 2            # up to K, from the stalled queue
+    assert mock_trigger.await_count == 2
+    assert not mock_seed.called                 # did NOT re-seed
+
+
+@pytest.mark.asyncio
+async def test_backfill_bails_when_job_genuinely_active(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    # Job exists AND has work in flight: a re-run must NOT dispatch anything.
+    from app.actions.configurations import BackfillConfig
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[{**INDIVIDUAL_ROW, "id": "0"}])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 3, "completed": 1, "observations_sent": 10,
+                                          "in_flight": 2, "pending_remaining": 1, "range": "r"}))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result.get("already_active") is True
+    assert not mock_trigger.called
