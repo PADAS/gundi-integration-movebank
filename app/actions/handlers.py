@@ -403,6 +403,7 @@ async def _seed_pull_cursor_at_end(integration_id: str, study_id: str, ind, end:
     loaded_at doesn't dedup them.
     """
     state = IndividualState(individual_id=ind.id, study_id=study_id, local_identifier=ind.local_identifier)
+    state.coverage_start = end  # pull owns [end, +inf); everything before is backfill's to fill
     for stid in _supported_sensor_type_ids(ind):
         state.update_sensor_state(stid, end, 0)
     await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID, json.loads(state.json()), source_id=ind.id)
@@ -587,6 +588,10 @@ async def _finalize_backfill_individual(integration_id, job, ind, action_config,
                 new_ts = max(candidate_stamps)
                 new_event_id = max(existing_ss.highest_event_id or 0, backfill_ss.highest_event_id or 0)
                 existing_state.update_sensor_state(stid, new_ts, new_event_id)
+        # Backfill has now covered down to action_config.start, so the combined
+        # coverage floor moves there — a later backfill with the same/later start
+        # will see an empty range for this individual.
+        existing_state.coverage_start = action_config.start
         await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID,
                                       json.loads(existing_state.json()), source_id=ind.id)
     await job.record_completion(observations)

@@ -70,6 +70,11 @@ def _gps_event(event_id, ts):
     }
 
 
+def _make_individual(**overrides):
+    from app.actions.client import Individual
+    return Individual.parse_obj({**INDIVIDUAL_ROW, **overrides})
+
+
 @pytest.fixture
 def mock_state_store(mocker):
     """In-memory stand-in for the module-level state_manager in handlers."""
@@ -1291,3 +1296,42 @@ async def test_pull_second_run_preserves_coverage_start(
 
     saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
     assert IndividualState.parse_obj(saved).coverage_start == datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_seed_pull_cursor_stamps_coverage_start(mocker, integration, mock_state_store):
+    from app.actions.handlers import _seed_pull_cursor_at_end
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    await _seed_pull_cursor_at_end(str(integration.id), "12345", _make_individual(), end)
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    assert IndividualState.parse_obj(saved).coverage_start == end
+
+
+@pytest.mark.asyncio
+async def test_finalize_sets_coverage_start_to_backfill_start(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    events = [_gps_event(10, "2024-01-02 00:00:00.000")]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 1,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+
+    await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    assert IndividualState.parse_obj(saved).coverage_start == start
