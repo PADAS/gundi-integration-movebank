@@ -10,6 +10,7 @@ from dateutil.parser import parse as parse_date
 from movebank_client import MovebankClient
 
 import app.actions.client as client
+from app.actions.core import action_title
 from app import settings
 from app.actions.backfill_queue import BackfillJob
 from app.actions.client import IndividualState, generate_individuals
@@ -129,6 +130,7 @@ def _advance_watermarks(state, events, sensor_type_ids, sensor_type_timestamps, 
             minimum_event_ids[stid] = new_max + 1
 
 
+@action_title("(1) Movebank Credentials")
 async def action_auth(integration, action_config: AuthenticateConfig):
     logger.info(
         f"Executing auth action with integration {integration} and action_config {action_config}..."
@@ -156,6 +158,7 @@ async def action_auth(integration, action_config: AuthenticateConfig):
             return {"valid_credentials": False}
 
 
+@action_title("(2) Read Movebank Data")
 @activity_logger()
 @crontab_schedule("*/10 * * * *")  # same cadence as the v1 cronjob
 async def action_pull_observations(integration, action_config: PullObservationsConfig):
@@ -348,10 +351,16 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
 
 def _resolve_start(start, ind) -> datetime:
     """A concrete datetime for this individual: the operator's date, or for
-    'all' the individual's earliest record (falling back to the lookback floor)."""
+    'all' the individual's earliest record (falling back to the lookback floor).
+
+    `start` is the validated config value — the literal "all", or a date string
+    (BackfillConfig.start). A datetime is also accepted for programmatic callers.
+    """
     if isinstance(start, datetime):
         return start
-    # start == "all"
+    if isinstance(start, str) and start.strip().lower() != "all":
+        return _ensure_utc(parse_date(start))
+    # "all"
     if ind.timestamp_start:
         return ind.timestamp_start
     return datetime.now(tz=timezone.utc) - timedelta(days=3650)  # ~10y floor
@@ -390,6 +399,7 @@ async def _seed_pull_cursor_at_end(integration_id: str, study_id: str, ind, end:
     await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID, json.loads(state.json()), source_id=ind.id)
 
 
+@action_title("(3) Backfill Movebank Data for a Study")
 @activity_logger()
 async def action_backfill(integration, action_config: BackfillConfig):
     integration_id = str(integration.id)

@@ -1,7 +1,8 @@
 from datetime import datetime
-from typing import List, Literal, Optional, Union
+from typing import List, Optional
 
-from pydantic import Field, SecretStr
+from dateutil.parser import parse as parse_date
+from pydantic import Field, SecretStr, validator
 
 from app.actions import AuthActionConfiguration, ExecutableActionMixin, PullActionConfiguration
 from app.actions.client import Individual
@@ -40,19 +41,20 @@ class PullEventsForIndividualConfig(InternalActionConfiguration):
     maximum_lookback_hours: int = 24
 
 
+# Executable, NOT scheduled — must not subclass PullActionConfiguration
+# (that would register it for type-wide scheduling).
 class BackfillConfig(GenericActionConfiguration, ExecutableActionMixin):
-    """Operator-triggered study backfill. Executable, NOT scheduled — it must
-    not subclass PullActionConfiguration."""
+    """Back-fill historical Movebank data for a study."""
     study_id: str = Field(..., title="Movebank Study ID")
     individual_ids: Optional[List[str]] = Field(
         None,
         title="Individual IDs",
         description="Leave empty to backfill the whole study, or list specific individual IDs.",
     )
-    start: Union[datetime, Literal["all"]] = Field(
+    start: str = Field(
         "all",
         title="Start",
-        description="Earliest datetime to backfill from, or 'all' to fetch from each individual's earliest record.",
+        description="A start date (e.g. 2024-01-01) or 'all' to fetch from each individual's earliest record.",
     )
     backfill_max_concurrency: Optional[int] = Field(
         None,
@@ -60,6 +62,21 @@ class BackfillConfig(GenericActionConfiguration, ExecutableActionMixin):
         description="Individuals processed in parallel. Defaults to the service's BACKFILL_MAX_CONCURRENCY.",
         ge=1,
     )
+    ui_global_options = GlobalUISchemaOptions(
+        order=["study_id", "individual_ids", "start", "backfill_max_concurrency"],
+    )
+
+    @validator("start")
+    def _validate_start(cls, value):
+        # A real date or the literal "all" — never let a typo silently become
+        # full-history "all".
+        if value.strip().lower() == "all":
+            return "all"
+        try:
+            parse_date(value)
+        except (ValueError, OverflowError, TypeError):
+            raise ValueError("start must be a date (e.g. 2024-01-01) or 'all'")
+        return value
 
 
 class BackfillEventsForIndividualConfig(InternalActionConfiguration):

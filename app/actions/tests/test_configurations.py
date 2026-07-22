@@ -60,16 +60,15 @@ def test_backfill_config_whole_study_all_data():
 
 
 def test_backfill_config_dated_and_filtered():
-    from datetime import datetime, timezone
     from app.actions.configurations import BackfillConfig
     config = BackfillConfig(
         study_id="12345",
         individual_ids=["111", "222"],
-        start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        start="2024-01-01",
         backfill_max_concurrency=4,
     )
     assert config.individual_ids == ["111", "222"]
-    assert config.start.year == 2024
+    assert config.start == "2024-01-01"
     assert config.backfill_max_concurrency == 4
 
 
