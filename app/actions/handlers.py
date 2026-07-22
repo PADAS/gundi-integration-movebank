@@ -389,25 +389,6 @@ def _resolve_start(start, ind) -> datetime:
     return datetime.now(tz=timezone.utc) - timedelta(days=3650)  # ~10y floor
 
 
-async def _resolve_end(integration_id: str, ind, now: datetime) -> tuple:
-    """Freeze the boundary where backfill meets the steady-state pull: the
-    individual's existing pull cursor if any, else now.
-
-    Returns (end, had_existing_cursor). When there was no existing cursor,
-    action_backfill claims it itself (seeds it to `now`, see
-    _seed_pull_cursor_at_end) so a concurrent steady-state pull run can't
-    compute its own lookback-based start and reach back into the range
-    backfill is about to cover.
-    """
-    saved = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=ind.id)
-    if saved:
-        state = IndividualState.parse_obj(saved)
-        stamps = [s.latest_timestamp for s in state.sensor_states.values() if s.latest_timestamp]
-        if stamps:
-            return min(stamps), True
-    return now, False
-
-
 async def _seed_pull_cursor_at_end(integration_id: str, study_id: str, ind, end: datetime) -> None:
     """Claim [end, +inf) for the steady-state pull cursor before backfill starts.
 
@@ -495,12 +476,11 @@ async def action_backfill(integration, action_config: BackfillConfig):
         )
     individuals = candidates
 
-    ranges = {}
-    had_cursor = {}
-    for i in individuals:
-        end_dt, cursor_existed = await _resolve_end(integration_id, i, now)
-        ranges[i.id] = (_resolve_start(action_config.start, i), end_dt)
-        had_cursor[i.id] = cursor_existed
+    # Every candidate reaching here has NO existing pull cursor (the filter
+    # above skipped those that did), so each individual's boundary is simply
+    # `now`: backfill covers [start, now) and the pull will cover [now, +inf)
+    # once its cursor is claimed below.
+    ranges = {i.id: (_resolve_start(action_config.start, i), now) for i in individuals}
 
     # Only individuals with a non-empty range are worth queuing.
     queued = [i for i in individuals if ranges[i.id][0] < ranges[i.id][1]]
@@ -517,8 +497,9 @@ async def action_backfill(integration, action_config: BackfillConfig):
     # backfill is about to cover (see _seed_pull_cursor_at_end).
     for i in queued:
         start_dt, end_dt = ranges[i.id]
-        if not had_cursor[i.id]:
-            await _seed_pull_cursor_at_end(integration_id, action_config.study_id, i, end_dt)
+        # No prior cursor (guaranteed by the skip filter) — claim the boundary
+        # so a concurrent */10 pull can't reach back into backfill's range.
+        await _seed_pull_cursor_at_end(integration_id, action_config.study_id, i, end_dt)
         await job.put_individual_config(
             i.id,
             BackfillEventsForIndividualConfig(
