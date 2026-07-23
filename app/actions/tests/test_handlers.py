@@ -4,7 +4,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.actions.client import IndividualState
-from app.actions.configurations import PullEventsForIndividualConfig, PullObservationsConfig
+from app.actions.configurations import (
+    BackfillConfig,
+    BackfillEventsForIndividualConfig,
+    PullEventsForIndividualConfig,
+    PullObservationsConfig,
+)
 from app.actions.handlers import (
     action_backfill,
     action_backfill_events_for_individual,
@@ -68,6 +73,11 @@ def _gps_event(event_id, ts):
         "individual_id": "111",
         "sensor_type_id": "653",
     }
+
+
+def _make_individual(**overrides):
+    from app.actions.client import Individual
+    return Individual.parse_obj({**INDIVIDUAL_ROW, **overrides})
 
 
 @pytest.fixture
@@ -1247,3 +1257,267 @@ async def test_dispatch_rolls_back_and_requeues_on_trigger_failure(mocker):
     assert calls["incr"] == 1
     assert calls["decr"] == 1              # rolled back
     assert calls["requeued"] == ["111"]    # not lost
+
+
+@pytest.mark.asyncio
+async def test_pull_first_run_stamps_coverage_start(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Fresh individual (no saved cursor): after the first run that persists a
+    # cursor, coverage_start must equal default_start = timestamp_end - lookback.
+    events = [_gps_event(100, "2026-06-30 10:00:00.000")]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    await action_pull_events_for_individual(
+        integration=integration,
+        action_config=_sub_action_config(
+            maximum_lookback_hours=24,
+            individual_overrides={"timestamp_end": "2026-07-01 00:00:00.000"},
+        ),
+    )
+
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    state = IndividualState.parse_obj(saved)
+    assert state.coverage_start == datetime(2026, 6, 30, 0, 0, tzinfo=timezone.utc)  # end - 24h
+
+
+@pytest.mark.asyncio
+async def test_pull_second_run_preserves_coverage_start(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A saved cursor with an existing coverage_start must not be overwritten.
+    prior = IndividualState(individual_id="111", study_id="12345")
+    prior.update_sensor_state(653, datetime(2026, 6, 1, tzinfo=timezone.utc), 50)
+    prior.coverage_start = datetime(2020, 1, 1, tzinfo=timezone.utc)  # far-back floor
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = prior.dict()
+    events = [_gps_event(100, "2026-06-30 10:00:00.000")]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config()
+    )
+
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    assert IndividualState.parse_obj(saved).coverage_start == datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_seed_pull_cursor_stamps_coverage_start(mocker, integration, mock_state_store):
+    from app.actions.handlers import _seed_pull_cursor_at_end
+    end = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    await _seed_pull_cursor_at_end(str(integration.id), "12345", _make_individual(), end)
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    assert IndividualState.parse_obj(saved).coverage_start == end
+
+
+@pytest.mark.asyncio
+async def test_finalize_sets_coverage_start_to_backfill_start(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    events = [_gps_event(10, "2024-01-02 00:00:00.000")]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 1,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+
+    await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    assert IndividualState.parse_obj(saved).coverage_start == start
+
+
+@pytest.mark.asyncio
+async def test_backfill_fills_behind_existing_coverage_start(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # An individual WITH a real cursor (coverage_start recorded) must be queued,
+    # with end == coverage_start (not skipped).
+    from app.actions.configurations import BackfillConfig
+    cov = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    st = IndividualState(individual_id="111", study_id="12345")
+    st.update_sensor_state(653, datetime(2026, 6, 1, tzinfo=timezone.utc), 500)
+    st.coverage_start = cov
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = st.dict()
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    seeded = {}
+    async def fake_seed(self, ids, *, total, range_repr): seeded["ids"] = list(ids)
+    async def fake_put(self, iid, blob): seeded.setdefault("configs", {})[iid] = blob
+    async def fake_next(self): return (seeded.get("ids") or []).pop(0) if seeded.get("ids") else None
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", fake_seed)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", fake_put)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", fake_next)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=1))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.get_individual_config",
+                 AsyncMock(side_effect=lambda iid: seeded["configs"][iid]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 0, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration, action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["individuals"] == 1          # queued, not skipped
+    cfg = BackfillEventsForIndividualConfig.parse_raw(seeded["configs"]["111"])
+    assert cfg.end == cov                       # end == coverage_start
+
+
+@pytest.mark.asyncio
+async def test_backfill_legacy_seed_placeholder_full_backfill(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Legacy cursor: all sensors event_id == 0, no coverage_start -> treat its
+    # timestamp as the floor (full backfill), do NOT skip.
+    seed_ts = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    st = IndividualState(individual_id="111", study_id="12345")
+    st.update_sensor_state(653, seed_ts, 0)     # event_id 0 => placeholder
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = st.dict()
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    seeded = {}
+    async def fake_seed(self, ids, *, total, range_repr): seeded["ids"] = list(ids)
+    async def fake_put(self, iid, blob): seeded.setdefault("configs", {})[iid] = blob
+    async def fake_next(self): return (seeded.get("ids") or []).pop(0) if seeded.get("ids") else None
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", fake_seed)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", fake_put)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", fake_next)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=1))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.get_individual_config",
+                 AsyncMock(side_effect=lambda iid: seeded["configs"][iid]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 0, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration, action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["individuals"] == 1
+    cfg = BackfillEventsForIndividualConfig.parse_raw(seeded["configs"]["111"])
+    assert cfg.end == seed_ts
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_legacy_real_cursor_unknown_floor(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Legacy real coverage (event_id > 0) with no coverage_start -> skip with warning.
+    st = IndividualState(individual_id="111", study_id="12345")
+    st.update_sensor_state(653, datetime(2026, 6, 1, tzinfo=timezone.utc), 500)  # real events, no coverage_start
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = st.dict()
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration, action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["individuals"] == 0
+    assert result["skipped_existing"] == 1
+    assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_individual_with_empty_range(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # An already-covered individual whose coverage_start is at or behind its
+    # resolved start produces an empty [start, end) range. It must be neither
+    # queued nor counted as skipped_existing (that counter is reserved for the
+    # legacy real-cursor-without-floor case).
+    resolved_start = datetime(2025, 1, 1, tzinfo=timezone.utc)  # INDIVIDUAL_ROW's timestamp_start
+    st = IndividualState(individual_id="111", study_id="12345")
+    st.update_sensor_state(653, datetime(2026, 6, 1, tzinfo=timezone.utc), 500)
+    st.coverage_start = resolved_start
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = st.dict()
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration, action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["individuals"] == 0
+    assert result["skipped_existing"] == 0
+    assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_settling_warning_gated_by_real_coverage(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store, caplog
+):
+    # The settling-margin warning should only fire when the cursor reflects
+    # real prior coverage (highest_event_id > 0 on at least one sensor). A
+    # freshly-seeded/legacy-placeholder cursor (all event_id == 0) always has
+    # end_dt == latest, which would otherwise trip the warning spuriously.
+    from app import settings
+
+    async def run_backfill():
+        mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+        mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+        mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
+        mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+        mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+        return await action_backfill(
+            integration=integration, action_config=BackfillConfig(study_id="12345", start="all"),
+        )
+
+    warning_text = "accessory rows near the boundary may duplicate"
+
+    # Real cursor, span below the settling margin -> warning IS logged.
+    latest = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    real_st = IndividualState(individual_id="111", study_id="12345")
+    real_st.update_sensor_state(653, latest, 500)  # real events
+    real_st.coverage_start = latest - timedelta(hours=settings.ACCESSORY_SETTLING_HOURS - 1)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = real_st.dict()
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        await run_backfill()
+    assert any(warning_text in rec.message for rec in caplog.records)
+
+    # Zero-span placeholder cursor (all sensors event_id == 0) -> warning is NOT logged.
+    placeholder_st = IndividualState(individual_id="111", study_id="12345")
+    placeholder_st.update_sensor_state(653, latest, 0)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = placeholder_st.dict()
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        await run_backfill()
+    assert not any(warning_text in rec.message for rec in caplog.records)
+
+
+def test_display_name_precedence():
+    from app.actions.handlers import _display_name
+    # local_identifier wins when present
+    assert _display_name(_make_individual()) == "tag-1"
+    # empty local_identifier falls back to nick_name
+    assert _display_name(_make_individual(local_identifier="")) == "Aquila"
+    # empty local_identifier and nick_name fall back to ring_id
+    assert _display_name(_make_individual(local_identifier="", nick_name="")) == "R1"

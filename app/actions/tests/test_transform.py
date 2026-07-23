@@ -19,6 +19,7 @@ def test_build_observation_maps_gps_event():
     assert obs["source"] == "111"
     assert obs["source_name"] == "Aquila"
     assert obs["type"] == "tracking-device"
+    assert obs["subject_type"] == "unassigned"
     assert obs["recorded_at"] == "2026-01-01T10:00:00+00:00"
     assert obs["location"] == {"lat": 1.5, "lon": 2.5}
     # Everything except coordinates and timestamp lands in additional.

@@ -87,6 +87,13 @@ def _compute_batch_window(number_of_events, span_seconds) -> timedelta:
     return window
 
 
+def _display_name(ind) -> str:
+    """Human-facing name for an individual, used as the observation's
+    subject_name/source_name. Prefers the tag's local_identifier, falling
+    back to the nick_name and then the ring_id."""
+    return ind.local_identifier or ind.nick_name or ind.ring_id
+
+
 def _supported_sensor_type_ids(ind) -> list:
     """Movebank sensor-type labels this individual reports, mapped to the
     numeric sensor_type_ids this integration knows how to handle."""
@@ -239,6 +246,7 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     except pydantic.ValidationError:
         logger.exception(f"Failed parsing saved state for {log_reference}; starting fresh.")
         individual_state = None
+    was_fresh = individual_state is None
     if individual_state is None:
         individual_state = IndividualState(
             individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
@@ -246,6 +254,10 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
 
     # Build per-sensor cursors from state; new sensors start at the lookback window.
     default_start = resolved_individual_timestamp_end - timedelta(hours=action_config.maximum_lookback_hours)
+    if was_fresh:
+        # First-ever cursor for this individual: record the oldest point the pull
+        # will cover, so a later backfill knows where to stop (fills [start, this)).
+        individual_state.coverage_start = default_start
     sensor_type_timestamps = {}
     minimum_event_ids = {}
     for sensor_type_id in sensor_type_ids:
@@ -272,7 +284,7 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
         f"({ind.number_of_events} events on record)."
     )
 
-    device_name = ind.nick_name or ind.local_identifier or ind.ring_id
+    device_name = _display_name(ind)
     auth_config = client.get_auth_config(integration)
     total_observations_sent = 0
     current_window_start = earliest_start
@@ -398,6 +410,7 @@ async def _seed_pull_cursor_at_end(integration_id: str, study_id: str, ind, end:
     loaded_at doesn't dedup them.
     """
     state = IndividualState(individual_id=ind.id, study_id=study_id, local_identifier=ind.local_identifier)
+    state.coverage_start = end  # pull owns [end, +inf); everything before is backfill's to fill
     for stid in _supported_sensor_type_ids(ind):
         state.update_sensor_state(stid, end, 0)
     await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID, json.loads(state.json()), source_id=ind.id)
@@ -456,35 +469,47 @@ async def action_backfill(integration, action_config: BackfillConfig):
         logger.info(f"Backfill {job_id}: job already active, skipping re-seed")
         return {"job_id": job_id, "already_active": True}
 
-    # Backfill is for INITIAL load only: an individual that already has a
-    # steady-state pull cursor is skipped entirely (not queued) — filling
-    # history behind an existing cursor isn't supported yet, and attempting it
-    # would duplicate data the pull has already collected.
-    candidates = []
+    # Resolve each individual's backfill end from its steady-state coverage
+    # floor. Backfill fills [start, end); the pull owns [end, +inf).
+    #   - no cursor            -> end = now, and seed the pull cursor at now
+    #   - coverage_start set   -> end = coverage_start (fill history behind the pull)
+    #   - legacy seed (all event_id 0, no coverage_start) -> end = its timestamp
+    #   - legacy real cursor (event_id > 0, no coverage_start) -> skip (unknown floor)
+    ranges = {}
+    seed_needed = set()
     skipped_existing = []
     for i in individuals:
         saved = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=i.id)
-        if saved:
-            skipped_existing.append(i.id)
+        if not saved:
+            end_dt = now
+            seed_needed.add(i.id)
         else:
-            candidates.append(i)
+            state = IndividualState.parse_obj(saved)
+            if state.coverage_start is not None:
+                end_dt = state.coverage_start
+            elif all((ss.highest_event_id or 0) == 0 for ss in state.sensor_states.values()):
+                stamps = [ss.latest_timestamp for ss in state.sensor_states.values() if ss.latest_timestamp]
+                end_dt = min(stamps) if stamps else now
+            else:
+                skipped_existing.append(i.id)
+                continue
+            latest = max((ss.latest_timestamp for ss in state.sensor_states.values() if ss.latest_timestamp), default=None)
+            has_real_coverage = any((ss.highest_event_id or 0) > 0 for ss in state.sensor_states.values())
+            if has_real_coverage and latest and end_dt > latest - timedelta(hours=settings.ACCESSORY_SETTLING_HOURS):
+                logger.warning(
+                    f"Backfill {job_id}/{i.id}: coverage span is below the accessory settling "
+                    "margin; accessory rows near the boundary may duplicate."
+                )
+        ranges[i.id] = (_resolve_start(action_config.start, i), end_dt)
     if skipped_existing:
         logger.warning(
-            f"Backfill {job_id}: skipped {len(skipped_existing)} individuals that already have "
-            "collection history (backfill is for initial load; filling history behind an "
-            "existing cursor is not yet supported)"
+            f"Backfill {job_id}: skipped {len(skipped_existing)} individuals with existing collection "
+            "history but no recorded coverage floor; clear their cursor to force a full backfill."
         )
-    individuals = candidates
-
-    # Every candidate reaching here has NO existing pull cursor (the filter
-    # above skipped those that did), so each individual's boundary is simply
-    # `now`: backfill covers [start, now) and the pull will cover [now, +inf)
-    # once its cursor is claimed below.
-    ranges = {i.id: (_resolve_start(action_config.start, i), now) for i in individuals}
 
     # Only individuals with a non-empty range are worth queuing.
-    queued = [i for i in individuals if ranges[i.id][0] < ranges[i.id][1]]
-    range_repr = f"[{action_config.start} .. {now.isoformat()})"
+    queued = [i for i in individuals if i.id in ranges and ranges[i.id][0] < ranges[i.id][1]]
+    range_repr = f"[{action_config.start} .. per-individual coverage floor)"
     await job.seed([i.id for i in queued], total=len(queued), range_repr=range_repr)
 
     logger.info(f"Backfill {job_id} for study {action_config.study_id}: {len(queued)} individuals, range {range_repr}")
@@ -497,9 +522,10 @@ async def action_backfill(integration, action_config: BackfillConfig):
     # backfill is about to cover (see _seed_pull_cursor_at_end).
     for i in queued:
         start_dt, end_dt = ranges[i.id]
-        # No prior cursor (guaranteed by the skip filter) — claim the boundary
-        # so a concurrent */10 pull can't reach back into backfill's range.
-        await _seed_pull_cursor_at_end(integration_id, action_config.study_id, i, end_dt)
+        # Only fresh individuals need a boundary-claim seed; an already-cursored
+        # individual's cursor already owns [coverage_start, +inf).
+        if i.id in seed_needed:
+            await _seed_pull_cursor_at_end(integration_id, action_config.study_id, i, end_dt)
         await job.put_individual_config(
             i.id,
             BackfillEventsForIndividualConfig(
@@ -582,6 +608,10 @@ async def _finalize_backfill_individual(integration_id, job, ind, action_config,
                 new_ts = max(candidate_stamps)
                 new_event_id = max(existing_ss.highest_event_id or 0, backfill_ss.highest_event_id or 0)
                 existing_state.update_sensor_state(stid, new_ts, new_event_id)
+        # Backfill has now covered down to action_config.start, so the combined
+        # coverage floor moves there — a later backfill with the same/later start
+        # will see an empty range for this individual.
+        existing_state.coverage_start = action_config.start
         await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID,
                                       json.loads(existing_state.json()), source_id=ind.id)
     await job.record_completion(observations)
@@ -699,7 +729,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                         ):
                             events.append(event)
 
-                device_name = ind.nick_name or ind.local_identifier or ind.ring_id
+                device_name = _display_name(ind)
                 observations = [o for e in events if (o := build_observation(event=e, device_name=device_name)) is not None]
                 for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
                     await send_observations_to_gundi(observations=batch, integration_id=integration_id)
