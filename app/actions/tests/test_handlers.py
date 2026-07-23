@@ -997,6 +997,7 @@ async def test_backfill_honours_persisted_window_seconds(
                                           "in_flight": 0, "pending_remaining": 0, "range": "r"}))
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
     mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 1)
 
     await action_backfill_events_for_individual(
         integration=integration,

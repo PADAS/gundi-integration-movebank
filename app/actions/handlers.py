@@ -709,6 +709,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
         except (TypeError, ValueError):
             pass
     min_window = timedelta(seconds=settings.MIN_BACKFILL_WINDOW_SECONDS)
+    window = max(window, min_window)
     observations_sent = 0
     current = persisted_scan_from if persisted_scan_from is not None else min(sensor_type_timestamps.values())
 

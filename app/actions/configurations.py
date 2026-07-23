@@ -66,7 +66,8 @@ class BackfillConfig(GenericActionConfiguration, ExecutableActionMixin):
         False,
         title="Restart",
         description="Clear any existing job for these parameters and start over from the "
-                    "beginning. Use to recover a stuck backfill.",
+                    "beginning. Use to recover a stuck backfill. Only use on a stuck job: "
+                    "clearing a healthy in-flight job can double-dispatch its remaining work.",
     )
     ui_global_options = GlobalUISchemaOptions(
         order=["study_id", "individual_ids", "start", "backfill_max_concurrency", "restart"],
