@@ -62,8 +62,15 @@ class BackfillConfig(GenericActionConfiguration, ExecutableActionMixin):
         description="Individuals processed in parallel. Defaults to the service's BACKFILL_MAX_CONCURRENCY.",
         ge=1,
     )
+    restart: bool = Field(
+        False,
+        title="Restart",
+        description="Clear any existing job for these parameters and start over from the "
+                    "beginning. Use to recover a stuck backfill. Only use on a stuck job: "
+                    "clearing a healthy in-flight job can double-dispatch its remaining work.",
+    )
     ui_global_options = GlobalUISchemaOptions(
-        order=["study_id", "individual_ids", "start", "backfill_max_concurrency"],
+        order=["study_id", "individual_ids", "start", "backfill_max_concurrency", "restart"],
     )
 
     @validator("start")

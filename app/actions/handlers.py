@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -440,6 +441,20 @@ async def action_backfill(integration, action_config: BackfillConfig):
     job_id = "job-" + hashlib.sha256(job_seed.encode()).hexdigest()[:12]
     job = BackfillJob(integration_id, job_id)
 
+    if action_config.restart:
+        # Operator recovery: wipe the deterministic job's state and its
+        # per-individual backfill watermarks so it re-seeds and re-runs from
+        # `start`, instead of returning already_active forever on a wedged job.
+        await job.clear()
+        for i in individuals:
+            await state_manager.delete_state(
+                integration_id, BACKFILL_WATERMARK_ACTION_ID, source_id=f"{job_id}.{i.id}"
+            )
+        await state_manager.delete_state(integration_id, f"backfill_progress.{job_id}")
+        logger.warning(
+            f"Backfill {job_id}: restart requested — cleared prior job state and watermarks"
+        )
+
     # Idempotent seed: a redelivered/double-clicked backfill command hashes to
     # the SAME job_id. If that job is already active, re-seeding would
     # re-zero its counters and re-RPUSH individuals that are already in
@@ -688,6 +703,13 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     deadline = time.monotonic() + 0.8 * settings.MAX_ACTION_EXECUTION_TIME
     span_seconds = (action_config.end - action_config.start).total_seconds()
     window = _compute_batch_window(ind.number_of_events, span_seconds)
+    if saved and saved.get("window_seconds"):
+        try:
+            window = timedelta(seconds=float(saved["window_seconds"]))
+        except (TypeError, ValueError):
+            pass
+    min_window = timedelta(seconds=settings.MIN_BACKFILL_WINDOW_SECONDS)
+    window = max(window, min_window)
     observations_sent = 0
     current = persisted_scan_from if persisted_scan_from is not None else min(sensor_type_timestamps.values())
 
@@ -729,6 +751,39 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                         ):
                             events.append(event)
 
+                # Overflow guard: only SEND a window we can finish within the
+                # budget. A FULLY-fetched window (not deadline-interrupted) with
+                # more than the per-window cap is discarded — nothing sent,
+                # watermarks and scan floor untouched — and the window is shrunk
+                # proportionally, persisted, and retried at the same `current`.
+                # Never shrink below the floor; at the floor, fall through and
+                # send even if over cap (a burst denser than the floor holds).
+                if (not window_interrupted
+                        and len(events) > settings.MAX_RECORDS_PER_BACKFILL_WINDOW
+                        and window > min_window):
+                    shrunk = (window.total_seconds()
+                              * settings.MAX_RECORDS_PER_BACKFILL_WINDOW / len(events)
+                              * settings.BACKFILL_WINDOW_SHRINK_SAFETY)
+                    window = max(min_window, timedelta(seconds=shrunk))
+                    blob = json.loads(state.json())
+                    blob["scan_from"] = current.isoformat()           # unchanged
+                    blob["window_seconds"] = window.total_seconds()
+                    await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
+                                                  blob, source_id=watermark_source)
+                    logger.info(
+                        f"Backfill {log_reference}: window over cap "
+                        f"({len(events)} > {settings.MAX_RECORDS_PER_BACKFILL_WINDOW}); "
+                        f"shrunk to {window.total_seconds():.0f}s, retrying"
+                    )
+                    continue
+                if (not window_interrupted
+                        and len(events) > settings.MAX_RECORDS_PER_BACKFILL_WINDOW):
+                    logger.warning(
+                        f"Backfill {log_reference}: window at floor "
+                        f"({settings.MIN_BACKFILL_WINDOW_SECONDS}s) still over cap "
+                        f"({len(events)} events); sending anyway"
+                    )
+
                 device_name = _display_name(ind)
                 observations = [o for e in events if (o := build_observation(event=e, device_name=device_name)) is not None]
                 for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
@@ -747,6 +802,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 # single call, every window, regardless of whether events came back.
                 blob = json.loads(state.json())
                 blob["scan_from"] = current.isoformat()
+                blob["window_seconds"] = window.total_seconds()
                 await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
                                               blob, source_id=watermark_source)
 
@@ -756,6 +812,19 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 # risking the invocation running past its execution budget.
                 if window_interrupted or observations_sent >= MAX_RECORDS_PER_BACKFILL_STEP:
                     break
+    except asyncio.CancelledError:
+        # Hard execution-timeout: asyncio.wait_for in the action runner cancels
+        # this task, raising CancelledError (a BaseException — the handlers below
+        # do NOT catch it). scan_from + window_seconds are persisted every
+        # window, so no data is lost; a later trigger resumes from the last
+        # completed window. We do not attempt async recovery here (re-trigger /
+        # in_flight unwind): awaits during cancellation are themselves cancelled
+        # and unreliable. Recover a job wedged by a timeout with restart=true.
+        logger.warning(
+            f"Backfill {log_reference}: step hard-cancelled at scan_from={current.isoformat()}; "
+            "resume on next trigger or re-run with restart=true"
+        )
+        raise
     except NoConnectionSlot:
         # No connection slot available: re-trigger THIS individual (same in-flight
         # unit continues) rather than losing the step or double-counting in-flight.

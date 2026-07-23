@@ -16,8 +16,13 @@ This is Gundi's integration for pulling data from Movebank Studies.
   Works on a fresh integration and on one that already has collection history:
   each individual is back-filled up to its recorded coverage floor
   (`coverage_start`), so backfill and the steady-state pull partition the
-  timeline with no gap or overlap. Config: `study_id`, optional `individual_ids`,
-  `start` (a date or `"all"`), optional `backfill_max_concurrency`.
+  timeline with no gap or overlap. Each cascade step processes bounded windows
+  (`MAX_RECORDS_PER_BACKFILL_WINDOW`, adaptively shrunk down to
+  `MIN_BACKFILL_WINDOW_SECONDS` on dense data) so a step always finishes inside
+  the execution budget and cleanly cascades. Set `restart: true` to clear a
+  stuck/previous job for the same parameters and start over. Config:
+  `study_id`, optional `individual_ids`, `start` (a date or `"all"`), optional
+  `backfill_max_concurrency`, `restart`.
 - **backfill_events_for_individual** (internal) — self-cascading worker for one
   individual: fetches `[start, end)` in time-budgeted steps under the shared
   Movebank connection semaphore, sends to Gundi, and on completion hands the
