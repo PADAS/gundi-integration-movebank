@@ -1618,7 +1618,7 @@ def test_display_name_precedence():
 
 @pytest.mark.asyncio
 async def test_backfill_cancelled_step_reraises_and_preserves_scan_from(
-        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store, caplog
 ):
     # A hard cancellation mid-send must propagate (CancelledError is BaseException,
     # not caught by the retry/backoff handlers) and must not have advanced the
@@ -1628,15 +1628,20 @@ async def test_backfill_cancelled_step_reraises_and_preserves_scan_from(
     mocker.patch("app.actions.handlers.send_observations_to_gundi",
                  AsyncMock(side_effect=asyncio.CancelledError()))
 
-    with pytest.raises(asyncio.CancelledError):
-        await action_backfill_events_for_individual(
-            integration=integration,
-            action_config=BackfillEventsForIndividualConfig(
-                study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
-                start=datetime(2024, 1, 1, tzinfo=timezone.utc),
-                end=datetime(2024, 1, 2, tzinfo=timezone.utc),
-            ),
-        )
+    with caplog.at_level("WARNING"):
+        with pytest.raises(asyncio.CancelledError):
+            await action_backfill_events_for_individual(
+                integration=integration,
+                action_config=BackfillEventsForIndividualConfig(
+                    study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+                    start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    end=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                ),
+            )
+
+    # The except-CancelledError block's warning fired (the one thing this
+    # handler adds on the hard-cancellation path).
+    assert any("hard-cancelled" in rec.message for rec in caplog.records)
 
     # The send was cancelled before the per-window persist, so no watermark blob
     # was written for this individual (scan_from never advanced).
