@@ -1646,3 +1646,70 @@ async def test_backfill_cancelled_step_reraises_and_preserves_scan_from(
     # The send was cancelled before the per-window persist, so no watermark blob
     # was written for this individual (scan_from never advanced).
     assert (str(integration.id), "backfill_watermark", "job-x.111") not in mock_state_store
+
+
+@pytest.mark.asyncio
+async def test_backfill_restart_clears_job_and_reseeds(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # With restart=True, an existing (wedged) job is cleared and re-seeded rather
+    # than returning already_active.
+    from app.actions.configurations import BackfillConfig
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    # Stateful exists/clear: the job exists until restart clears it. If restart
+    # did NOT run, exists()==True would short-circuit to already_active.
+    jobstate = {"exists": True, "cleared": False}
+    async def fake_exists(self): return jobstate["exists"]
+    async def fake_clear(self): jobstate["exists"] = False; jobstate["cleared"] = True
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", fake_exists)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.clear", fake_clear)
+    seeded = {}
+    configs = {}
+    async def fake_seed(self, ids, *, total, range_repr): seeded["ids"] = list(ids)
+    async def fake_next(self): return (seeded.get("ids") or []).pop(0) if seeded.get("ids") else None
+    async def fake_put_config(self, individual_id, config_json): configs[individual_id] = config_json
+    async def fake_get_config(self, individual_id): return configs.get(individual_id)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", fake_seed)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", fake_put_config)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", fake_next)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=1))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.get_individual_config", fake_get_config)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 0, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    delete = mocker.patch("app.actions.handlers.state_manager.delete_state", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", restart=True),
+    )
+
+    assert jobstate["cleared"] is True
+    assert result.get("already_active") is not True
+    # Watermark for the candidate individual was cleared (job_id is deterministic).
+    assert any(call.kwargs.get("source_id", "").endswith(".111")
+               or (len(call.args) >= 3 and str(call.args[2]).endswith(".111"))
+               for call in delete.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_backfill_default_still_bails_when_job_active(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # restart defaults False: an existing active job still returns already_active.
+    from app.actions.configurations import BackfillConfig
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 0, "observations_sent": 0,
+                                          "in_flight": 1, "pending_remaining": 0, "range": "r"}))
+    clear = mocker.patch("app.actions.backfill_queue.BackfillJob.clear", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result.get("already_active") is True
+    assert not clear.called

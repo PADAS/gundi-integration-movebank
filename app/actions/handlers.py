@@ -441,6 +441,20 @@ async def action_backfill(integration, action_config: BackfillConfig):
     job_id = "job-" + hashlib.sha256(job_seed.encode()).hexdigest()[:12]
     job = BackfillJob(integration_id, job_id)
 
+    if action_config.restart:
+        # Operator recovery: wipe the deterministic job's state and its
+        # per-individual backfill watermarks so it re-seeds and re-runs from
+        # `start`, instead of returning already_active forever on a wedged job.
+        await job.clear()
+        for i in individuals:
+            await state_manager.delete_state(
+                integration_id, BACKFILL_WATERMARK_ACTION_ID, source_id=f"{job_id}.{i.id}"
+            )
+        await state_manager.delete_state(integration_id, f"backfill_progress.{job_id}")
+        logger.warning(
+            f"Backfill {job_id}: restart requested — cleared prior job state and watermarks"
+        )
+
     # Idempotent seed: a redelivered/double-clicked backfill command hashes to
     # the SAME job_id. If that job is already active, re-seeding would
     # re-zero its counters and re-RPUSH individuals that are already in

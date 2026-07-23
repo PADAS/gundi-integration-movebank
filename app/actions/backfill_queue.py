@@ -82,6 +82,12 @@ class BackfillJob:
         double-clicked command hashing to the same job_id."""
         return bool(await self.db.exists(self._meta))
 
+    async def clear(self) -> None:
+        """Delete every Redis key for this job (meta hash, pending queue, and the
+        per-individual configs hash). Used by a restart to wipe a stuck or
+        finished job before re-seeding."""
+        await self.db.delete(self._meta, self._pending, f"{self._meta}.configs")
+
     async def put_individual_config(self, individual_id: str, config_json: str) -> None:
         await self.db.hset(f"{self._meta}.configs", mapping={individual_id: config_json})
 
