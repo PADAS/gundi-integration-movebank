@@ -919,6 +919,98 @@ async def test_backfill_individual_stops_at_per_step_record_backstop(
 
 
 @pytest.mark.asyncio
+async def test_backfill_window_over_cap_is_discarded_then_sent_after_shrink(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A fully-fetched over-cap window is DISCARDED (not sent); the window shrinks
+    # and persists, and only a later (floor-sized) window is actually sent. With
+    # the fixed-count generator every fetch returns 3 (> cap 2), so the window
+    # shrinks to the floor in one step, then the floor window is sent anyway.
+    mocker.patch("app.actions.handlers.settings.MAX_RECORDS_PER_BACKFILL_WINDOW", 2)
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 259200)  # 3 days
+    mocker.patch("app.actions.handlers.settings.BACKFILL_WINDOW_SHRINK_SAFETY", 0.8)
+    gen, calls = make_counting_events_generator(3)  # 3 > cap 2 on every fetch
+    mock_movebank_client.get_individual_events_by_time = gen
+    send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+
+    await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 2, tzinfo=timezone.utc),  # 1-day range
+        ),
+    )
+
+    # Two fetches (one discarded at 5d, one sent at the 3d floor) but only ONE
+    # send — proving the over-cap fetch was discarded, not sent.
+    assert calls["count"] == 2
+    assert send.call_count == 1
+    # The floor-sized window sent here also happens to finish this individual
+    # (a 3-day window exceeds the 1-day range), so _finalize_backfill_individual
+    # deletes the watermark blob as part of normal completion cleanup — checking
+    # mock_state_store post-hoc would just see it gone. Assert against the
+    # set_state call the shrink step made instead, which is what actually
+    # proves the window was persisted at the floor.
+    from app.actions import handlers as handlers_module
+    persisted_windows = [
+        call.args[2].get("window_seconds")
+        for call in handlers_module.state_manager.set_state.call_args_list
+        if call.args[1] == "backfill_watermark"
+    ]
+    assert persisted_windows and all(float(w) == 259200 for w in persisted_windows)
+
+
+@pytest.mark.asyncio
+async def test_backfill_honours_persisted_window_seconds(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A persisted window_seconds from a prior step is used instead of the density
+    # estimate: the sub-action queries with end_at = current + persisted window.
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
+        **st.dict(), "scan_from": "2024-01-01T00:00:00+00:00", "window_seconds": 60.0,
+    }
+    ends = []
+    def gen(**kwargs):
+        ends.append(kwargs.get("timestamp_end"))
+        async def _agen():
+            for _ in ():
+                yield None
+        return _agen()
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+
+    await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 1, 0, 2, tzinfo=timezone.utc),  # 2-minute range
+        ),
+    )
+
+    # First window ends 60s after the persisted scan_from, not 5 days later.
+    assert ends[0] == datetime(2024, 1, 1, 0, 1, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
 async def test_backfill_individual_checks_deadline_between_sensor_fetches(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
