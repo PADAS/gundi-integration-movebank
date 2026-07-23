@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
@@ -1613,3 +1614,30 @@ def test_display_name_precedence():
     assert _display_name(_make_individual(local_identifier="")) == "Aquila"
     # empty local_identifier and nick_name fall back to ring_id
     assert _display_name(_make_individual(local_identifier="", nick_name="")) == "R1"
+
+
+@pytest.mark.asyncio
+async def test_backfill_cancelled_step_reraises_and_preserves_scan_from(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A hard cancellation mid-send must propagate (CancelledError is BaseException,
+    # not caught by the retry/backoff handlers) and must not have advanced the
+    # persisted scan_from past what was durably completed.
+    gen, _calls = make_counting_events_generator(1)  # 1 event/fetch, under the cap
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi",
+                 AsyncMock(side_effect=asyncio.CancelledError()))
+
+    with pytest.raises(asyncio.CancelledError):
+        await action_backfill_events_for_individual(
+            integration=integration,
+            action_config=BackfillEventsForIndividualConfig(
+                study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+                start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            ),
+        )
+
+    # The send was cancelled before the per-window persist, so no watermark blob
+    # was written for this individual (scan_from never advanced).
+    assert (str(integration.id), "backfill_watermark", "job-x.111") not in mock_state_store

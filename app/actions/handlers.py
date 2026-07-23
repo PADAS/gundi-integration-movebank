@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -796,6 +797,19 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 # risking the invocation running past its execution budget.
                 if window_interrupted or observations_sent >= MAX_RECORDS_PER_BACKFILL_STEP:
                     break
+    except asyncio.CancelledError:
+        # Hard execution-timeout: asyncio.wait_for in the action runner cancels
+        # this task, raising CancelledError (a BaseException — the handlers below
+        # do NOT catch it). scan_from + window_seconds are persisted every
+        # window, so no data is lost; a later trigger resumes from the last
+        # completed window. We do not attempt async recovery here (re-trigger /
+        # in_flight unwind): awaits during cancellation are themselves cancelled
+        # and unreliable. Recover a job wedged by a timeout with restart=true.
+        logger.warning(
+            f"Backfill {log_reference}: step hard-cancelled at scan_from={current.isoformat()}; "
+            "resume on next trigger or re-run with restart=true"
+        )
+        raise
     except NoConnectionSlot:
         # No connection slot available: re-trigger THIS individual (same in-flight
         # unit continues) rather than losing the step or double-counting in-flight.
