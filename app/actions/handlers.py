@@ -601,6 +601,21 @@ async def _dispatch_backfill_individual(integration_id, job, individual_id):
     logger.warning(f"Backfill {job.job_id}: exhausted pending queue looking for a valid config to dispatch")
 
 
+async def _record_abandoned_coverage(integration_id, ind, action_config, floor):
+    """On abandon, lower the pull cursor's coverage_start to the reached floor so
+    the recent portion a reverse backfill DID cover is recorded (a later fresh
+    backfill sees a smaller remaining range). Single best-effort write on a rare
+    path; preserves the pull's sensor cursors as read."""
+    raw = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=ind.id)
+    existing = IndividualState.parse_obj(raw) if raw else IndividualState(
+        individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
+    )
+    if existing.coverage_start is None or floor < existing.coverage_start:
+        existing.coverage_start = floor
+    await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID,
+                                  json.loads(existing.json()), source_id=ind.id)
+
+
 async def _finalize_backfill_individual(integration_id, job, ind, action_config, *, observations, state=None):
     # Merge the backfill watermark FORWARD into the steady-state pull cursor:
     # per sensor, take max(existing, backfill) on both the timestamp and the
@@ -854,6 +869,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
             logger.info(f"Backfill {action_config.job_id}/{ind.id}: attempt {attempts} failed ({exc}); retrying")
             return {"status": "retry", "attempts": attempts}
         logger.warning(f"Backfill {action_config.job_id}/{ind.id}: abandoned after {attempts} attempts: {exc}")
+        await _record_abandoned_coverage(integration_id, ind, action_config, floor=cursor)
         result = await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=0)
         return {"status": "abandoned", **{k: v for k, v in result.items() if k != "status"}}
 

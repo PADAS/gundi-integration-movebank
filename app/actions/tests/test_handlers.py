@@ -736,8 +736,11 @@ async def test_backfill_individual_abandoned_after_max_attempts(
     # Finalize ran exactly once on the abandon path — no double-counting.
     assert mock_record_completion.await_count == 1
     assert mock_decr_in_flight.await_count == 1
-    # Abandoned with observations=0 and no state: no pull cursor handed off.
-    assert (str(integration.id), "pull_events_for_individual", "111") not in mock_state_store
+    # Abandoned with zero progress (cursor never descended past `end`): the
+    # reached-floor record still writes, but at the original boundary — a
+    # no-op floor, not a data loss.
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    assert IndividualState.parse_obj(saved).coverage_start == datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 @pytest.mark.asyncio
@@ -1905,3 +1908,61 @@ async def test_backfill_resumes_from_persisted_descending_cursor(
 
     assert calls["windows"][0][1] == datetime(2024, 6, 1, tzinfo=timezone.utc)          # resumed at scan_from
     assert calls["windows"][0][0] == datetime(2024, 5, 31, tzinfo=timezone.utc)         # one 1-day window down
+
+
+@pytest.mark.asyncio
+async def test_backfill_abandon_lowers_coverage_start_to_reached_floor(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # One window completes (cursor descends), then fetches fail and the
+    # individual is abandoned; coverage_start must be LOWERED to the reached
+    # floor (the descended cursor), not left at its original value.
+    from app.actions.handlers import BACKFILL_MAX_ATTEMPTS
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 6, 1, tzinfo=timezone.utc)
+    # A 30-day window means the first window is [end - 30d, end) = [2024-05-02, 2024-06-01).
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-1.111")] = {
+        **st.dict(), "window_seconds": 2592000.0,  # 30 days
+    }
+    # Pre-existing pull cursor with coverage_start at end (the backfill boundary).
+    pull = IndividualState(individual_id="111", study_id="12345")
+    pull.coverage_start = end
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = pull.dict()
+
+    # Window 1 returns one in-range event (succeeds, cursor descends to 2024-05-02);
+    # window 2's fetch raises -> abandon (incr_attempts mocked past the limit).
+    fetches = {"n": 0}
+    async def gen(**kwargs):
+        fetches["n"] += 1
+        if fetches["n"] == 1:
+            mid = kwargs["timestamp_start"] + (kwargs["timestamp_end"] - kwargs["timestamp_start"]) / 2
+            yield {"event_id": "1", "timestamp": mid.strftime("%Y-%m-%d %H:%M:%S.000"),
+                   "location_lat": "1.5", "location_long": "2.5",
+                   "individual_id": "111", "sensor_type_id": "653"}
+        else:
+            raise RuntimeError("movebank down")
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_attempts",
+                 AsyncMock(return_value=BACKFILL_MAX_ATTEMPTS + 1))  # over the limit -> abandon
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "abandoned"
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    # Lowered from end (2024-06-01) to the reached floor (2024-05-02).
+    assert IndividualState.parse_obj(saved).coverage_start == datetime(2024, 5, 2, tzinfo=timezone.utc)
