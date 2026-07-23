@@ -1,6 +1,6 @@
 # Recent-First (Reverse-Chronological) Backfill — Design
 
-**Status:** approved design, pre-implementation
+**Status:** implemented
 **Date:** 2026-07-23
 **Branch:** movebank-backfill-recent-first (off main, post-PR #17)
 
