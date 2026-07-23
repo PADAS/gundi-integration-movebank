@@ -686,12 +686,14 @@ async def action_backfill_events_for_individual(integration, action_config: Back
         sensor_type_timestamps[stid] = ss.latest_timestamp or action_config.start
         minimum_event_ids[stid] = (ss.highest_event_id or 0) + 1
 
-    # The scan position is a DURABLE floor, persisted every window regardless
+    # The scan position is a DURABLE cursor, persisted every window regardless
     # of whether events came back. Windows are anchored to it (below), not to
     # the per-sensor event cursor above — otherwise a sensor that returns
     # nothing for the whole range would never move its own cursor, and a
-    # re-trigger after a budget-exhausted step would recompute `current` from
+    # re-trigger after a budget-exhausted step would recompute the cursor from
     # that unmoved cursor and rescan the same empty span forever (livelock).
+    # It descends from `end` toward `start`; at any point we have covered
+    # `[scan_from, end)` and still owe `[start, scan_from)`.
     persisted_scan_from = None
     if saved and saved.get("scan_from"):
         try:
@@ -711,7 +713,11 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     min_window = timedelta(seconds=settings.MIN_BACKFILL_WINDOW_SECONDS)
     window = max(window, min_window)
     observations_sent = 0
-    current = persisted_scan_from if persisted_scan_from is not None else min(sensor_type_timestamps.values())
+    # Reverse (recent-first): `cursor` is the LOWER edge of coverage so far — we
+    # have covered [cursor, end) and still owe [start, cursor). It begins at
+    # `end` (= coverage_start) and descends toward `start`; a persisted position
+    # resumes the descent. (The backfill watermark's scan_from stores it.)
+    cursor = persisted_scan_from if persisted_scan_from is not None else action_config.end
 
     mb_client = client.MovebankClient(
         base_url=integration.base_url, username=auth_config.username,
@@ -726,10 +732,9 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     # second time, double-counting record_completion/decr_in_flight.
     try:
         async with mb_client as mb:
-            while current < action_config.end and time.monotonic() < deadline:
-                end_at = min(action_config.end, current + window)
-                # All sensors sweep the same [current, end_at) window together —
-                # anchored to the scan floor, not each sensor's own cursor.
+            while cursor > action_config.start and time.monotonic() < deadline:
+                window_lower = max(action_config.start, cursor - window)
+                window_upper = cursor
                 events = []
                 window_interrupted = False
                 for stid in sensor_type_ids:
@@ -742,66 +747,72 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                     if time.monotonic() >= deadline:
                         window_interrupted = True
                         break
-                    query_start = _query_start_for_sensor(stid, current, minimum_event_ids[stid])
                     async with movebank_slot(auth_config.username):
                         async for event in mb.get_individual_events_by_time(
                             study_id=action_config.study_id, individual_id=ind.id,
-                            timestamp_start=query_start, timestamp_end=end_at,
-                            sensor_type_ids=[stid], minimum_event_id=minimum_event_ids[stid],
+                            timestamp_start=window_lower, timestamp_end=window_upper,
+                            sensor_type_ids=[stid], minimum_event_id=0,
                         ):
                             events.append(event)
 
-                # Overflow guard: only SEND a window we can finish within the
-                # budget. A FULLY-fetched window (not deadline-interrupted) with
-                # more than the per-window cap is discarded — nothing sent,
-                # watermarks and scan floor untouched — and the window is shrunk
-                # proportionally, persisted, and retried at the same `current`.
-                # Never shrink below the floor; at the floor, fall through and
-                # send even if over cap (a burst denser than the floor holds).
+                # Timestamp-range ownership: keep only events whose timestamp is
+                # in this window's half-open [lower, upper). Discards the client's
+                # accessory 60-min pre-roll and the whole-second timestamp_end
+                # truncation, so each event belongs to exactly one window and no
+                # cross-window event-id dedup is needed. Unparseable timestamps
+                # are dropped (build_observation would drop them anyway).
+                kept = []
+                for e in events:
+                    try:
+                        ts = _ensure_utc(parse_date(e.get("timestamp")))
+                    except Exception:
+                        continue
+                    if window_lower <= ts < window_upper:
+                        kept.append(e)
+
+                # Overflow guard on KEPT (send) volume — see step-budget design.
                 if (not window_interrupted
-                        and len(events) > settings.MAX_RECORDS_PER_BACKFILL_WINDOW
+                        and len(kept) > settings.MAX_RECORDS_PER_BACKFILL_WINDOW
                         and window > min_window):
                     shrunk = (window.total_seconds()
-                              * settings.MAX_RECORDS_PER_BACKFILL_WINDOW / len(events)
+                              * settings.MAX_RECORDS_PER_BACKFILL_WINDOW / len(kept)
                               * settings.BACKFILL_WINDOW_SHRINK_SAFETY)
                     window = max(min_window, timedelta(seconds=shrunk))
                     blob = json.loads(state.json())
-                    blob["scan_from"] = current.isoformat()           # unchanged
+                    blob["scan_from"] = cursor.isoformat()           # unchanged (cursor not advanced)
                     blob["window_seconds"] = window.total_seconds()
                     await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
                                                   blob, source_id=watermark_source)
                     logger.info(
                         f"Backfill {log_reference}: window over cap "
-                        f"({len(events)} > {settings.MAX_RECORDS_PER_BACKFILL_WINDOW}); "
+                        f"({len(kept)} > {settings.MAX_RECORDS_PER_BACKFILL_WINDOW}); "
                         f"shrunk to {window.total_seconds():.0f}s, retrying"
                     )
                     continue
                 if (not window_interrupted
-                        and len(events) > settings.MAX_RECORDS_PER_BACKFILL_WINDOW):
+                        and len(kept) > settings.MAX_RECORDS_PER_BACKFILL_WINDOW):
                     logger.warning(
                         f"Backfill {log_reference}: window at floor "
                         f"({settings.MIN_BACKFILL_WINDOW_SECONDS}s) still over cap "
-                        f"({len(events)} events); sending anyway"
+                        f"({len(kept)} events); sending anyway"
                     )
 
                 device_name = _display_name(ind)
-                observations = [o for e in events if (o := build_observation(event=e, device_name=device_name)) is not None]
+                observations = [o for e in kept if (o := build_observation(event=e, device_name=device_name)) is not None]
                 for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
                     await send_observations_to_gundi(observations=batch, integration_id=integration_id)
 
-                _advance_watermarks(state, events, sensor_type_ids, sensor_type_timestamps, minimum_event_ids)
+                # Vestigial in reverse: advances per-sensor state from the kept
+                # events. Used only by the finalize forward-merge, which is inert
+                # here (backfill's max is below coverage_start). Kept for parity
+                # and harmless (may reflect the oldest window's values).
+                _advance_watermarks(state, kept, sensor_type_ids, sensor_type_timestamps, minimum_event_ids)
                 observations_sent += len(observations)
                 if not window_interrupted:
-                    # Only advance past this window if EVERY sensor was fetched
-                    # for it; an interrupted window is retried in full next
-                    # step (safe: per-sensor minimum_event_id already advanced
-                    # for whichever sensors DID get fetched, so no duplicates).
-                    current = current + window
+                    cursor = window_lower       # descend
 
-                # Persist the scan floor together with the sensor states in a
-                # single call, every window, regardless of whether events came back.
                 blob = json.loads(state.json())
-                blob["scan_from"] = current.isoformat()
+                blob["scan_from"] = cursor.isoformat()
                 blob["window_seconds"] = window.total_seconds()
                 await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
                                               blob, source_id=watermark_source)
@@ -821,7 +832,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
         # in_flight unwind): awaits during cancellation are themselves cancelled
         # and unreliable. Recover a job wedged by a timeout with restart=true.
         logger.warning(
-            f"Backfill {log_reference}: step hard-cancelled at scan_from={current.isoformat()}; "
+            f"Backfill {log_reference}: step hard-cancelled at scan_from={cursor.isoformat()}; "
             "resume on next trigger or re-run with restart=true"
         )
         raise
@@ -847,12 +858,13 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     # count against BACKFILL_MAX_ATTEMPTS.
     await job.reset_attempts(ind.id)
 
-    if current < action_config.end:
-        # Budget exhausted mid-range: continue THIS individual on the next step.
+    if cursor > action_config.start:
+        # Budget exhausted mid-range: continue THIS individual on the next step
+        # (descending from the persisted cursor).
         await trigger_action(
             integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=action_config,
         )
-        logger.info(f"Backfill {log_reference} continued at {current.isoformat()} ({observations_sent} obs this step)")
+        logger.info(f"Backfill {log_reference} continued at {cursor.isoformat()} ({observations_sent} obs this step)")
         return {"status": "continued", "observations_sent": observations_sent}
 
     return await _finalize_backfill_individual(
