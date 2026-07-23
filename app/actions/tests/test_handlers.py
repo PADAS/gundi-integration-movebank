@@ -1007,6 +1007,12 @@ async def test_backfill_individual_checks_deadline_between_sensor_fetches(
     # Uses a real (tiny) deadline and a real sleep on the first sensor's fetch
     # rather than mocking time.monotonic, which asyncio's own loop internals
     # also call (mocking it globally breaks the event loop itself).
+    #
+    # The first sensor's fetch DOES return an event before the deadline is hit
+    # on the second sensor. The whole window must be discarded (not partially
+    # sent) — see test_backfill_individual_resumed_window_does_not_duplicate_
+    # sensor_already_fetched below for the duplicate-send regression this
+    # atomicity guards against.
     import asyncio
     from app.actions.configurations import BackfillEventsForIndividualConfig
     from datetime import datetime, timezone
@@ -1018,12 +1024,11 @@ async def test_backfill_individual_checks_deadline_between_sensor_fetches(
         if kwargs["sensor_type_ids"] == [653]:
             calls["gps"] += 1
             await asyncio.sleep(0.1)  # simulate a slow first-sensor request
+            yield _gps_event(1, "2024-01-02 12:00:00.000")
         else:
             calls["accessory"] += 1
-        if False:
-            yield {}
     mock_movebank_client.get_individual_events_by_time = _gen
-    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
     mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
     # A tiny real budget: comfortably survives until after the GPS fetch is
     # requested, but is exhausted by the time the 0.1s sleep completes.
@@ -1043,6 +1048,81 @@ async def test_backfill_individual_checks_deadline_between_sensor_fetches(
     assert calls["gps"] == 1
     assert calls["accessory"] == 0  # deadline hit before this sensor's fetch
     assert mock_trigger.await_count == 1
+    # Discard-on-interrupt: the GPS event already fetched must NOT be sent,
+    # and no scan_from/window_seconds is persisted for the (retried) window —
+    # the whole window, including the sensor already fetched, is redone.
+    assert mock_send.await_count == 0
+    assert mock_state_store.get((str(integration.id), "backfill_watermark", "job-1.111")) is None
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_resumed_window_does_not_duplicate_sensor_already_fetched(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Regression for the reverse-backfill duplicate-send bug: when the
+    # deadline hits between a window's per-sensor fetches, the whole window
+    # must be discarded (not partially sent). Call 1's GPS fetch succeeds but
+    # the accessory fetch is cut off by the deadline; call 2 then resumes the
+    # (unmoved) cursor and re-fetches BOTH sensors over the identical window.
+    # If the window were partially sent on call 1 (the bug), the GPS event
+    # would be sent again on call 2 -> a duplicate observation.
+    import asyncio
+    from datetime import datetime, timezone
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    call_state = {"slow_first_fetch": True}
+
+    async def _gen(**kwargs):
+        stid = kwargs["sensor_type_ids"][0]
+        if stid == 653:  # gps
+            if call_state["slow_first_fetch"]:
+                await asyncio.sleep(0.1)  # call 1 only: blow the deadline mid-window
+            yield _gps_event(1, "2024-01-02 12:00:00.000")
+        else:  # accessory-measurements
+            yield {
+                "event_id": "2", "timestamp": "2024-01-02 12:00:00.000",
+                "individual_id": "111", "sensor_type_id": str(stid),
+                "location_lat": "1.5", "location_long": "2.5",
+            }
+    mock_movebank_client.get_individual_events_by_time = _gen
+
+    sent_event_ids = []
+
+    async def _send(observations, integration_id):
+        sent_event_ids.extend(o["additional"]["event_id"] for o in observations)
+        return []
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(side_effect=_send))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 2, "in_flight": 0, "range": "r"}))
+
+    config = BackfillEventsForIndividualConfig(
+        study_id="12345",
+        individual={**INDIVIDUAL_ROW, "sensor_type_ids": "gps,accessory-measurements"},
+        job_id="job-1", start=start, end=end,
+    )
+
+    # Call 1: deadline hits between sensors -> window discarded whole, cursor
+    # unmoved, nothing sent.
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 0.01)
+    result1 = await action_backfill_events_for_individual(integration=integration, action_config=config)
+    assert result1["status"] == "continued"
+    assert sent_event_ids == []
+
+    # Call 2: resumes at the SAME (unmoved) cursor with a generous deadline,
+    # so both sensors fetch successfully this time.
+    call_state["slow_first_fetch"] = False
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 100)
+    await action_backfill_events_for_individual(integration=integration, action_config=config)
+
+    # The gps sensor's event ("1") must be sent exactly once across both
+    # calls — not duplicated because call 1 partially sent the window.
+    assert sent_event_ids.count("1") == 1
+    assert sent_event_ids.count("2") == 1
 
 
 @pytest.mark.asyncio

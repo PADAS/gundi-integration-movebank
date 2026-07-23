@@ -755,6 +755,14 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                         ):
                             events.append(event)
 
+                if window_interrupted:
+                    # Deadline hit mid-window (between sensors): discard the
+                    # partial fetch — we only ever send a WHOLE window
+                    # (atomicity). Cursor/scan_from stay put; the whole window is
+                    # re-fetched next step. Nothing was sent, so there is no
+                    # dedup floor to maintain and no duplicate on retry.
+                    break
+
                 # Timestamp-range ownership: keep only events whose timestamp is
                 # in this window's half-open [lower, upper). Discards the client's
                 # accessory 60-min pre-roll and the whole-second timestamp_end
@@ -771,8 +779,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                         kept.append(e)
 
                 # Overflow guard on KEPT (send) volume — see step-budget design.
-                if (not window_interrupted
-                        and len(kept) > settings.MAX_RECORDS_PER_BACKFILL_WINDOW
+                if (len(kept) > settings.MAX_RECORDS_PER_BACKFILL_WINDOW
                         and window > min_window):
                     shrunk = (window.total_seconds()
                               * settings.MAX_RECORDS_PER_BACKFILL_WINDOW / len(kept)
@@ -789,8 +796,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                         f"shrunk to {window.total_seconds():.0f}s, retrying"
                     )
                     continue
-                if (not window_interrupted
-                        and len(kept) > settings.MAX_RECORDS_PER_BACKFILL_WINDOW):
+                if len(kept) > settings.MAX_RECORDS_PER_BACKFILL_WINDOW:
                     logger.warning(
                         f"Backfill {log_reference}: window at floor "
                         f"({settings.MIN_BACKFILL_WINDOW_SECONDS}s) still over cap "
@@ -808,8 +814,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 # and harmless (may reflect the oldest window's values).
                 _advance_watermarks(state, kept, sensor_type_ids, sensor_type_timestamps, minimum_event_ids)
                 observations_sent += len(observations)
-                if not window_interrupted:
-                    cursor = window_lower       # descend
+                cursor = window_lower       # descend
 
                 blob = json.loads(state.json())
                 blob["scan_from"] = cursor.isoformat()
@@ -821,7 +826,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 # expected even with density-based sizing. Stop taking more
                 # windows once this step's total crosses the cap, rather than
                 # risking the invocation running past its execution budget.
-                if window_interrupted or observations_sent >= MAX_RECORDS_PER_BACKFILL_STEP:
+                if observations_sent >= MAX_RECORDS_PER_BACKFILL_STEP:
                     break
     except asyncio.CancelledError:
         # Hard execution-timeout: asyncio.wait_for in the action runner cancels
