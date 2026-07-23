@@ -1,6 +1,6 @@
 # Backfill Step Budget & Wedge Recovery — Design
 
-**Status:** approved design, pre-implementation
+**Status:** implemented
 **Date:** 2026-07-23
 **Branch:** movebank-backfill-step-budget (off main, post-PR #16)
 
