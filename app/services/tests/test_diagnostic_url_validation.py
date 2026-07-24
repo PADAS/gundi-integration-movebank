@@ -15,6 +15,8 @@ def test_redact_url_strips_credentials_and_brackets_ipv6():
     # A non-numeric port must NOT collapse the whole URL to "<unparseable url>";
     # we still surface the safe host/path.
     assert _redact_url("https://example.com:abc/p") == "example.com/p"
+    # An explicit port 0 (falsy but valid) is preserved.
+    assert _redact_url("https://example.com:0/p") == "example.com:0/p"
 
 
 def _addrinfo(ip):

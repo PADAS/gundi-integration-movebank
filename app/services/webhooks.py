@@ -101,7 +101,7 @@ def _redact_url(url: str) -> str:
             port = parsed.port  # raises ValueError on a non-numeric port
         except ValueError:
             port = None
-        if port:
+        if port is not None:  # keep an explicit port, including 0 (falsy but valid)
             # Bracket IPv6 literals so host:port stays unambiguous (e.g. [::1]:8080).
             bracketed = f"[{host}]" if ":" in host else host
             host = f"{bracketed}:{port}"
