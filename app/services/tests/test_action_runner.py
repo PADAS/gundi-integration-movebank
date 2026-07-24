@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 
@@ -589,4 +590,42 @@ async def test_execute_action_with_handler_error(
     assert event.payload.request_data == str(expected_error.request.content or expected_error.request.body)
     assert event.payload.server_response_status == expected_error.response.status_code
     assert event.payload.server_response_body == str(expected_error.response.text)
+
+
+@pytest.mark.asyncio
+async def test_execute_action_timeout_logs_warning_not_failure(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    # A hard execution timeout means the action exceeded its budget — a
+    # workload/duration issue, NOT a connection problem. It must be recorded as
+    # a WARNING custom log, never an IntegrationActionFailed event (which the
+    # platform health calculator would use to mark the connection unhealthy).
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    # Make the handler time out (wait_for propagates asyncio.TimeoutError, hitting
+    # the same except-branch a real MAX_ACTION_EXECUTION_TIME timeout would).
+    handler, _, _ = mock_action_handlers["pull_observations"]
+    handler.side_effect = asyncio.TimeoutError()
+
+    response = api_client.post(
+        "/v1/actions/execute/",
+        json={"integration_id": str(integration_v2.id), "action_id": "pull_observations"},
+    )
+
+    # API contract: a timeout is a recoverable outcome, returned as HTTP 200 with
+    # a {timed_out, recoverable} body — NOT a 504 / error payload.
+    assert response.status_code == 200
+    body = response.json()
+    assert body.get("timed_out") is True
+    assert body.get("recoverable") is True
+    # No health-dinging failure event was published.
+    assert not _published_events_of_type(mock_publish_event, IntegrationActionFailed)
+    # A WARNING-level custom activity log WAS published for visibility.
+    warnings = _published_events_of_type(mock_publish_event, IntegrationActionCustomLog)
+    assert warnings, "expected a custom activity log for the timeout"
+    assert any(w.payload.level == LogLevel.WARNING for w in warnings)
 

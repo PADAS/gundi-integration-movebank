@@ -101,6 +101,36 @@ async def _handle_error(
     )
 
 
+async def _handle_recoverable_timeout(exc, integration_id, action_id, config_data=None):
+    """Record an action execution timeout as a WARNING rather than a failure.
+
+    A TimeoutError means the action exceeded MAX_ACTION_EXECUTION_TIME — a
+    workload/duration limit, not a connection (credential/connectivity) problem,
+    and the work is recoverable (cascade actions resume from their persisted
+    progress; a scheduled action simply runs again next tick). So we publish a
+    WARNING custom activity log for visibility instead of an
+    IntegrationActionFailed event, keeping the platform health calculator from
+    marking the connection unhealthy for a recoverable timeout. The traceback is
+    still logged locally for debugging.
+
+    `exc` must be the actual caught TimeoutError; its traceback is logged
+    explicitly via exc_info=exc so the log doesn't depend on an ambient
+    exception context (deterministic even if this helper is ever called outside
+    the originating `except`).
+    """
+    message = f"Action '{action_id}' for integration '{integration_id}' timed out (exceeded execution budget)"
+    logger.warning(message, exc_info=exc)
+    await log_action_activity(
+        integration_id=integration_id,
+        action_id=action_id,
+        title=f"Action '{action_id}' timed out; recorded as a warning (recoverable).",
+        level=LogLevel.WARNING,
+        config_data=config_data or {},
+        data={"reason": "execution_timeout", "message": message},
+    )
+    return {"timed_out": True, "recoverable": True, "action_id": action_id}
+
+
 def _skip_quietly(integration_id, action_id, *, reason, message, log_level=logging.INFO):
     """Record an expected pull-action skip in the local log only.
 
@@ -267,12 +297,14 @@ async def execute_action(
             handler(**handler_kwargs),
             timeout=settings.MAX_ACTION_EXECUTION_TIME
         )
-    except asyncio.TimeoutError:
-        return await _handle_error(
-            asyncio.TimeoutError(f"Action '{action_id}' timed out"),
-            integration_id, action_id,
+    except asyncio.TimeoutError as exc:
+        # A timeout is a recoverable workload/duration limit, not a connection
+        # failure — record it as a WARNING so it doesn't mark the connection
+        # unhealthy (see _handle_recoverable_timeout). Pass the actual caught
+        # exception so its traceback is logged deterministically.
+        return await _handle_recoverable_timeout(
+            exc, integration_id, action_id,
             config_data={"configurations": [c.dict() for c in integration.configurations]},
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT
         )
     except Exception as e:
         return await _handle_error(e, integration_id, action_id,
