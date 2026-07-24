@@ -175,8 +175,9 @@ async def test_pull_events_skips_when_caught_up_to_present(
     # "no new data" is gated on NOW, not the individual's timestamp_end: only a
     # cursor that has reached the present skips. (A cursor merely at a stale
     # timestamp_end must NOT skip — see test_pull_events_fetches_beyond_stale_...)
+    # Cursor is relative to now (an hour ahead) so the test is time-independent.
     state = IndividualState(individual_id="111", study_id="12345")
-    state.update_sensor_state(653, datetime(2099, 1, 1, tzinfo=timezone.utc), 999)
+    state.update_sensor_state(653, datetime.now(timezone.utc) + timedelta(hours=1), 999)
     mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = state.dict()
 
     result = await action_pull_events_for_individual(
