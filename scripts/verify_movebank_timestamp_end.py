@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Verify whether a Movebank study's per-individual `timestamp_end` metadata is
-STALE relative to the actual event stream — the suspected reason the pull skips
-for "no new data".
+"""Diagnostic: detect whether a Movebank study's per-individual `timestamp_end`
+metadata is STALE relative to the actual event stream — i.e. real events exist
+after the reported end.
 
-The steady-state pull caps its fetch at `min(now, individual.timestamp_end)` and
-short-circuits once a sensor cursor reaches `timestamp_end`. If Movebank's
-`timestamp_end` (from the get_individuals_by_study metadata) lags real events,
-new data is never fetched. This script checks, per individual, whether GPS
-events exist STRICTLY AFTER the reported `timestamp_end`.
+This was the root cause of a pull that stopped importing new data: the pull used
+to cap its fetch at `min(now, individual.timestamp_end)` and short-circuit once a
+sensor cursor reached `timestamp_end`, so a stale `timestamp_end` (from the
+get_individuals_by_study metadata) hid all newer events. The pull no longer uses
+`timestamp_end` for its bounds (it fetches up to `now`), so this is now an
+informational check on Movebank metadata quality rather than a live-bug detector.
+It checks, per individual, whether GPS events exist STRICTLY AFTER the reported
+`timestamp_end`.
 
 Read-only: it only issues Movebank direct-read queries; it writes nothing to
 Redis, Gundi, or EarthRanger.
