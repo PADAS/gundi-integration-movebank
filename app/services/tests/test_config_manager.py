@@ -346,7 +346,7 @@ async def test_get_webhook_configuration_reads_cached_absence_sentinel(
         mocker, mock_redis_empty, mock_gundi_client_v2_class, integration_v2,
 ):
     import asyncio as _asyncio
-    fut = _asyncio.get_event_loop().create_future()
+    fut = _asyncio.get_running_loop().create_future()
     fut.set_result(b"null")
     mock_redis_empty.Redis.return_value.get.return_value = fut
     mocker.patch("app.services.config_manager.redis", mock_redis_empty)

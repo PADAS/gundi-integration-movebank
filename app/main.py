@@ -108,25 +108,45 @@ async def execute(
 async def push_data(
     request: Request,
 ):
-    json_body = await request.json()
-    logger.debug(f"JSON: {json_body}")
-    payload = base64.b64decode(json_body["message"]["data"]).decode("utf-8").strip()
-    logger.debug(f"Payload: {payload}")
-    json_payload = json.loads(payload)
-    attributes = json_body["message"].get("attributes", {})
-    logger.debug(f"Attributes: {attributes}")
+    # Parse defensively: a malformed envelope (missing message/data, bad base64,
+    # non-UTF8, invalid JSON) can never succeed, so ACK it (2xx) instead of
+    # raising — a non-2xx would make PubSub redeliver it forever.
+    try:
+        json_body = await request.json()
+        message = json_body["message"]
+        # Log metadata only — the envelope and decoded payload can carry sensitive
+        # data (observations, and the attribute values redacted below).
+        logger.debug(f"PubSub message id: {message.get('messageId', '<none>')}")
+        payload = base64.b64decode(message["data"]).decode("utf-8").strip()
+        logger.debug(f"Payload: {len(payload)} bytes")
+        json_payload = json.loads(payload)
+        # Coerce any non-dict attributes (missing, null, or a malformed type) to
+        # {} so the .keys() access below can't raise outside this try and cause
+        # a non-2xx / redelivery.
+        attributes = message.get("attributes")
+        attributes = attributes if isinstance(attributes, dict) else {}
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, AttributeError) as exc:
+        logger.error(f"Acking unparseable PubSub push message: {type(exc).__name__}")
+        return {}
+    # Keys only — attribute VALUES may carry sensitive data (see below).
+    logger.debug(f"Attribute keys: {sorted(attributes.keys())}")
     destination_id = attributes.get("destination_id")
     if not destination_id:
-        # Ack malformed messages (2xx) — raising here would make PubSub
-        # redeliver a message that can never succeed.
-        logger.error(f"PubSub message missing required attribute 'destination_id': {attributes}")
+        # Ack malformed messages (2xx) — they can never succeed, so a non-2xx
+        # would only make PubSub redeliver them forever. Log attribute keys
+        # only; the values may carry sensitive data.
+        logger.error(
+            f"PubSub message missing required attribute 'destination_id'. "
+            f"Attribute keys: {sorted(attributes.keys())}"
+        )
         return {}
-    await execute_action(
+    # Push data rides in the message itself, so execution errors must propagate
+    # (non-2xx) for PubSub to redeliver — acking a failed run would drop data.
+    return await execute_action(
         integration_id=destination_id,
         data=json_payload,
         metadata=attributes
     )
-    return {}
 
 app.include_router(
     actions.router, prefix="/v1/actions", tags=["actions"], responses={}
