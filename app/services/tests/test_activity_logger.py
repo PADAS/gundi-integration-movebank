@@ -1,3 +1,4 @@
+import httpx
 import pytest
 from unittest.mock import ANY
 from gundi_core.events import (
@@ -66,6 +67,42 @@ async def test_activity_logger_decorator(
     assert mock_publish_event.call_count == 2
     assert isinstance(mock_publish_event.call_args_list[0].kwargs.get("event"), IntegrationActionStarted)
     assert isinstance(mock_publish_event.call_args_list[1].kwargs.get("event"), IntegrationActionComplete)
+
+
+@pytest.mark.asyncio
+async def test_activity_logger_decorator_skips_failed_event_on_rate_limit(
+        mocker, mock_publish_event, integration_v2, pull_observations_config
+):
+    # Provider rate limiting is recorded as a recoverable WARNING by the action
+    # runner (see execute_action). The decorator must NOT also publish an
+    # IntegrationActionFailed for it — that would put an ERROR entry in the
+    # activity feed right next to the runner's WARNING and ding connection
+    # health, defeating the point of the recoverable path.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+
+    # Same signal shape as production: movebank-client raises with the final
+    # 429 response attached, which classify_error maps to "rate_limit".
+    rate_limited = Exception("Rate limit retries exhausted after 3 attempts over 31.0s")
+    rate_limited.response = httpx.Response(
+        429, request=httpx.Request("GET", "https://www.movebank.org/movebank/service/direct-read")
+    )
+
+    @activity_logger()
+    async def action_pull_observations(integration, action_config):
+        raise rate_limited
+
+    with pytest.raises(Exception, match="Rate limit retries exhausted"):
+        await action_pull_observations(
+            integration=integration_v2,
+            action_config=pull_observations_config
+        )
+
+    # Only the start event — the exception still propagates to the action
+    # runner, which owns the WARNING activity log for rate limits.
+    published = [call.kwargs.get("event") for call in mock_publish_event.call_args_list]
+    assert not any(isinstance(e, IntegrationActionFailed) for e in published)
+    assert mock_publish_event.call_count == 1
+    assert isinstance(published[0], IntegrationActionStarted)
 
 
 @pytest.mark.asyncio
