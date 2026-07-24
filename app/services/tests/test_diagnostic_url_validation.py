@@ -12,6 +12,9 @@ def test_redact_url_strips_credentials_and_brackets_ipv6():
     # IPv6 literal + port is bracketed so host:port stays unambiguous.
     assert _redact_url("http://[::1]:8080/p") == "[::1]:8080/p"
     assert _redact_url("http://[2001:db8::1]:443/x") == "[2001:db8::1]:443/x"
+    # A non-numeric port must NOT collapse the whole URL to "<unparseable url>";
+    # we still surface the safe host/path.
+    assert _redact_url("https://example.com:abc/p") == "example.com/p"
 
 
 def _addrinfo(ip):

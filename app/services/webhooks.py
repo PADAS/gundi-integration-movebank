@@ -97,10 +97,14 @@ def _redact_url(url: str) -> str:
     try:
         parsed = urlparse(url)
         host = parsed.hostname or "<no-host>"
-        if parsed.port:
+        try:
+            port = parsed.port  # raises ValueError on a non-numeric port
+        except ValueError:
+            port = None
+        if port:
             # Bracket IPv6 literals so host:port stays unambiguous (e.g. [::1]:8080).
             bracketed = f"[{host}]" if ":" in host else host
-            host = f"{bracketed}:{parsed.port}"
+            host = f"{bracketed}:{port}"
         return f"{host}{parsed.path}"
     except Exception:
         return "<unparseable url>"
