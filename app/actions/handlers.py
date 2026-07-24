@@ -641,9 +641,15 @@ async def _merge_backfill_into_pull_cursor(
     existing_raw = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=ind.id)
     if not existing_raw and not create_if_missing:
         return
+    existed = bool(existing_raw)
     existing_state = IndividualState.parse_obj(existing_raw) if existing_raw else IndividualState(
         individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
     )
+    # Track whether anything actually changes: this key is also written by the
+    # scheduled pull, so every needless get/merge/set is another chance to
+    # clobber a concurrent pull-cursor advance (TOCTOU). Only write when a field
+    # really moves — or when we just created the cursor.
+    changed = not existed
     for stid_str, backfill_ss in state.sensor_states.items():
         stid = int(stid_str)
         existing_ss = existing_state.get_sensor_state(stid)
@@ -651,14 +657,20 @@ async def _merge_backfill_into_pull_cursor(
         if candidate_stamps:
             new_ts = max(candidate_stamps)
             new_event_id = max(existing_ss.highest_event_id or 0, backfill_ss.highest_event_id or 0)
-            existing_state.update_sensor_state(stid, new_ts, new_event_id)
+            if new_ts != existing_ss.latest_timestamp or new_event_id != (existing_ss.highest_event_id or 0):
+                existing_state.update_sensor_state(stid, new_ts, new_event_id)
+                changed = True
     if lower_only:
-        if existing_state.coverage_start is None or coverage_start < existing_state.coverage_start:
+        if (existing_state.coverage_start is None or coverage_start < existing_state.coverage_start) \
+                and existing_state.coverage_start != coverage_start:
             existing_state.coverage_start = coverage_start
-    else:
+            changed = True
+    elif existing_state.coverage_start != coverage_start:
         existing_state.coverage_start = coverage_start
-    await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID,
-                                  json.loads(existing_state.json()), source_id=ind.id)
+        changed = True
+    if changed:
+        await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID,
+                                      json.loads(existing_state.json()), source_id=ind.id)
 
 
 async def _finalize_backfill_individual(integration_id, job, ind, action_config, *, observations, state=None):

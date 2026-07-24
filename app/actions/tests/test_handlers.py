@@ -2088,3 +2088,39 @@ async def test_backfill_abandon_lowers_coverage_start_to_reached_floor(
     # The recent window's event-id was merged FORWARD into the pull cursor so the
     # pull's accessory settling re-read dedups the seam (not just coverage_start).
     assert merged.sensor_states["653"].highest_event_id == 1
+
+
+@pytest.mark.asyncio
+async def test_merge_into_pull_cursor_skips_write_when_unchanged(mocker, integration):
+    # The merge shares the pull cursor key with the scheduled pull, so it must
+    # NOT set_state when nothing actually changes (a needless write is another
+    # TOCTOU chance to clobber a concurrent pull advance).
+    from app.actions.handlers import _merge_backfill_into_pull_cursor
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    end = datetime(2024, 6, 1, tzinfo=timezone.utc)
+    existing = IndividualState(individual_id="111", study_id="12345")
+    existing.coverage_start = end
+    existing.update_sensor_state(653, end, 10)
+    mocker.patch("app.actions.handlers.state_manager.get_state", AsyncMock(return_value=existing.dict()))
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", AsyncMock())
+
+    # Backfill maxima are <= existing and the floor is not below existing coverage_start.
+    bf = IndividualState(individual_id="111", study_id="12345")
+    bf.update_sensor_state(653, end, 5)
+    cfg = BackfillEventsForIndividualConfig(
+        study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1",
+        start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=end,
+    )
+    await _merge_backfill_into_pull_cursor(
+        str(integration.id), _make_individual(), cfg, bf,
+        coverage_start=end, lower_only=True, create_if_missing=False,
+    )
+    assert not set_state.called  # nothing moved -> no write
+
+    # A real advance (higher event-id) DOES write.
+    bf.update_sensor_state(653, end, 99)
+    await _merge_backfill_into_pull_cursor(
+        str(integration.id), _make_individual(), cfg, bf,
+        coverage_start=end, lower_only=True, create_if_missing=False,
+    )
+    assert set_state.called
