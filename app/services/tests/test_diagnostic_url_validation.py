@@ -2,7 +2,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.services.webhooks import _validate_diagnostic_url
+from app.services.webhooks import _validate_diagnostic_url, _redact_url
+
+
+def test_redact_url_strips_credentials_and_brackets_ipv6():
+    # userinfo + query are dropped (they can carry secrets); host[:port] + path kept.
+    assert _redact_url("https://user:secret@example.com/path?token=abc") == "example.com/path"
+    assert _redact_url("https://example.com:8080/p") == "example.com:8080/p"
+    # IPv6 literal + port is bracketed so host:port stays unambiguous.
+    assert _redact_url("http://[::1]:8080/p") == "[::1]:8080/p"
+    assert _redact_url("http://[2001:db8::1]:443/x") == "[2001:db8::1]:443/x"
 
 
 def _addrinfo(ip):

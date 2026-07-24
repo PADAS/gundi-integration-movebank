@@ -114,7 +114,8 @@ async def push_data(
     logger.debug(f"Payload: {payload}")
     json_payload = json.loads(payload)
     attributes = json_body["message"].get("attributes", {})
-    logger.debug(f"Attributes: {attributes}")
+    # Keys only — attribute VALUES may carry sensitive data (see below).
+    logger.debug(f"Attribute keys: {sorted(attributes.keys())}")
     destination_id = attributes.get("destination_id")
     if not destination_id:
         # Ack malformed messages (2xx) — they can never succeed, so a non-2xx
@@ -132,7 +133,6 @@ async def push_data(
         data=json_payload,
         metadata=attributes
     )
-    return {}
 
 app.include_router(
     actions.router, prefix="/v1/actions", tags=["actions"], responses={}
