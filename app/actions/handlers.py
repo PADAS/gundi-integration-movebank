@@ -243,8 +243,6 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
         return {"skipped": "no_timestamp_start"}
 
     now = datetime.now(tz=timezone.utc)
-    # Some individuals don't provide timestamp_end, so resolve a reasonable value.
-    resolved_individual_timestamp_end = ind.timestamp_end or now
     # Fetch up to NOW, NOT the individual's timestamp_end. Movebank's per-individual
     # timestamp_end is derived study metadata that often lags the live event
     # stream, so capping here froze collection once a cursor caught up to a stale
@@ -296,10 +294,10 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     # Size the fetch window by event density (shared with backfill via
     # _compute_batch_window): high-frequency individuals get a window that
     # should hold roughly HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD events, assuming
-    # an even distribution over the individual's active range.
-    # resolved_individual_timestamp_end falls back to now when the individual
-    # omits timestamp_end, so density sizing works for those individuals too.
-    total_seconds = (resolved_individual_timestamp_end - ind.timestamp_start).total_seconds()
+    # an even distribution over the individual's active range. Size against `now`,
+    # not timestamp_end: a stale timestamp_end would shrink the span and produce
+    # needlessly small windows (extra Movebank calls) for high-frequency tags.
+    total_seconds = (now - ind.timestamp_start).total_seconds()
     batch_window_size = _compute_batch_window(ind.number_of_events, total_seconds)
 
     logger.info(

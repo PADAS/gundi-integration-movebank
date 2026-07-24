@@ -357,20 +357,31 @@ async def test_pull_events_respects_max_records_cap(
     assert calls["count"] == 2  # third window never ran
 
 
+def test_compute_batch_window_falls_back_on_nonpositive_span():
+    from app.actions.handlers import _compute_batch_window, DEFAULT_BATCH_WINDOW
+    # A non-positive span (e.g. timestamp_start >= now) would give a
+    # non-positive, never-advancing window for a high-frequency individual — the
+    # guard must fall back to the default.
+    assert _compute_batch_window(6000, 0) == DEFAULT_BATCH_WINDOW
+    assert _compute_batch_window(6000, -100) == DEFAULT_BATCH_WINDOW
+    # A positive span for a high-frequency individual yields a smaller window.
+    assert _compute_batch_window(10000, 5 * 86400) < DEFAULT_BATCH_WINDOW
+    # Low-frequency individuals always get the default window.
+    assert _compute_batch_window(100, 5 * 86400) == DEFAULT_BATCH_WINDOW
+
+
 @pytest.mark.asyncio
-async def test_pull_events_zero_range_high_frequency_individual_terminates(
+async def test_pull_events_high_frequency_individual_no_events_terminates(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
-    # timestamp_end == timestamp_start would make the density window zero -> guard must fall back.
+    # A high-frequency individual (density-sized window) with no new events must
+    # terminate cleanly rather than spin. (The zero-span window guard itself is
+    # covered by test_compute_batch_window_falls_back_on_nonpositive_span.)
     mock_movebank_client.get_individual_events_by_time = make_events_generator([])
     mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
     result = await action_pull_events_for_individual(
         integration=integration,
-        action_config=_sub_action_config(individual_overrides={
-            "number_of_events": "6000",
-            "timestamp_start": "2026-07-01 00:00:00.000",
-            "timestamp_end": "2026-07-01 00:00:00.000",
-        }),
+        action_config=_sub_action_config(individual_overrides={"number_of_events": "6000"}),
     )
     assert result["observations_sent"] == 0
 
