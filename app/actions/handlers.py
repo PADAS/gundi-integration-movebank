@@ -245,7 +245,12 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     now = datetime.now(tz=timezone.utc)
     # Some individuals don't provide timestamp_end, so resolve a reasonable value.
     resolved_individual_timestamp_end = ind.timestamp_end or now
-    highest_date = min(now, resolved_individual_timestamp_end)
+    # Fetch up to NOW, NOT the individual's timestamp_end. Movebank's per-individual
+    # timestamp_end is derived study metadata that often lags the live event
+    # stream, so capping here froze collection once a cursor caught up to a stale
+    # value ("no new data" forever). The per-sensor cursor + event-id filter dedup,
+    # and the empty-window quiet flag idles genuinely dormant individuals.
+    highest_date = now
 
     sensor_type_ids = _supported_sensor_type_ids(ind)
     if not sensor_type_ids:
@@ -264,8 +269,11 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
             individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
         )
 
-    # Build per-sensor cursors from state; new sensors start at the lookback window.
-    default_start = resolved_individual_timestamp_end - timedelta(hours=action_config.maximum_lookback_hours)
+    # Build per-sensor cursors from state; new sensors start at the lookback
+    # window measured from NOW (not timestamp_end, which can be stale) so a fresh
+    # individual's first run stays bounded to the recent window — history is the
+    # backfill's job.
+    default_start = now - timedelta(hours=action_config.maximum_lookback_hours)
     if was_fresh:
         # First-ever cursor for this individual: record the oldest point the pull
         # will cover, so a later backfill knows where to stop (fills [start, this)).
@@ -278,7 +286,10 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
         minimum_event_ids[sensor_type_id] = (sensor_state.highest_event_id or 0) + 1
 
     earliest_start = min(sensor_type_timestamps.values())
-    if earliest_start >= resolved_individual_timestamp_end:
+    if earliest_start >= now:
+        # Cursor has reached the present — nothing to fetch. (Idle individuals
+        # whose cursor is behind `now` are handled by the empty-window quiet
+        # flag below, not by the stale timestamp_end metadata.)
         logger.info(f"Skip Movebank {log_reference} for no new data.")
         return {"skipped": "no_new_data"}
 
