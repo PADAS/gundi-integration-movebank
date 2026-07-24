@@ -201,6 +201,72 @@ def make_counting_events_generator(events_per_call):
     return _gen, calls
 
 
+def make_windowed_events_generator(per_window, sensor_type_id="653"):
+    """Async-generator stand-in that yields `per_window` events with timestamps
+    spread INSIDE each requested [timestamp_start, timestamp_end) window, so the
+    reverse sub-action's timestamp-range keep-filter retains them. Records each
+    call's (timestamp_start, timestamp_end) in `calls['windows']`."""
+    calls = {"count": 0, "windows": []}
+
+    async def _gen(**kwargs):
+        start = kwargs["timestamp_start"]
+        end = kwargs["timestamp_end"]
+        calls["windows"].append((start, end))
+        base = calls["count"] * 100000
+        calls["count"] += 1
+        span = (end - start).total_seconds()
+        for i in range(per_window):
+            # Evenly place events strictly inside [start, end).
+            offset = span * (i + 1) / (per_window + 1)
+            ts = start + timedelta(seconds=offset)
+            yield {
+                "event_id": str(base + i),
+                "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S.000"),
+                "location_lat": "1.5", "location_long": "2.5",
+                "individual_id": "111", "sensor_type_id": sensor_type_id,
+            }
+    return _gen, calls
+
+
+def make_reverse_windowed_events_generator(events_per_window, sensor_type_id, overall_start):
+    """Stand-in for get_individual_events_by_time whose events' event_id is
+    derived from each event's own TIMESTAMP (seconds since `overall_start`), so
+    a LATER timestamp always gets a HIGHER event_id — matching Movebank reality
+    (ids increase with time).
+
+    This is deliberately different from make_windowed_events_generator above,
+    which assigns higher ids to LATER CALLS. In a reverse (recent-first)
+    descent, later calls are OLDER windows — the opposite of reality, and not
+    useful for proving which window's id should win the finalize merge. Here,
+    event_id tracks wall-clock time directly, so whichever window is actually
+    more recent has the higher ids, regardless of call order.
+    """
+    calls = {"count": 0, "windows": [], "window_events": []}
+
+    async def _gen(**kwargs):
+        start = kwargs["timestamp_start"]
+        end = kwargs["timestamp_end"]
+        calls["windows"].append((start, end))
+        calls["count"] += 1
+        span = (end - start).total_seconds()
+        window_events = []
+        for i in range(events_per_window):
+            # Evenly place events strictly inside [start, end).
+            offset = span * (i + 1) / (events_per_window + 1)
+            ts = start + timedelta(seconds=offset)
+            event_id = int((ts - overall_start).total_seconds())
+            event = {
+                "event_id": str(event_id),
+                "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S.000"),
+                "individual_id": "111",
+                "sensor_type_id": str(sensor_type_id),
+            }
+            window_events.append(event)
+            yield event
+        calls["window_events"].append(window_events)
+    return _gen, calls
+
+
 @pytest.mark.asyncio
 async def test_pull_events_respects_max_records_cap(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
@@ -550,13 +616,13 @@ async def test_backfill_individual_retriggers_self_when_budget_exhausted(
 
 
 @pytest.mark.asyncio
-async def test_backfill_individual_sparse_sensor_reaches_end_without_livelock(
+async def test_backfill_individual_sparse_sensor_reaches_start_without_livelock(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
     # A sensor that returns NO events across a multi-window range must still
-    # make bounded progress: the scan floor (`scan_from`) advances every
+    # make bounded progress: the descending cursor (`scan_from`) advances every
     # window regardless of whether events came back, so the step reaches
-    # `end` and finalizes instead of restarting at `start` forever.
+    # `start` and finalizes instead of getting stuck at `end` forever.
     from app.actions.configurations import BackfillEventsForIndividualConfig
     from datetime import datetime, timezone
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
@@ -583,59 +649,9 @@ async def test_backfill_individual_sparse_sensor_reaches_end_without_livelock(
     assert result["status"] == "completed"
     assert not mock_trigger.called  # no self re-trigger: bounded, not livelocked
     # The watermark is deleted on a successful finalize (see MINOR-4 fix) — its
-    # absence here is proof the scan floor actually reached `end` in-bounds
-    # rather than getting stuck mid-range.
+    # absence here is proof the descending cursor actually reached `start`
+    # in-bounds rather than getting stuck mid-range.
     assert (str(integration.id), "backfill_watermark", "job-1.111") not in mock_state_store
-
-
-@pytest.mark.asyncio
-async def test_backfill_individual_resumes_scan_from_persisted_floor(
-        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
-):
-    # Simulate a prior step that advanced the scan floor past `start` without
-    # ever getting an event for its sensor (so the per-sensor cursor is still
-    # unmoved, sitting at `start`). A fresh step must resume scanning from the
-    # persisted scan_from, not recompute `current` from the unmoved per-sensor
-    # cursor and rescan the already-covered span.
-    from app.actions.configurations import BackfillEventsForIndividualConfig
-    from app.actions.client import IndividualState
-    from datetime import datetime, timezone
-    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    end = datetime(2024, 1, 20, tzinfo=timezone.utc)
-    persisted_scan_from = datetime(2024, 1, 11, tzinfo=timezone.utc)  # past two 5-day windows
-    seeded_state = IndividualState(individual_id="111", study_id="12345")
-    blob = seeded_state.dict()
-    blob["scan_from"] = persisted_scan_from.isoformat()
-    mock_state_store[(str(integration.id), "backfill_watermark", "job-1.111")] = blob
-
-    captured_starts = []
-
-    async def _gen(**kwargs):
-        captured_starts.append(kwargs["timestamp_start"])
-        if False:
-            yield {}
-    mock_movebank_client.get_individual_events_by_time = _gen
-    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
-    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
-    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
-    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
-                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0, "in_flight": 0, "range": "r"}))
-    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
-    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
-    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
-    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
-
-    result = await action_backfill_events_for_individual(
-        integration=integration,
-        action_config=BackfillEventsForIndividualConfig(
-            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
-        ),
-    )
-
-    assert result["status"] == "completed"
-    # First fetch must start from the persisted scan floor, not from `start`
-    # (which is where the never-advanced per-sensor cursor would place it).
-    assert captured_starts[0] == persisted_scan_from
 
 
 @pytest.mark.asyncio
@@ -673,7 +689,10 @@ async def test_backfill_seeds_pull_cursor_at_end_and_finalize_merges_forward(
     assert before <= seeded_ss.latest_timestamp <= after
 
     # Now run the sub-action to completion for a small range fully in the past.
-    events = [_gps_event(42, "2025-06-01 00:00:00.000")]
+    # The event's timestamp must fall INSIDE [start, end) below: the new
+    # timestamp-range keep-filter drops anything outside the queried window
+    # (this whole 2-day range collapses into a single window).
+    events = [_gps_event(42, "2025-01-02 00:00:00.000")]
     mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
     mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
     mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
@@ -744,11 +763,23 @@ async def test_backfill_individual_abandoned_after_max_attempts(
                  AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0, "in_flight": 0, "range": "r"}))
     warn = mocker.patch("app.actions.handlers.logger.warning")
 
+    backfill_end = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # Mirror production: action_backfill's _seed_pull_cursor_at_end always runs
+    # before a sub-action can be dispatched, so a pull cursor already exists by
+    # the time this abandon path is reached. The abandon merge
+    # (_merge_backfill_into_pull_cursor with create_if_missing=False) only writes
+    # onto an existing cursor; pre-seed one here so that path is exercised
+    # instead of the create-fresh path it must NOT take.
+    seeded = IndividualState(individual_id="111", study_id="12345", local_identifier="tag-1")
+    seeded.coverage_start = backfill_end
+    seeded.update_sensor_state(653, backfill_end, 0)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = seeded.dict()
+
     result = await action_backfill_events_for_individual(
         integration=integration,
         action_config=BackfillEventsForIndividualConfig(
             study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1",
-            start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=backfill_end,
         ),
     )
     assert result["status"] == "abandoned"
@@ -756,8 +787,11 @@ async def test_backfill_individual_abandoned_after_max_attempts(
     # Finalize ran exactly once on the abandon path — no double-counting.
     assert mock_record_completion.await_count == 1
     assert mock_decr_in_flight.await_count == 1
-    # Abandoned with observations=0 and no state: no pull cursor handed off.
-    assert (str(integration.id), "pull_events_for_individual", "111") not in mock_state_store
+    # Abandoned with zero progress (cursor never descended past `end`): the
+    # reached-floor record still writes, but at the original boundary — a
+    # no-op floor, not a data loss.
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    assert IndividualState.parse_obj(saved).coverage_start == datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 @pytest.mark.asyncio
@@ -898,7 +932,7 @@ async def test_backfill_individual_stops_at_per_step_record_backstop(
     from datetime import datetime, timezone
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2025, 1, 1, tzinfo=timezone.utc)  # huge range, many windows available
-    gen, calls = make_counting_events_generator(3000)  # 3000 events/window, GPS-only
+    gen, calls = make_windowed_events_generator(3000)  # 3000 in-range events/window, GPS-only
     mock_movebank_client.get_individual_events_by_time = gen
     mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
     mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
@@ -925,12 +959,13 @@ async def test_backfill_window_over_cap_is_discarded_then_sent_after_shrink(
 ):
     # A fully-fetched over-cap window is DISCARDED (not sent); the window shrinks
     # and persists, and only a later (floor-sized) window is actually sent. With
-    # the fixed-count generator every fetch returns 3 (> cap 2), so the window
-    # shrinks to the floor in one step, then the floor window is sent anyway.
+    # the windowed generator every fetch returns 3 in-range events (> cap 2), so
+    # the window shrinks to the floor in one step, then the floor window is sent
+    # anyway. Windows now descend from `end`.
     mocker.patch("app.actions.handlers.settings.MAX_RECORDS_PER_BACKFILL_WINDOW", 2)
     mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 259200)  # 3 days
     mocker.patch("app.actions.handlers.settings.BACKFILL_WINDOW_SHRINK_SAFETY", 0.8)
-    gen, calls = make_counting_events_generator(3)  # 3 > cap 2 on every fetch
+    gen, calls = make_windowed_events_generator(3)  # 3 in-range events > cap 2 on every fetch
     mock_movebank_client.get_individual_events_by_time = gen
     send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
     mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
@@ -975,13 +1010,16 @@ async def test_backfill_honours_persisted_window_seconds(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
     # A persisted window_seconds from a prior step is used instead of the density
-    # estimate: the sub-action queries with end_at = current + persisted window.
+    # estimate: in reverse, the sub-action queries with timestamp_start ==
+    # cursor - persisted window. scan_from is one minute past `start` so the
+    # descending cursor has room to take a 60s window without clamping to start.
     st = IndividualState(individual_id="111", study_id="12345")
     mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
-        **st.dict(), "scan_from": "2024-01-01T00:00:00+00:00", "window_seconds": 60.0,
+        **st.dict(), "scan_from": "2024-01-01T00:01:00+00:00", "window_seconds": 60.0,
     }
-    ends = []
+    starts, ends = [], []
     def gen(**kwargs):
+        starts.append(kwargs.get("timestamp_start"))
         ends.append(kwargs.get("timestamp_end"))
         async def _agen():
             for _ in ():
@@ -1008,7 +1046,8 @@ async def test_backfill_honours_persisted_window_seconds(
         ),
     )
 
-    # First window ends 60s after the persisted scan_from, not 5 days later.
+    # First window is [scan_from - 60s, scan_from), not a 5-day-wide window.
+    assert starts[0] == datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
     assert ends[0] == datetime(2024, 1, 1, 0, 1, tzinfo=timezone.utc)
 
 
@@ -1022,6 +1061,12 @@ async def test_backfill_individual_checks_deadline_between_sensor_fetches(
     # Uses a real (tiny) deadline and a real sleep on the first sensor's fetch
     # rather than mocking time.monotonic, which asyncio's own loop internals
     # also call (mocking it globally breaks the event loop itself).
+    #
+    # The first sensor's fetch DOES return an event before the deadline is hit
+    # on the second sensor. The whole window must be discarded (not partially
+    # sent) — see test_backfill_individual_resumed_window_does_not_duplicate_
+    # sensor_already_fetched below for the duplicate-send regression this
+    # atomicity guards against.
     import asyncio
     from app.actions.configurations import BackfillEventsForIndividualConfig
     from datetime import datetime, timezone
@@ -1033,12 +1078,11 @@ async def test_backfill_individual_checks_deadline_between_sensor_fetches(
         if kwargs["sensor_type_ids"] == [653]:
             calls["gps"] += 1
             await asyncio.sleep(0.1)  # simulate a slow first-sensor request
+            yield _gps_event(1, "2024-01-02 12:00:00.000")
         else:
             calls["accessory"] += 1
-        if False:
-            yield {}
     mock_movebank_client.get_individual_events_by_time = _gen
-    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
     mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
     # A tiny real budget: comfortably survives until after the GPS fetch is
     # requested, but is exhausted by the time the 0.1s sleep completes.
@@ -1058,6 +1102,81 @@ async def test_backfill_individual_checks_deadline_between_sensor_fetches(
     assert calls["gps"] == 1
     assert calls["accessory"] == 0  # deadline hit before this sensor's fetch
     assert mock_trigger.await_count == 1
+    # Discard-on-interrupt: the GPS event already fetched must NOT be sent,
+    # and no scan_from/window_seconds is persisted for the (retried) window —
+    # the whole window, including the sensor already fetched, is redone.
+    assert mock_send.await_count == 0
+    assert mock_state_store.get((str(integration.id), "backfill_watermark", "job-1.111")) is None
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_resumed_window_does_not_duplicate_sensor_already_fetched(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Regression for the reverse-backfill duplicate-send bug: when the
+    # deadline hits between a window's per-sensor fetches, the whole window
+    # must be discarded (not partially sent). Call 1's GPS fetch succeeds but
+    # the accessory fetch is cut off by the deadline; call 2 then resumes the
+    # (unmoved) cursor and re-fetches BOTH sensors over the identical window.
+    # If the window were partially sent on call 1 (the bug), the GPS event
+    # would be sent again on call 2 -> a duplicate observation.
+    import asyncio
+    from datetime import datetime, timezone
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    call_state = {"slow_first_fetch": True}
+
+    async def _gen(**kwargs):
+        stid = kwargs["sensor_type_ids"][0]
+        if stid == 653:  # gps
+            if call_state["slow_first_fetch"]:
+                await asyncio.sleep(0.1)  # call 1 only: blow the deadline mid-window
+            yield _gps_event(1, "2024-01-02 12:00:00.000")
+        else:  # accessory-measurements
+            yield {
+                "event_id": "2", "timestamp": "2024-01-02 12:00:00.000",
+                "individual_id": "111", "sensor_type_id": str(stid),
+                "location_lat": "1.5", "location_long": "2.5",
+            }
+    mock_movebank_client.get_individual_events_by_time = _gen
+
+    sent_event_ids = []
+
+    async def _send(observations, integration_id):
+        sent_event_ids.extend(o["additional"]["event_id"] for o in observations)
+        return []
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(side_effect=_send))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 2, "in_flight": 0, "range": "r"}))
+
+    config = BackfillEventsForIndividualConfig(
+        study_id="12345",
+        individual={**INDIVIDUAL_ROW, "sensor_type_ids": "gps,accessory-measurements"},
+        job_id="job-1", start=start, end=end,
+    )
+
+    # Call 1: deadline hits between sensors -> window discarded whole, cursor
+    # unmoved, nothing sent.
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 0.01)
+    result1 = await action_backfill_events_for_individual(integration=integration, action_config=config)
+    assert result1["status"] == "continued"
+    assert sent_event_ids == []
+
+    # Call 2: resumes at the SAME (unmoved) cursor with a generous deadline,
+    # so both sensors fetch successfully this time.
+    call_state["slow_first_fetch"] = False
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 100)
+    await action_backfill_events_for_individual(integration=integration, action_config=config)
+
+    # The gps sensor's event ("1") must be sent exactly once across both
+    # calls — not duplicated because call 1 partially sent the window.
+    assert sent_event_ids.count("1") == 1
+    assert sent_event_ids.count("2") == 1
 
 
 @pytest.mark.asyncio
@@ -1437,6 +1556,73 @@ async def test_finalize_sets_coverage_start_to_backfill_start(
 
 
 @pytest.mark.asyncio
+async def test_backfill_reverse_finalize_carries_recent_windows_event_id_forward(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    """CRITICAL regression test: reverse backfill descends recent-window-first,
+    so across a multi-window run, _finalize_backfill_individual's forward-merge
+    into the pull cursor must carry the RECENT window's (highest) per-sensor
+    event_id — not the OLDEST window's (lowest), which is the one processed
+    LAST and would win under a naive overwrite.
+
+    Uses a real-timestamp-derived event_id (via
+    make_reverse_windowed_events_generator) rather than
+    make_windowed_events_generator, whose ids increase with CALL order — the
+    opposite of reverse-descent reality, where the first call is the most
+    recent window.
+
+    Before the _advance_watermarks cumulative-max fix, each window's call to
+    state.update_sensor_state OVERWROTE the running per-sensor state, so by
+    the time the descent reached the oldest (last-processed) window, `state`
+    held THAT window's low event_id — which finalize then merged into the pull
+    cursor, handing its accessory-settling re-read a too-low dedup floor and
+    letting it re-emit already-sent seam events as duplicates. This test fails
+    before the fix and passes after.
+    """
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    ACCESSORY_SENSOR_ID = 7842954
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 11, tzinfo=timezone.utc)  # 10 days -> exactly two 5-day (default) windows
+    gen, calls = make_reverse_windowed_events_generator(3, ACCESSORY_SENSOR_ID, overall_start=start)
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 6,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+
+    individual = {**INDIVIDUAL_ROW, "sensor_type_ids": "accessory-measurements"}
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=individual, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "completed"
+    assert calls["count"] == 2  # exactly two windows: recent [end-5d, end), then older [start, end-5d)
+
+    recent_window_start, _ = calls["windows"][0]
+    older_window_start, _ = calls["windows"][1]
+    assert recent_window_start > older_window_start  # sanity: window 0 really is the more recent one
+
+    recent_ids = [int(e["event_id"]) for e in calls["window_events"][0]]
+    older_ids = [int(e["event_id"]) for e in calls["window_events"][1]]
+    assert max(recent_ids) > max(older_ids)  # sanity: the generator really gave recent events higher ids
+
+    merged = IndividualState.parse_obj(
+        mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    )
+    merged_ss = merged.get_sensor_state(ACCESSORY_SENSOR_ID)
+    assert merged_ss.highest_event_id == max(recent_ids)
+    assert merged_ss.highest_event_id != max(older_ids)
+
+
+@pytest.mark.asyncio
 async def test_backfill_fills_behind_existing_coverage_start(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
@@ -1623,8 +1809,9 @@ async def test_backfill_cancelled_step_reraises_and_preserves_scan_from(
 ):
     # A hard cancellation mid-send must propagate (CancelledError is BaseException,
     # not caught by the retry/backoff handlers) and must not have advanced the
-    # persisted scan_from past what was durably completed.
-    gen, _calls = make_counting_events_generator(1)  # 1 event/fetch, under the cap
+    # persisted scan_from past what was durably completed. Needs an in-range
+    # event (kept by the timestamp keep-filter) so send is actually reached.
+    gen, _calls = make_windowed_events_generator(1)  # 1 in-range event/fetch, under the cap
     mock_movebank_client.get_individual_events_by_time = gen
     mocker.patch("app.actions.handlers.send_observations_to_gundi",
                  AsyncMock(side_effect=asyncio.CancelledError()))
@@ -1714,3 +1901,226 @@ async def test_backfill_default_still_bails_when_job_active(
 
     assert result.get("already_active") is True
     assert not clear.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_processes_recent_window_first(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Reverse: the FIRST window queried is the most recent one, [end - window, end).
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, tzinfo=timezone.utc)
+    gen, calls = make_windowed_events_generator(1)
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    for m in ("record_completion", "decr_in_flight", "reset_attempts"):
+        mocker.patch(f"app.actions.backfill_queue.BackfillJob.{m}", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual={**INDIVIDUAL_ROW, "number_of_events": "60000"},
+            job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "completed"
+    first_lower, first_upper = calls["windows"][0]
+    assert first_upper == end                      # started at the most recent edge
+    assert first_lower > start                     # first window is a recent slice, not the whole range
+    # windows strictly descend and tile down to start with no gap/overlap
+    lowers = [w[0] for w in calls["windows"]]
+    uppers = [w[1] for w in calls["windows"]]
+    assert uppers[1:] == lowers[:-1]               # each window's upper == previous window's lower
+    assert min(lowers) == start                     # reached start
+
+
+@pytest.mark.asyncio
+async def test_backfill_timestamp_ownership_no_dup_across_boundary(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # An event exactly at a window boundary, and the accessory 60-min pre-roll,
+    # must each be emitted by exactly one window (no dup, no gap). We drive real
+    # source-id collection through send and assert uniqueness.
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 11, tzinfo=timezone.utc)
+
+    # Generator returns the SAME fixed set every call (like the real client's
+    # range-agnostic over-fetch): three events, one on a window boundary.
+    boundary = datetime(2024, 1, 6, tzinfo=timezone.utc)
+    fixed = [
+        {"event_id": "1", "timestamp": "2024-01-03 12:00:00.000", "location_lat": "1.5",
+         "location_long": "2.5", "individual_id": "111", "sensor_type_id": "653"},
+        {"event_id": "2", "timestamp": boundary.strftime("%Y-%m-%d %H:%M:%S.000"), "location_lat": "1.5",
+         "location_long": "2.5", "individual_id": "111", "sensor_type_id": "653"},
+        {"event_id": "3", "timestamp": "2024-01-08 12:00:00.000", "location_lat": "1.5",
+         "location_long": "2.5", "individual_id": "111", "sensor_type_id": "653"},
+    ]
+    async def gen(**kwargs):
+        for e in fixed:
+            yield e
+    mock_movebank_client.get_individual_events_by_time = gen
+    sent_ids = []
+    async def capture(observations, **kwargs):
+        sent_ids.extend(o["additional"]["event_id"] for o in observations)
+        return []
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(side_effect=capture))
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 60)
+    for m in ("record_completion", "decr_in_flight", "reset_attempts"):
+        mocker.patch(f"app.actions.backfill_queue.BackfillJob.{m}", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+
+    await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual={**INDIVIDUAL_ROW, "number_of_events": "1000"},
+            job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    # Each of the three in-range events emitted exactly once (boundary event not doubled).
+    assert sorted(sent_ids) == ["1", "2", "3"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_resumes_from_persisted_descending_cursor(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A persisted scan_from (descending cursor) resumes the descent: the first
+    # window queried is [scan_from - window, scan_from), not [end - window, end).
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-1.111")] = {
+        **st.dict(), "scan_from": "2024-06-01T00:00:00+00:00", "window_seconds": 86400.0,  # 1-day window
+    }
+    gen, calls = make_windowed_events_generator(0)
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    for m in ("record_completion", "decr_in_flight", "reset_attempts"):
+        mocker.patch(f"app.actions.backfill_queue.BackfillJob.{m}", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+
+    await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 12, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert calls["windows"][0][1] == datetime(2024, 6, 1, tzinfo=timezone.utc)          # resumed at scan_from
+    assert calls["windows"][0][0] == datetime(2024, 5, 31, tzinfo=timezone.utc)         # one 1-day window down
+
+
+@pytest.mark.asyncio
+async def test_backfill_abandon_lowers_coverage_start_to_reached_floor(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # One window completes (cursor descends), then fetches fail and the
+    # individual is abandoned; coverage_start must be LOWERED to the reached
+    # floor (the descended cursor), not left at its original value.
+    from app.actions.handlers import BACKFILL_MAX_ATTEMPTS
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 6, 1, tzinfo=timezone.utc)
+    # A 30-day window means the first window is [end - 30d, end) = [2024-05-02, 2024-06-01).
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-1.111")] = {
+        **st.dict(), "window_seconds": 2592000.0,  # 30 days
+    }
+    # Pre-existing pull cursor with coverage_start at end (the backfill boundary).
+    pull = IndividualState(individual_id="111", study_id="12345")
+    pull.coverage_start = end
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = pull.dict()
+
+    # Window 1 returns one in-range event (succeeds, cursor descends to 2024-05-02);
+    # window 2's fetch raises -> abandon (incr_attempts mocked past the limit).
+    fetches = {"n": 0}
+    async def gen(**kwargs):
+        fetches["n"] += 1
+        if fetches["n"] == 1:
+            mid = kwargs["timestamp_start"] + (kwargs["timestamp_end"] - kwargs["timestamp_start"]) / 2
+            yield {"event_id": "1", "timestamp": mid.strftime("%Y-%m-%d %H:%M:%S.000"),
+                   "location_lat": "1.5", "location_long": "2.5",
+                   "individual_id": "111", "sensor_type_id": "653"}
+        else:
+            raise RuntimeError("movebank down")
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_attempts",
+                 AsyncMock(return_value=BACKFILL_MAX_ATTEMPTS + 1))  # over the limit -> abandon
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "abandoned"
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    merged = IndividualState.parse_obj(saved)
+    # Lowered from end (2024-06-01) to the reached floor (2024-05-02).
+    assert merged.coverage_start == datetime(2024, 5, 2, tzinfo=timezone.utc)
+    # The recent window's event-id was merged FORWARD into the pull cursor so the
+    # pull's accessory settling re-read dedups the seam (not just coverage_start).
+    assert merged.sensor_states["653"].highest_event_id == 1
+
+
+@pytest.mark.asyncio
+async def test_merge_into_pull_cursor_skips_write_when_unchanged(mocker, integration):
+    # The merge shares the pull cursor key with the scheduled pull, so it must
+    # NOT set_state when nothing actually changes (a needless write is another
+    # TOCTOU chance to clobber a concurrent pull advance).
+    from app.actions.handlers import _merge_backfill_into_pull_cursor
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    end = datetime(2024, 6, 1, tzinfo=timezone.utc)
+    existing = IndividualState(individual_id="111", study_id="12345")
+    existing.coverage_start = end
+    existing.update_sensor_state(653, end, 10)
+    mocker.patch("app.actions.handlers.state_manager.get_state", AsyncMock(return_value=existing.dict()))
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", AsyncMock())
+
+    # Backfill maxima are <= existing and the floor is not below existing coverage_start.
+    bf = IndividualState(individual_id="111", study_id="12345")
+    bf.update_sensor_state(653, end, 5)
+    cfg = BackfillEventsForIndividualConfig(
+        study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1",
+        start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=end,
+    )
+    await _merge_backfill_into_pull_cursor(
+        str(integration.id), _make_individual(), cfg, bf,
+        coverage_start=end, lower_only=True, create_if_missing=False,
+    )
+    assert not set_state.called  # nothing moved -> no write
+
+    # A real advance (higher event-id) DOES write.
+    bf.update_sensor_state(653, end, 99)
+    await _merge_backfill_into_pull_cursor(
+        str(integration.id), _make_individual(), cfg, bf,
+        coverage_start=end, lower_only=True, create_if_missing=False,
+    )
+    assert set_state.called
