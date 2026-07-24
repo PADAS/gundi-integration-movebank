@@ -616,6 +616,12 @@ async def test_execute_action_timeout_logs_warning_not_failure(
         json={"integration_id": str(integration_v2.id), "action_id": "pull_observations"},
     )
 
+    # API contract: a timeout is a recoverable outcome, returned as HTTP 200 with
+    # a {timed_out, recoverable} body — NOT a 504 / error payload.
+    assert response.status_code == 200
+    body = response.json()
+    assert body.get("timed_out") is True
+    assert body.get("recoverable") is True
     # No health-dinging failure event was published.
     assert not _published_events_of_type(mock_publish_event, IntegrationActionFailed)
     # A WARNING-level custom activity log WAS published for visibility.
