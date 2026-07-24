@@ -634,6 +634,55 @@ async def test_execute_action_timeout_logs_warning_not_failure(
 
 
 @pytest.mark.asyncio
+async def test_execute_action_rate_limit_logs_warning_not_failure(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    # Provider rate limiting (a 429 whose retries the client exhausted) is a
+    # recoverable, expected condition — the action runs again on its next tick.
+    # It must be recorded as a WARNING custom log, never an
+    # IntegrationActionFailed event (which the platform health calculator would
+    # use to mark the connection unhealthy). In production movebank-client
+    # raises MBRateLimitError carrying the final 429 response; here we raise a
+    # generic exception with the same `.response.status_code == 429` signal so
+    # the runner's classify_error path (429 -> "rate_limit") fires regardless of
+    # the client version installed in the test image.
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    rate_limited = Exception("Rate limit retries exhausted after 3 attempts over 31.0s")
+    rate_limited.response = httpx.Response(
+        429, request=httpx.Request("GET", "https://www.movebank.org/movebank/service/direct-read")
+    )
+    handler, _, _ = mock_action_handlers["pull_observations"]
+    handler.side_effect = rate_limited
+
+    response = api_client.post(
+        "/v1/actions/execute/",
+        json={"integration_id": str(integration_v2.id), "action_id": "pull_observations"},
+    )
+
+    # API contract: rate limiting is a recoverable outcome, returned as HTTP 200
+    # with a {rate_limited, recoverable} body — NOT an error payload.
+    assert response.status_code == 200
+    body = response.json()
+    assert body.get("rate_limited") is True
+    assert body.get("recoverable") is True
+    # No health-dinging failure event was published.
+    assert not _published_events_of_type(mock_publish_event, IntegrationActionFailed)
+    # A WARNING-level custom activity log WAS published for visibility.
+    warnings = _published_events_of_type(mock_publish_event, IntegrationActionCustomLog)
+    assert warnings, "expected a custom activity log for the rate limit"
+    assert any(w.payload.level == LogLevel.WARNING for w in warnings)
+    assert any(
+        (w.payload.data or {}).get("reason") == "rate_limit"
+        for w in warnings
+    )
+
+
+@pytest.mark.asyncio
 async def test_push_data_acks_message_without_destination_id(
         mocker, pubsub_message_request_headers, run_push_action_pubsub_payload
 ):

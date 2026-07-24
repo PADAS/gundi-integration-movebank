@@ -131,34 +131,61 @@ async def _handle_error(
     )
 
 
-async def _handle_recoverable_timeout(exc, integration_id, action_id, config_data=None):
-    """Record an action execution timeout as a WARNING rather than a failure.
+async def _publish_recoverable_warning(exc, integration_id, action_id, *, title, message, reason, config_data=None):
+    """Record a recoverable, expected condition as a WARNING activity log
+    instead of an IntegrationActionFailed event.
 
-    A TimeoutError means the action exceeded MAX_ACTION_EXECUTION_TIME — a
-    workload/duration limit, not a connection (credential/connectivity) problem,
-    and the work is recoverable (cascade actions resume from their persisted
-    progress; a scheduled action simply runs again next tick). So we publish a
-    WARNING custom activity log for visibility instead of an
-    IntegrationActionFailed event, keeping the platform health calculator from
-    marking the connection unhealthy for a recoverable timeout. The traceback is
-    still logged locally for debugging.
+    Some failures are transient by nature — an execution timeout (the action
+    exceeded MAX_ACTION_EXECUTION_TIME) or provider rate limiting (429 retries
+    exhausted). Neither is a connection (credential/connectivity) problem, and
+    the work resumes on the next run (cascade actions from their persisted
+    progress; a scheduled action on the next tick). Surfacing them as hard
+    failures would let the platform health calculator mark the connection
+    unhealthy for something we expect to recover from, so we publish a WARNING
+    custom activity log for visibility instead.
 
-    `exc` must be the actual caught TimeoutError; its traceback is logged
-    explicitly via exc_info=exc so the log doesn't depend on an ambient
-    exception context (deterministic even if this helper is ever called outside
-    the originating `except`).
+    `exc` must be the actual caught exception; its traceback is logged via
+    exc_info=exc so the log doesn't depend on an ambient exception context
+    (deterministic even if this helper is ever called outside the originating
+    `except`).
     """
-    message = f"Action '{action_id}' for integration '{integration_id}' timed out (exceeded execution budget)"
     logger.warning(message, exc_info=exc)
     await log_action_activity(
         integration_id=integration_id,
         action_id=action_id,
-        title=f"Action '{action_id}' timed out; recorded as a warning (recoverable).",
+        title=title,
         level=LogLevel.WARNING,
         config_data=config_data or {},
-        data={"reason": "execution_timeout", "message": message},
+        data={"reason": reason, "message": message},
+    )
+
+
+async def _handle_recoverable_timeout(exc, integration_id, action_id, config_data=None):
+    """Record an action execution timeout as a WARNING (recoverable). See
+    _publish_recoverable_warning for why this isn't a hard failure."""
+    message = f"Action '{action_id}' for integration '{integration_id}' timed out (exceeded execution budget)"
+    await _publish_recoverable_warning(
+        exc, integration_id, action_id,
+        title=f"Action '{action_id}' timed out; recorded as a warning (recoverable).",
+        message=message,
+        reason="execution_timeout",
+        config_data=config_data,
     )
     return {"timed_out": True, "recoverable": True, "action_id": action_id}
+
+
+async def _handle_recoverable_rate_limit(exc, integration_id, action_id, config_data=None):
+    """Record provider rate limiting (e.g. 429 retries exhausted) as a WARNING
+    (recoverable) rather than a hard failure. See _publish_recoverable_warning."""
+    message = f"Action '{action_id}' for integration '{integration_id}' was rate limited by the provider: {exc}"
+    await _publish_recoverable_warning(
+        exc, integration_id, action_id,
+        title=f"Action '{action_id}' rate limited; recorded as a warning (recoverable).",
+        message=message,
+        reason="rate_limit",
+        config_data=config_data,
+    )
+    return {"rate_limited": True, "recoverable": True, "action_id": action_id}
 
 
 def _skip_quietly(integration_id, action_id, *, reason, message, log_level=logging.INFO):
@@ -337,6 +364,16 @@ async def execute_action(
             config_data={"configurations": [c.dict() for c in integration.configurations]},
         )
     except Exception as e:
+        # Provider rate limiting (e.g. movebank-client raises after exhausting
+        # its 429 retries) is a recoverable, expected condition — the action
+        # runs again on its next tick. Record it as a WARNING instead of an
+        # IntegrationActionFailed so it doesn't mark the connection unhealthy.
+        classified = classify_error(e)
+        if classified is not None and classified.error_type == "rate_limit":
+            return await _handle_recoverable_rate_limit(
+                e, integration_id, action_id,
+                config_data={"configurations": [c.dict() for c in integration.configurations]},
+            )
         return await _handle_error(e, integration_id, action_id,
                                    config_data={"configurations": [c.dict() for c in integration.configurations]},
                                    classify_heuristics=True)
