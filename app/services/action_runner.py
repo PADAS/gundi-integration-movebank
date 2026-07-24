@@ -144,12 +144,13 @@ async def _publish_recoverable_warning(exc, integration_id, action_id, *, title,
     unhealthy for something we expect to recover from, so we publish a WARNING
     custom activity log for visibility instead.
 
-    `exc` must be the actual caught exception; its traceback is logged via
-    exc_info=exc so the log doesn't depend on an ambient exception context
-    (deterministic even if this helper is ever called outside the originating
-    `except`).
+    `exc` must be the actual caught exception. Its traceback is logged via an
+    explicit (type, value, traceback) tuple built from the exception object
+    itself, so the log takes the traceback from `exc.__traceback__` rather than
+    the ambient `sys.exc_info()` — deterministic even if this helper is ever
+    called outside the originating `except`.
     """
-    logger.warning(message, exc_info=exc)
+    logger.warning(message, exc_info=(type(exc), exc, exc.__traceback__))
     await log_action_activity(
         integration_id=integration_id,
         action_id=action_id,
@@ -177,7 +178,11 @@ async def _handle_recoverable_timeout(exc, integration_id, action_id, config_dat
 async def _handle_recoverable_rate_limit(exc, integration_id, action_id, config_data=None):
     """Record provider rate limiting (e.g. 429 retries exhausted) as a WARNING
     (recoverable) rather than a hard failure. See _publish_recoverable_warning."""
-    message = f"Action '{action_id}' for integration '{integration_id}' was rate limited by the provider: {exc}"
+    # Only the first line of the exception — some (e.g. httpx.HTTPStatusError)
+    # stringify to multi-line text that would make the activity-feed message
+    # noisy. Consistent with classify_error's first-line rendering.
+    detail = (str(exc).splitlines() or [""])[0]
+    message = f"Action '{action_id}' for integration '{integration_id}' was rate limited by the provider: {detail}"
     await _publish_recoverable_warning(
         exc, integration_id, action_id,
         title=f"Action '{action_id}' rate limited; recorded as a warning (recoverable).",
