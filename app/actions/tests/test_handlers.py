@@ -766,10 +766,10 @@ async def test_backfill_individual_abandoned_after_max_attempts(
     backfill_end = datetime(2026, 1, 1, tzinfo=timezone.utc)
     # Mirror production: action_backfill's _seed_pull_cursor_at_end always runs
     # before a sub-action can be dispatched, so a pull cursor already exists by
-    # the time this abandon path is reached. _record_abandoned_coverage now
-    # only writes onto an existing cursor (MINOR fix); pre-seed one here so
-    # that lower-on-existing path is actually exercised instead of the
-    # create-fresh path it used to fall back to.
+    # the time this abandon path is reached. The abandon merge
+    # (_merge_backfill_into_pull_cursor with create_if_missing=False) only writes
+    # onto an existing cursor; pre-seed one here so that path is exercised
+    # instead of the create-fresh path it must NOT take.
     seeded = IndividualState(individual_id="111", study_id="12345", local_identifier="tag-1")
     seeded.coverage_start = backfill_end
     seeded.update_sensor_state(653, backfill_end, 0)
@@ -2082,5 +2082,9 @@ async def test_backfill_abandon_lowers_coverage_start_to_reached_floor(
 
     assert result["status"] == "abandoned"
     saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    merged = IndividualState.parse_obj(saved)
     # Lowered from end (2024-06-01) to the reached floor (2024-05-02).
-    assert IndividualState.parse_obj(saved).coverage_start == datetime(2024, 5, 2, tzinfo=timezone.utc)
+    assert merged.coverage_start == datetime(2024, 5, 2, tzinfo=timezone.utc)
+    # The recent window's event-id was merged FORWARD into the pull cursor so the
+    # pull's accessory settling re-read dedups the seam (not just coverage_start).
+    assert merged.sensor_states["653"].highest_event_id == 1

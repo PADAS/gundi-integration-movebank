@@ -612,56 +612,62 @@ async def _dispatch_backfill_individual(integration_id, job, individual_id):
     logger.warning(f"Backfill {job.job_id}: exhausted pending queue looking for a valid config to dispatch")
 
 
-async def _record_abandoned_coverage(integration_id, ind, action_config, floor):
-    """On abandon, lower the pull cursor's coverage_start to the reached floor so
-    the recent portion a reverse backfill DID cover is recorded (a later fresh
-    backfill sees a smaller remaining range). Single best-effort write on a rare
-    path; preserves the pull's sensor cursors as read.
+async def _merge_backfill_into_pull_cursor(
+        integration_id, ind, action_config, state, *, coverage_start, lower_only=False, create_if_missing=True
+):
+    """Merge the backfill watermark FORWARD into the steady-state pull cursor and
+    set its coverage floor.
 
-    Only writes when a pull cursor already exists. In production the seed
-    (_seed_pull_cursor_at_end) always runs before this path can be reached, so
-    a cursor is always present — but without this guard, a missing cursor
-    would fall back to constructing a fresh, sensor-less IndividualState here
-    and writing it, clobbering nothing today but creating a footgun for a
-    future caller that skips the seed."""
-    raw = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=ind.id)
-    if not raw:
+    Per sensor, take max(existing, backfill) on both the timestamp and the
+    highest event id. This carries backfill's event-ids forward — so the pull's
+    accessory settling re-read dedups against them — without ever moving a
+    running pull's cursor backward (action_backfill may already have claimed a
+    forward cursor at job start via _seed_pull_cursor_at_end, and a live pull may
+    have advanced it further while backfill ran). In reverse backfill the sent
+    windows are processed newest-first, so `state` holds the most-recent
+    event-ids (see _advance_watermarks' cumulative-max) — exactly what the
+    settling re-read needs to filter the seam.
+
+    coverage_start handling:
+      - lower_only=False (success finalize): set coverage_start = coverage_start
+        (the backfill's `start` — full coverage claimed down to there).
+      - lower_only=True (abandon): only lower coverage_start toward the reached
+        floor; never raise it, so a prior deeper backfill's floor is preserved.
+
+    create_if_missing=False (abandon) skips writing entirely when no pull cursor
+    exists yet — in production the seed always ran first, and we don't want a
+    caller that skipped the seed to materialise a cursor here.
+    """
+    existing_raw = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=ind.id)
+    if not existing_raw and not create_if_missing:
         return
-    existing = IndividualState.parse_obj(raw)
-    if existing.coverage_start is None or floor < existing.coverage_start:
-        existing.coverage_start = floor
+    existing_state = IndividualState.parse_obj(existing_raw) if existing_raw else IndividualState(
+        individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
+    )
+    for stid_str, backfill_ss in state.sensor_states.items():
+        stid = int(stid_str)
+        existing_ss = existing_state.get_sensor_state(stid)
+        candidate_stamps = [t for t in (existing_ss.latest_timestamp, backfill_ss.latest_timestamp) if t]
+        if candidate_stamps:
+            new_ts = max(candidate_stamps)
+            new_event_id = max(existing_ss.highest_event_id or 0, backfill_ss.highest_event_id or 0)
+            existing_state.update_sensor_state(stid, new_ts, new_event_id)
+    if lower_only:
+        if existing_state.coverage_start is None or coverage_start < existing_state.coverage_start:
+            existing_state.coverage_start = coverage_start
+    else:
+        existing_state.coverage_start = coverage_start
     await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID,
-                                  json.loads(existing.json()), source_id=ind.id)
+                                  json.loads(existing_state.json()), source_id=ind.id)
 
 
 async def _finalize_backfill_individual(integration_id, job, ind, action_config, *, observations, state=None):
-    # Merge the backfill watermark FORWARD into the steady-state pull cursor:
-    # per sensor, take max(existing, backfill) on both the timestamp and the
-    # highest event id. This carries backfill's event-ids forward (so the
-    # pull's accessory settling re-read dedups against them) without ever
-    # moving a running pull's cursor backward — action_backfill may already
-    # have claimed a forward cursor for this individual at job start (see
-    # _seed_pull_cursor_at_end), and a live pull may have advanced it further
-    # still while backfill was running.
     if state is not None:
-        existing_raw = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=ind.id)
-        existing_state = IndividualState.parse_obj(existing_raw) if existing_raw else IndividualState(
-            individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
+        # Success: carry backfill's per-sensor maxima forward and claim coverage
+        # down to action_config.start.
+        await _merge_backfill_into_pull_cursor(
+            integration_id, ind, action_config, state, coverage_start=action_config.start
         )
-        for stid_str, backfill_ss in state.sensor_states.items():
-            stid = int(stid_str)
-            existing_ss = existing_state.get_sensor_state(stid)
-            candidate_stamps = [t for t in (existing_ss.latest_timestamp, backfill_ss.latest_timestamp) if t]
-            if candidate_stamps:
-                new_ts = max(candidate_stamps)
-                new_event_id = max(existing_ss.highest_event_id or 0, backfill_ss.highest_event_id or 0)
-                existing_state.update_sensor_state(stid, new_ts, new_event_id)
-        # Backfill has now covered down to action_config.start, so the combined
-        # coverage floor moves there — a later backfill with the same/later start
-        # will see an empty range for this individual.
-        existing_state.coverage_start = action_config.start
-        await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID,
-                                      json.loads(existing_state.json()), source_id=ind.id)
     await job.record_completion(observations)
     await job.decr_in_flight()
 
@@ -892,7 +898,15 @@ async def action_backfill_events_for_individual(integration, action_config: Back
             logger.info(f"Backfill {action_config.job_id}/{ind.id}: attempt {attempts} failed ({exc}); retrying")
             return {"status": "retry", "attempts": attempts}
         logger.warning(f"Backfill {action_config.job_id}/{ind.id}: abandoned after {attempts} attempts: {exc}")
-        await _record_abandoned_coverage(integration_id, ind, action_config, floor=cursor)
+        # Carry whatever backfill DID send (recent windows, processed first)
+        # forward into the pull cursor so its accessory settling re-read dedups
+        # the seam, and lower coverage_start to the reached floor — WITHOUT
+        # claiming full completion. Then finalize with state=None so it doesn't
+        # merge again or move coverage_start to `start`.
+        await _merge_backfill_into_pull_cursor(
+            integration_id, ind, action_config, state,
+            coverage_start=cursor, lower_only=True, create_if_missing=False,
+        )
         result = await _finalize_backfill_individual(integration_id, job, ind, action_config, observations=0)
         return {"status": "abandoned", **{k: v for k, v in result.items() if k != "status"}}
 
