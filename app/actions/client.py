@@ -4,7 +4,7 @@ from typing import Dict, Optional, Union
 
 import pydantic
 from dateutil.parser import parse as parse_date
-from movebank_client import MovebankClient
+from movebank_client import MovebankClient as _MovebankClient
 # Not used in this module directly — re-exported for consumers that access them
 # through this namespace (e.g. `client.MBForbiddenError` in app/actions/handlers.py).
 from movebank_client.errors import MBClientError, MBForbiddenError
@@ -13,6 +13,18 @@ from app.services.errors import ConfigurationNotFound
 from app.services.utils import find_config_for_action
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MOVEBANK_BASE_URL = "https://www.movebank.org"
+
+
+class MovebankClient(_MovebankClient):
+    """Defaults base_url to the public Movebank server when the integration
+    record leaves it unset (None or empty string)."""
+
+    def __init__(self, **kwargs):
+        if not kwargs.get("base_url"):
+            kwargs["base_url"] = DEFAULT_MOVEBANK_BASE_URL
+        super().__init__(**kwargs)
 
 
 def get_auth_config(integration):
