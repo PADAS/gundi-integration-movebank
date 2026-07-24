@@ -120,7 +120,11 @@ async def push_data(
         payload = base64.b64decode(message["data"]).decode("utf-8").strip()
         logger.debug(f"Payload: {len(payload)} bytes")
         json_payload = json.loads(payload)
-        attributes = message.get("attributes", {})
+        # Coerce any non-dict attributes (missing, null, or a malformed type) to
+        # {} so the .keys() access below can't raise outside this try and cause
+        # a non-2xx / redelivery.
+        attributes = message.get("attributes")
+        attributes = attributes if isinstance(attributes, dict) else {}
     except (KeyError, TypeError, ValueError, UnicodeDecodeError, AttributeError) as exc:
         logger.error(f"Acking unparseable PubSub push message: {type(exc).__name__}")
         return {}

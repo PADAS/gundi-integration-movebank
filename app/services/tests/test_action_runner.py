@@ -674,6 +674,26 @@ async def test_push_data_acks_unparseable_message(
 
 
 @pytest.mark.asyncio
+async def test_push_data_acks_null_attributes(
+        mocker, pubsub_message_request_headers
+):
+    # "attributes": null (or any non-dict) must coerce to {} — not crash on
+    # .keys() and 500/redeliver. With no destination_id it acks (2xx).
+    mock_execute_action = mocker.patch("app.main.execute_action")
+    data = base64.b64encode(b"{}").decode()
+
+    response = api_client.post(
+        "/push-data",
+        headers=pubsub_message_request_headers,
+        json={"message": {"data": data, "attributes": None}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {}
+    assert not mock_execute_action.called
+
+
+@pytest.mark.asyncio
 async def test_execute_action_reports_classified_auth_error_with_clean_text(
         mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
         mock_publish_event, mock_action_handlers,
