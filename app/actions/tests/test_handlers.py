@@ -169,18 +169,91 @@ async def test_pull_events_skips_individual_without_timestamp_start(
 
 
 @pytest.mark.asyncio
-async def test_pull_events_skips_when_all_sensors_are_current(
+async def test_pull_events_skips_when_caught_up_to_present(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
-    # Saved cursor is already past the individual's timestamp_end.
+    # "no new data" is gated on NOW, not the individual's timestamp_end: only a
+    # cursor that has reached the present skips. (A cursor merely at a stale
+    # timestamp_end must NOT skip — see test_pull_events_fetches_beyond_stale_...)
+    # Cursor is relative to now (an hour ahead) so the test is time-independent.
     state = IndividualState(individual_id="111", study_id="12345")
-    state.update_sensor_state(653, datetime(2026, 7, 1, tzinfo=timezone.utc), 999)
+    state.update_sensor_state(653, datetime.now(timezone.utc) + timedelta(hours=1), 999)
     mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = state.dict()
 
     result = await action_pull_events_for_individual(
         integration=integration, action_config=_sub_action_config()
     )
     assert result == {"skipped": "no_new_data"}
+
+
+@pytest.mark.asyncio
+async def test_pull_events_fetches_beyond_stale_timestamp_end(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Regression: Movebank's per-individual timestamp_end metadata lags the live
+    # feed. A cursor caught up to a stale timestamp_end (INDIVIDUAL_ROW's is
+    # 2026-07-01, before `now`) must NOT freeze the pull — events after it and
+    # before now must still be fetched.
+    state = IndividualState(individual_id="111", study_id="12345")
+    state.update_sensor_state(653, datetime(2026, 7, 1, tzinfo=timezone.utc), 999)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = state.dict()
+    events = [_gps_event(1000, "2026-07-10 00:00:00.000"), _gps_event(1001, "2026-07-11 00:00:00.000")]
+
+    def gen(**kwargs):
+        # Mirror the real client's event-id filter so an advanced cursor doesn't
+        # re-yield already-sent events on later windows.
+        min_id = kwargs.get("minimum_event_id", 0)
+        async def _agen():
+            for e in events:
+                if int(e["event_id"]) >= min_id:
+                    yield e
+        return _agen()
+    mock_movebank_client.get_individual_events_by_time = gen
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    result = await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config()
+    )
+
+    assert result.get("observations_sent") == 2
+    assert mock_send.await_count >= 1
+    saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    assert IndividualState.parse_obj(saved).get_sensor_state(653).highest_event_id == 1001
+
+
+@pytest.mark.asyncio
+async def test_pull_events_fetch_window_extends_past_timestamp_end(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Isolates the highest_date=now fix (independent of the no-new-data gate):
+    # cursor is BEFORE the stale timestamp_end, so the gate never fires either
+    # way; events dated AFTER timestamp_end are only reachable if the fetch
+    # window extends to `now`. Uses a range-respecting generator (like Movebank's
+    # time-bounded API), so a `min(now, timestamp_end)` cap would never see them.
+    state = IndividualState(individual_id="111", study_id="12345")
+    state.update_sensor_state(653, datetime(2026, 6, 25, tzinfo=timezone.utc), 500)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = state.dict()
+    # timestamp_end = 2026-07-01 (INDIVIDUAL_ROW default); events are after it.
+    events = [_gps_event(1000, "2026-07-10 00:00:00.000"), _gps_event(1001, "2026-07-12 00:00:00.000")]
+
+    def gen(**kwargs):
+        q_start, q_end = kwargs["timestamp_start"], kwargs["timestamp_end"]
+        min_id = kwargs.get("minimum_event_id", 0)
+        async def _agen():
+            for e in events:
+                ts = datetime.strptime(e["timestamp"], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=timezone.utc)
+                if int(e["event_id"]) >= min_id and q_start <= ts < q_end:
+                    yield e
+        return _agen()
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    result = await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config()
+    )
+
+    # Reachable only because the window now extends to `now`, not timestamp_end.
+    assert result.get("observations_sent") == 2
 
 
 def make_counting_events_generator(events_per_call):
@@ -285,20 +358,31 @@ async def test_pull_events_respects_max_records_cap(
     assert calls["count"] == 2  # third window never ran
 
 
+def test_compute_batch_window_falls_back_on_nonpositive_span():
+    from app.actions.handlers import _compute_batch_window, DEFAULT_BATCH_WINDOW
+    # A non-positive span (e.g. timestamp_start >= now) would give a
+    # non-positive, never-advancing window for a high-frequency individual — the
+    # guard must fall back to the default.
+    assert _compute_batch_window(6000, 0) == DEFAULT_BATCH_WINDOW
+    assert _compute_batch_window(6000, -100) == DEFAULT_BATCH_WINDOW
+    # A positive span for a high-frequency individual yields a smaller window.
+    assert _compute_batch_window(10000, 5 * 86400) < DEFAULT_BATCH_WINDOW
+    # Low-frequency individuals always get the default window.
+    assert _compute_batch_window(100, 5 * 86400) == DEFAULT_BATCH_WINDOW
+
+
 @pytest.mark.asyncio
-async def test_pull_events_zero_range_high_frequency_individual_terminates(
+async def test_pull_events_high_frequency_individual_no_events_terminates(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
-    # timestamp_end == timestamp_start would make the density window zero -> guard must fall back.
+    # A high-frequency individual (density-sized window) with no new events must
+    # terminate cleanly rather than spin. (The zero-span window guard itself is
+    # covered by test_compute_batch_window_falls_back_on_nonpositive_span.)
     mock_movebank_client.get_individual_events_by_time = make_events_generator([])
     mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
     result = await action_pull_events_for_individual(
         integration=integration,
-        action_config=_sub_action_config(individual_overrides={
-            "number_of_events": "6000",
-            "timestamp_start": "2026-07-01 00:00:00.000",
-            "timestamp_end": "2026-07-01 00:00:00.000",
-        }),
+        action_config=_sub_action_config(individual_overrides={"number_of_events": "6000"}),
     )
     assert result["observations_sent"] == 0
 
@@ -1476,23 +1560,23 @@ async def test_dispatch_rolls_back_and_requeues_on_trigger_failure(mocker):
 async def test_pull_first_run_stamps_coverage_start(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
-    # Fresh individual (no saved cursor): after the first run that persists a
-    # cursor, coverage_start must equal default_start = timestamp_end - lookback.
+    # Fresh individual (no saved cursor): coverage_start is stamped at
+    # default_start = now - lookback (NOT timestamp_end, which can be stale).
     events = [_gps_event(100, "2026-06-30 10:00:00.000")]
     mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
     mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
 
+    before = datetime.now(timezone.utc)
     await action_pull_events_for_individual(
         integration=integration,
-        action_config=_sub_action_config(
-            maximum_lookback_hours=24,
-            individual_overrides={"timestamp_end": "2026-07-01 00:00:00.000"},
-        ),
+        action_config=_sub_action_config(maximum_lookback_hours=24),
     )
+    after = datetime.now(timezone.utc)
 
     saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
     state = IndividualState.parse_obj(saved)
-    assert state.coverage_start == datetime(2026, 6, 30, 0, 0, tzinfo=timezone.utc)  # end - 24h
+    # Stamped at (a `now` captured during the call) - 24h, so it lands in the window.
+    assert before - timedelta(hours=24) <= state.coverage_start <= after - timedelta(hours=24)
 
 
 @pytest.mark.asyncio
