@@ -109,9 +109,11 @@ async def push_data(
     request: Request,
 ):
     json_body = await request.json()
-    logger.debug(f"JSON: {json_body}")
+    # Log metadata only — the envelope and decoded payload can carry sensitive
+    # data (observations, and the attribute values redacted below).
+    logger.debug(f"PubSub message id: {json_body.get('message', {}).get('messageId', '<none>')}")
     payload = base64.b64decode(json_body["message"]["data"]).decode("utf-8").strip()
-    logger.debug(f"Payload: {payload}")
+    logger.debug(f"Payload: {len(payload)} bytes")
     json_payload = json.loads(payload)
     attributes = json_body["message"].get("attributes", {})
     # Keys only — attribute VALUES may carry sensitive data (see below).
