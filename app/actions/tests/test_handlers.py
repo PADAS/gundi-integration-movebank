@@ -228,6 +228,45 @@ def make_windowed_events_generator(per_window, sensor_type_id="653"):
     return _gen, calls
 
 
+def make_reverse_windowed_events_generator(events_per_window, sensor_type_id, overall_start):
+    """Stand-in for get_individual_events_by_time whose events' event_id is
+    derived from each event's own TIMESTAMP (seconds since `overall_start`), so
+    a LATER timestamp always gets a HIGHER event_id — matching Movebank reality
+    (ids increase with time).
+
+    This is deliberately different from make_windowed_events_generator above,
+    which assigns higher ids to LATER CALLS. In a reverse (recent-first)
+    descent, later calls are OLDER windows — the opposite of reality, and not
+    useful for proving which window's id should win the finalize merge. Here,
+    event_id tracks wall-clock time directly, so whichever window is actually
+    more recent has the higher ids, regardless of call order.
+    """
+    calls = {"count": 0, "windows": [], "window_events": []}
+
+    async def _gen(**kwargs):
+        start = kwargs["timestamp_start"]
+        end = kwargs["timestamp_end"]
+        calls["windows"].append((start, end))
+        calls["count"] += 1
+        span = (end - start).total_seconds()
+        window_events = []
+        for i in range(events_per_window):
+            # Evenly place events strictly inside [start, end).
+            offset = span * (i + 1) / (events_per_window + 1)
+            ts = start + timedelta(seconds=offset)
+            event_id = int((ts - overall_start).total_seconds())
+            event = {
+                "event_id": str(event_id),
+                "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S.000"),
+                "individual_id": "111",
+                "sensor_type_id": str(sensor_type_id),
+            }
+            window_events.append(event)
+            yield event
+        calls["window_events"].append(window_events)
+    return _gen, calls
+
+
 @pytest.mark.asyncio
 async def test_pull_events_respects_max_records_cap(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
@@ -724,11 +763,23 @@ async def test_backfill_individual_abandoned_after_max_attempts(
                  AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0, "in_flight": 0, "range": "r"}))
     warn = mocker.patch("app.actions.handlers.logger.warning")
 
+    backfill_end = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # Mirror production: action_backfill's _seed_pull_cursor_at_end always runs
+    # before a sub-action can be dispatched, so a pull cursor already exists by
+    # the time this abandon path is reached. _record_abandoned_coverage now
+    # only writes onto an existing cursor (MINOR fix); pre-seed one here so
+    # that lower-on-existing path is actually exercised instead of the
+    # create-fresh path it used to fall back to.
+    seeded = IndividualState(individual_id="111", study_id="12345", local_identifier="tag-1")
+    seeded.coverage_start = backfill_end
+    seeded.update_sensor_state(653, backfill_end, 0)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = seeded.dict()
+
     result = await action_backfill_events_for_individual(
         integration=integration,
         action_config=BackfillEventsForIndividualConfig(
             study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1",
-            start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=backfill_end,
         ),
     )
     assert result["status"] == "abandoned"
@@ -1502,6 +1553,73 @@ async def test_finalize_sets_coverage_start_to_backfill_start(
 
     saved = mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
     assert IndividualState.parse_obj(saved).coverage_start == start
+
+
+@pytest.mark.asyncio
+async def test_backfill_reverse_finalize_carries_recent_windows_event_id_forward(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    """CRITICAL regression test: reverse backfill descends recent-window-first,
+    so across a multi-window run, _finalize_backfill_individual's forward-merge
+    into the pull cursor must carry the RECENT window's (highest) per-sensor
+    event_id — not the OLDEST window's (lowest), which is the one processed
+    LAST and would win under a naive overwrite.
+
+    Uses a real-timestamp-derived event_id (via
+    make_reverse_windowed_events_generator) rather than
+    make_windowed_events_generator, whose ids increase with CALL order — the
+    opposite of reverse-descent reality, where the first call is the most
+    recent window.
+
+    Before the _advance_watermarks cumulative-max fix, each window's call to
+    state.update_sensor_state OVERWROTE the running per-sensor state, so by
+    the time the descent reached the oldest (last-processed) window, `state`
+    held THAT window's low event_id — which finalize then merged into the pull
+    cursor, handing its accessory-settling re-read a too-low dedup floor and
+    letting it re-emit already-sent seam events as duplicates. This test fails
+    before the fix and passes after.
+    """
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    ACCESSORY_SENSOR_ID = 7842954
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 11, tzinfo=timezone.utc)  # 10 days -> exactly two 5-day (default) windows
+    gen, calls = make_reverse_windowed_events_generator(3, ACCESSORY_SENSOR_ID, overall_start=start)
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 6,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+
+    individual = {**INDIVIDUAL_ROW, "sensor_type_ids": "accessory-measurements"}
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=individual, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "completed"
+    assert calls["count"] == 2  # exactly two windows: recent [end-5d, end), then older [start, end-5d)
+
+    recent_window_start, _ = calls["windows"][0]
+    older_window_start, _ = calls["windows"][1]
+    assert recent_window_start > older_window_start  # sanity: window 0 really is the more recent one
+
+    recent_ids = [int(e["event_id"]) for e in calls["window_events"][0]]
+    older_ids = [int(e["event_id"]) for e in calls["window_events"][1]]
+    assert max(recent_ids) > max(older_ids)  # sanity: the generator really gave recent events higher ids
+
+    merged = IndividualState.parse_obj(
+        mock_state_store[(str(integration.id), "pull_events_for_individual", "111")]
+    )
+    merged_ss = merged.get_sensor_state(ACCESSORY_SENSOR_ID)
+    assert merged_ss.highest_event_id == max(recent_ids)
+    assert merged_ss.highest_event_id != max(older_ids)
 
 
 @pytest.mark.asyncio

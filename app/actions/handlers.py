@@ -131,8 +131,19 @@ def _advance_watermarks(state, events, sensor_type_ids, sensor_type_timestamps, 
             except (TypeError, ValueError):
                 pass
         if stamps or ids:
-            new_latest = max(stamps) if stamps else sensor_type_timestamps[stid]
-            new_max = max(ids) if ids else minimum_event_ids[stid] - 1
+            existing = state.get_sensor_state(stid)
+            window_latest = max(stamps) if stamps else sensor_type_timestamps[stid]
+            window_max_id = max(ids) if ids else minimum_event_ids[stid] - 1
+            # Never move a sensor cursor BACKWARD: max against what's already
+            # stored. The steady-state pull is monotonic-forward, so this is a
+            # no-op there; reverse backfill processes RECENT windows first, so
+            # this preserves the most-recent window's timestamp/event-id for the
+            # finalize forward-merge. Carrying the oldest window's lower id would
+            # let the pull's accessory settling re-read re-emit seam events as
+            # duplicates.
+            candidate_stamps = [t for t in (existing.latest_timestamp, window_latest) if t]
+            new_latest = max(candidate_stamps) if candidate_stamps else window_latest
+            new_max = max(existing.highest_event_id or 0, window_max_id)
             state.update_sensor_state(stid, new_latest, new_max)
             sensor_type_timestamps[stid] = new_latest
             minimum_event_ids[stid] = new_max + 1
@@ -605,11 +616,18 @@ async def _record_abandoned_coverage(integration_id, ind, action_config, floor):
     """On abandon, lower the pull cursor's coverage_start to the reached floor so
     the recent portion a reverse backfill DID cover is recorded (a later fresh
     backfill sees a smaller remaining range). Single best-effort write on a rare
-    path; preserves the pull's sensor cursors as read."""
+    path; preserves the pull's sensor cursors as read.
+
+    Only writes when a pull cursor already exists. In production the seed
+    (_seed_pull_cursor_at_end) always runs before this path can be reached, so
+    a cursor is always present — but without this guard, a missing cursor
+    would fall back to constructing a fresh, sensor-less IndividualState here
+    and writing it, clobbering nothing today but creating a footgun for a
+    future caller that skips the seed."""
     raw = await state_manager.get_state(integration_id, CURSOR_STATE_ACTION_ID, source_id=ind.id)
-    existing = IndividualState.parse_obj(raw) if raw else IndividualState(
-        individual_id=ind.id, study_id=action_config.study_id, local_identifier=ind.local_identifier
-    )
+    if not raw:
+        return
+    existing = IndividualState.parse_obj(raw)
     if existing.coverage_start is None or floor < existing.coverage_start:
         existing.coverage_start = floor
     await state_manager.set_state(integration_id, CURSOR_STATE_ACTION_ID,
@@ -823,10 +841,15 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
                     await send_observations_to_gundi(observations=batch, integration_id=integration_id)
 
-                # Vestigial in reverse: advances per-sensor state from the kept
-                # events. Used only by the finalize forward-merge, which is inert
-                # here (backfill's max is below coverage_start). Kept for parity
-                # and harmless (may reflect the oldest window's values).
+                # Advances per-sensor state from the kept events, cumulative-max
+                # (see _advance_watermarks). In this REVERSE descent, windows are
+                # visited recent-first, so `state` ends up holding the MOST
+                # RECENT window's per-sensor timestamp/event-id — exactly what
+                # _finalize_backfill_individual needs to merge forward into the
+                # pull cursor. (An overwrite here would instead finalize with the
+                # OLDEST window's values, handing the pull cursor a too-low
+                # accessory event-id floor and letting its settling re-read
+                # re-emit already-sent seam events as duplicates.)
                 _advance_watermarks(state, kept, sensor_type_ids, sensor_type_timestamps, minimum_event_ids)
                 observations_sent += len(observations)
                 cursor = window_lower       # descend
