@@ -2364,3 +2364,43 @@ async def test_backfill_individual_cancel_clears_job_when_last_in_flight(
     assert result["status"] == "cancelled"
     mock_clear.assert_awaited_once()       # last in-flight unit removes the job state
     assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_cancel_job_id_stable_across_study_membership_drift(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    # Seed a whole-study job while the study has 2 individuals.
+    rows = [{**INDIVIDUAL_ROW, "id": "1"}, {**INDIVIDUAL_ROW, "id": "2"}]
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=rows)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    started = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    # Study membership changed since the job started. Cancel must hash to the
+    # SAME job from the user-supplied parameters alone — it must not depend on
+    # a live Movebank fetch (which could also be down mid-incident).
+    mock_movebank_client.get_individuals_by_study = AsyncMock(
+        side_effect=AssertionError("cancel must not fetch study individuals")
+    )
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 2, "completed": 0, "observations_sent": 0,
+                                         "in_flight": 1, "pending_remaining": 1, "range": "r"}))
+    mock_cancel = mocker.patch("app.actions.backfill_queue.BackfillJob.cancel", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", cancel=True),
+    )
+
+    assert result["cancelled"] is True
+    assert result["job_id"] == started["job_id"]
+    mock_cancel.assert_awaited_once()

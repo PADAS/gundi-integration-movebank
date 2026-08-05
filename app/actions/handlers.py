@@ -442,22 +442,14 @@ async def _seed_pull_cursor_at_end(integration_id: str, study_id: str, ind, end:
 async def action_backfill(integration, action_config: BackfillConfig):
     integration_id = str(integration.id)
     now = datetime.now(tz=timezone.utc)
-    auth_config = client.get_auth_config(integration)
-    mb_client = client.MovebankClient(
-        base_url=integration.base_url,
-        username=auth_config.username,
-        password=auth_config.password.get_secret_value(),
-    )
-    async with mb_client as mb:
-        async with movebank_slot(auth_config.username):
-            rows = await mb.get_individuals_by_study(study_id=action_config.study_id)
-    individuals = list(generate_individuals(rows))
-    if action_config.individual_ids:
-        wanted = set(action_config.individual_ids)
-        individuals = [i for i in individuals if i.id in wanted]
 
-    # Deterministic job id: a redelivered backfill command resumes the same job.
-    job_seed = f"{action_config.study_id}:{sorted(i.id for i in individuals)}:{action_config.start}"
+    # Deterministic job id from the USER-SUPPLIED parameters only: a redelivered
+    # backfill command resumes the same job, and a later cancel/restart with the
+    # same parameters targets it. Deliberately NOT derived from the fetched
+    # study membership — that can drift while a whole-study job runs, which
+    # would hash a cancel to a different id than the job it's aimed at.
+    ids_repr = sorted(action_config.individual_ids) if action_config.individual_ids else "all"
+    job_seed = f"{action_config.study_id}:{ids_repr}:{action_config.start}"
     job_id = "job-" + hashlib.sha256(job_seed.encode()).hexdigest()[:12]
     job = BackfillJob(integration_id, job_id)
 
@@ -466,6 +458,8 @@ async def action_backfill(integration, action_config: BackfillConfig):
         # in-flight individual unwinds at its next step (they carry their
         # config in the PubSub message, so Redis cleanup alone can't stop
         # them — see action_backfill_events_for_individual's entry check).
+        # Handled before any Movebank traffic: cancel stays usable even when
+        # Movebank itself is down or saturated.
         if not await job.exists():
             logger.info(f"Backfill {job_id}: cancel requested but no active job")
             return {"job_id": job_id, "cancelled": False, "active": False}
@@ -483,6 +477,20 @@ async def action_backfill(integration, action_config: BackfillConfig):
             logger.warning(f"Backfill {job_id}: cancelled idle job — cleared all job state")
         return {"job_id": job_id, "cancelled": True,
                 "pending_cleared": snap["pending_remaining"], "in_flight": snap["in_flight"]}
+
+    auth_config = client.get_auth_config(integration)
+    mb_client = client.MovebankClient(
+        base_url=integration.base_url,
+        username=auth_config.username,
+        password=auth_config.password.get_secret_value(),
+    )
+    async with mb_client as mb:
+        async with movebank_slot(auth_config.username):
+            rows = await mb.get_individuals_by_study(study_id=action_config.study_id)
+    individuals = list(generate_individuals(rows))
+    if action_config.individual_ids:
+        wanted = set(action_config.individual_ids)
+        individuals = [i for i in individuals if i.id in wanted]
 
     if action_config.restart:
         # Operator recovery: wipe the deterministic job's state and its
