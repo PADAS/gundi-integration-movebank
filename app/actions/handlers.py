@@ -461,6 +461,29 @@ async def action_backfill(integration, action_config: BackfillConfig):
     job_id = "job-" + hashlib.sha256(job_seed.encode()).hexdigest()[:12]
     job = BackfillJob(integration_id, job_id)
 
+    if action_config.cancel:
+        # Operator stop: flag the job so nothing new dispatches and every
+        # in-flight individual unwinds at its next step (they carry their
+        # config in the PubSub message, so Redis cleanup alone can't stop
+        # them — see action_backfill_events_for_individual's entry check).
+        if not await job.exists():
+            logger.info(f"Backfill {job_id}: cancel requested but no active job")
+            return {"job_id": job_id, "cancelled": False, "active": False}
+        snap = await job.snapshot()
+        if snap["in_flight"] > 0:
+            await job.cancel()
+            logger.warning(
+                f"Backfill {job_id}: cancelled — dropped {snap['pending_remaining']} pending "
+                f"individuals; {snap['in_flight']} in flight will stop at their next step"
+            )
+        else:
+            # Nothing running to observe the flag and drain the job, so a lone
+            # cancelled meta hash would just leak — remove the job outright.
+            await job.clear()
+            logger.warning(f"Backfill {job_id}: cancelled idle job — cleared all job state")
+        return {"job_id": job_id, "cancelled": True,
+                "pending_cleared": snap["pending_remaining"], "in_flight": snap["in_flight"]}
+
     if action_config.restart:
         # Operator recovery: wipe the deterministic job's state and its
         # per-individual backfill watermarks so it re-seeds and re-runs from
@@ -724,6 +747,16 @@ async def _finalize_backfill_individual(integration_id, job, ind, action_config,
     return {"status": "completed", "observations_sent": observations}
 
 
+def _saved_scan_from(saved) -> Optional[datetime]:
+    """Parse the persisted descent position out of a backfill watermark blob."""
+    if saved and saved.get("scan_from"):
+        try:
+            return _ensure_utc(parse_date(saved["scan_from"]))
+        except Exception:
+            return None
+    return None
+
+
 @activity_logger()
 async def action_backfill_events_for_individual(integration, action_config: BackfillEventsForIndividualConfig):
     ind = action_config.individual
@@ -731,6 +764,33 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     job = BackfillJob(integration_id, action_config.job_id)
     watermark_source = f"{action_config.job_id}.{ind.id}"
     log_reference = f"job:{action_config.job_id},individual:{ind.id}"
+
+    if await job.is_cancelled():
+        # Every continuation path (dispatch, continued, retry, backoff) re-enters
+        # here, so this single check stops the whole cascade within one step.
+        # Carry whatever WAS sent (recent windows first) into the pull cursor so
+        # its settling re-read dedups the seam, and lower coverage_start to the
+        # reached floor — same bookkeeping as the abandon path. The watermark is
+        # kept, so re-running the same backfill resumes this individual.
+        saved = await state_manager.get_state(integration_id, BACKFILL_WATERMARK_ACTION_ID, source_id=watermark_source)
+        if saved:
+            state = IndividualState.parse_obj(saved)
+            reached = _saved_scan_from(saved) or action_config.end
+            await _merge_backfill_into_pull_cursor(
+                integration_id, ind, action_config, state,
+                coverage_start=reached, lower_only=True, create_if_missing=False,
+            )
+        remaining = await job.decr_in_flight()
+        if remaining == 0:
+            # Last in-flight unit: nothing else will ever touch this job's keys
+            # (pending/configs were dropped at cancel time), so remove them.
+            await job.clear()
+            logger.info(f"Backfill {log_reference}: job cancelled; last in-flight individual "
+                        "stopped — job state cleared")
+        else:
+            logger.info(f"Backfill {log_reference}: job cancelled; stopping "
+                        f"({remaining} still in flight)")
+        return {"status": "cancelled"}
 
     sensor_type_ids = _supported_sensor_type_ids(ind)
     if not sensor_type_ids:
@@ -754,12 +814,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     # that unmoved cursor and rescan the same empty span forever (livelock).
     # It descends from `end` toward `start`; at any point we have covered
     # `[scan_from, end)` and still owe `[start, scan_from)`.
-    persisted_scan_from = None
-    if saved and saved.get("scan_from"):
-        try:
-            persisted_scan_from = _ensure_utc(parse_date(saved["scan_from"]))
-        except Exception:
-            persisted_scan_from = None
+    persisted_scan_from = _saved_scan_from(saved)
 
     auth_config = client.get_auth_config(integration)
     deadline = time.monotonic() + 0.8 * settings.MAX_ACTION_EXECUTION_TIME

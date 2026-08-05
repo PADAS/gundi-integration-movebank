@@ -82,6 +82,20 @@ class BackfillJob:
         double-clicked command hashing to the same job_id."""
         return bool(await self.db.exists(self._meta))
 
+    async def cancel(self) -> None:
+        """Mark the job cancelled and drop its pending queue + configs so
+        nothing new can dispatch. The meta hash (with the flag) survives so
+        in-flight steps observe it at their next trigger and unwind; the last
+        one to drain clears the job (see action_backfill_events_for_individual)."""
+        await self.db.hset(self._meta, mapping={"cancelled": 1})
+        await self.db.delete(self._pending, f"{self._meta}.configs")
+
+    async def is_cancelled(self) -> bool:
+        value = await self.db.hget(self._meta, "cancelled")
+        if isinstance(value, bytes):
+            value = value.decode()
+        return value in ("1", 1)
+
     async def clear(self) -> None:
         """Delete every Redis key for this job (meta hash, pending queue, and the
         per-individual configs hash). Used by a restart to wipe a stuck or

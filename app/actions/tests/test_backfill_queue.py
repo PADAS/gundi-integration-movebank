@@ -47,7 +47,14 @@ def fake_redis():
     async def llen(key):
         return len(store["list"])
 
+    async def delete(*keys):
+        for key in keys:
+            store["hashes"].pop(key, None)
+            if key.endswith(".pending"):
+                store["list"].clear()
+
     client.hincrby = AsyncMock(side_effect=hincrby)
+    client.delete = AsyncMock(side_effect=delete)
     client.hset = AsyncMock(side_effect=hset)
     client.hgetall = AsyncMock(side_effect=hgetall)
     client.hget = AsyncMock(side_effect=hget)
@@ -149,6 +156,35 @@ async def test_exists_false_before_seed_true_after(job):
     assert await job.exists() is False
     await job.seed(["a"], total=1, range_repr="r")
     assert await job.exists() is True
+
+
+@pytest.mark.asyncio
+async def test_is_cancelled_false_by_default(job):
+    await job.seed(["a"], total=1, range_repr="r")
+    assert await job.is_cancelled() is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_marks_job_and_drops_pending_and_configs(job):
+    await job.seed(["a", "b"], total=2, range_repr="r")
+    await job.put_individual_config("a", '{"x": 1}')
+    await job.cancel()
+    assert await job.is_cancelled() is True
+    # The meta hash survives so in-flight steps still see the flag ...
+    assert await job.exists() is True
+    # ... but nothing new can dispatch: pending queue and configs are gone.
+    assert await job.next_individual() is None
+    assert await job.get_individual_config("a") is None
+
+
+@pytest.mark.asyncio
+async def test_clear_removes_cancelled_flag(job):
+    # restart=true recovers a cancelled job: clear() wipes the flag along with
+    # the rest of the meta hash.
+    await job.seed(["a"], total=1, range_repr="r")
+    await job.cancel()
+    await job.clear()
+    assert await job.is_cancelled() is False
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from dateutil.parser import parse as parse_date
-from pydantic import Field, SecretStr, validator
+from pydantic import Field, SecretStr, root_validator, validator
 
 from app.actions import AuthActionConfiguration, ExecutableActionMixin, PullActionConfiguration
 from app.actions.client import Individual
@@ -69,9 +69,23 @@ class BackfillConfig(GenericActionConfiguration, ExecutableActionMixin):
                     "beginning. Use to recover a stuck backfill. Only use on a stuck job: "
                     "clearing a healthy in-flight job can double-dispatch its remaining work.",
     )
-    ui_global_options = GlobalUISchemaOptions(
-        order=["study_id", "individual_ids", "start", "backfill_max_concurrency", "restart"],
+    cancel: bool = Field(
+        False,
+        title="Cancel",
+        description="Stop the active job for these parameters: nothing new is dispatched and "
+                    "in-flight individuals stop at their next step. Submit with the SAME Study "
+                    "ID, Individual IDs and Start as the running job. Data already sent is "
+                    "kept; re-running the same backfill resumes where cancel stopped it.",
     )
+    ui_global_options = GlobalUISchemaOptions(
+        order=["study_id", "individual_ids", "start", "backfill_max_concurrency", "restart", "cancel"],
+    )
+
+    @root_validator
+    def _cancel_xor_restart(cls, values):
+        if values.get("cancel") and values.get("restart"):
+            raise ValueError("cancel and restart are mutually exclusive — pick one")
+        return values
 
     @validator("start")
     def _validate_start(cls, value):
