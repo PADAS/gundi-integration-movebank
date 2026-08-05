@@ -90,6 +90,20 @@ class BackfillJob:
         await self.db.hset(self._meta, mapping={"cancelled": 1})
         await self.db.delete(self._pending, f"{self._meta}.configs")
 
+    async def retire_cancelled(self, *, ttl_seconds: int) -> None:
+        """Retire a cancelled job whose in-flight work has drained: drop the
+        working state but leave the meta hash — carrying `cancelled=1` — as a
+        TTL'd tombstone.
+
+        The tombstone is what stops a late or duplicate PubSub delivery (the
+        commands topic is at-least-once, and main.py always acks) from resuming
+        a cancelled backfill: without it `is_cancelled()` would read a missing
+        key as False and the step would fetch from its retained watermark and
+        cascade onward. Bounded by the TTL so it can't leak, and dropped up
+        front by an intentional re-run or restart."""
+        await self.db.delete(self._pending, f"{self._meta}.configs")
+        await self.db.expire(self._meta, ttl_seconds)
+
     async def is_cancelled(self) -> bool:
         value = await self.db.hget(self._meta, "cancelled")
         if isinstance(value, bytes):

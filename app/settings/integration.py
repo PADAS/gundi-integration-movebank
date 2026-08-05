@@ -25,3 +25,10 @@ MIN_BACKFILL_WINDOW_SECONDS = env.int("MIN_BACKFILL_WINDOW_SECONDS", 300)
 # Safety factor when proportionally shrinking the window on overflow, so the
 # resized window aims comfortably below the cap rather than exactly at it.
 BACKFILL_WINDOW_SHRINK_SAFETY = env.float("BACKFILL_WINDOW_SHRINK_SAFETY", 0.8)
+# How long a cancelled backfill job's tombstone lives after the job has drained.
+# PubSub is at-least-once, so a duplicate delivery of an already-processed step
+# can arrive after the job's working state is gone; the tombstone is what makes
+# that late step short-circuit instead of resuming a cancelled backfill. Keep it
+# comfortably above the commands subscription's message-retention window. It is
+# one small key per cancelled job, and an intentional re-run drops it up front.
+CANCELLED_JOB_TOMBSTONE_SECONDS = env.int("CANCELLED_JOB_TOMBSTONE_SECONDS", 86400)

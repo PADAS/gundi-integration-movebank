@@ -464,17 +464,19 @@ async def action_backfill(integration, action_config: BackfillConfig):
             logger.info(f"Backfill {job_id}: cancel requested but no active job")
             return {"job_id": job_id, "cancelled": False, "active": False}
         snap = await job.snapshot()
+        await job.cancel()
         if snap["in_flight"] > 0:
-            await job.cancel()
             logger.warning(
                 f"Backfill {job_id}: cancelled — dropped {snap['pending_remaining']} pending "
                 f"individuals; {snap['in_flight']} in flight will stop at their next step"
             )
         else:
-            # Nothing running to observe the flag and drain the job, so a lone
-            # cancelled meta hash would just leak — remove the job outright.
-            await job.clear()
-            logger.warning(f"Backfill {job_id}: cancelled idle job — cleared all job state")
+            # Nothing in flight to observe the flag and retire the job, so do it
+            # here. Still a TTL'd tombstone rather than an outright delete: a
+            # duplicate delivery of an already-finalized step can arrive after
+            # in_flight has hit 0, and must not restart the cascade.
+            await job.retire_cancelled(ttl_seconds=settings.CANCELLED_JOB_TOMBSTONE_SECONDS)
+            logger.warning(f"Backfill {job_id}: cancelled idle job — retired with a tombstone")
         return {"job_id": job_id, "cancelled": True,
                 "pending_cleared": snap["pending_remaining"], "in_flight": snap["in_flight"]}
 
@@ -512,7 +514,22 @@ async def action_backfill(integration, action_config: BackfillConfig):
     # flight or already dispatched — double-dispatching them. Bail out early.
     if await job.exists():
         snap = await job.snapshot()
-        if snap["in_flight"] == 0 and snap["pending_remaining"] > 0:
+        if await job.is_cancelled():
+            # A cancelled job (possibly just its TTL'd tombstone) occupies this
+            # job_id. While its in-flight steps are still unwinding, re-seeding
+            # would double-dispatch exactly those individuals — refuse.
+            if snap["in_flight"] > 0:
+                logger.info(
+                    f"Backfill {job_id}: cancelled job still draining "
+                    f"({snap['in_flight']} in flight); not re-seeding"
+                )
+                return {"job_id": job_id, "cancelled_draining": True, "in_flight": snap["in_flight"]}
+            # Fully drained: this run is an intentional re-start of the same
+            # backfill, so drop the tombstone and seed fresh below. Retained
+            # watermarks make each individual resume where cancel stopped it.
+            await job.clear()
+            logger.info(f"Backfill {job_id}: prior run was cancelled and has drained; seeding fresh")
+        elif snap["in_flight"] == 0 and snap["pending_remaining"] > 0:
             # A prior invocation seeded the job (meta + pending) but crashed
             # before/while dispatching — nothing is in flight yet work is still
             # queued. There's no PubSub redelivery to restart it, so a re-run
@@ -532,8 +549,9 @@ async def action_backfill(integration, action_config: BackfillConfig):
                 await _dispatch_backfill_individual(integration_id, job, next_id)
                 dispatched += 1
             return {"job_id": job_id, "resumed": True, "dispatched": dispatched}
-        logger.info(f"Backfill {job_id}: job already active, skipping re-seed")
-        return {"job_id": job_id, "already_active": True}
+        else:
+            logger.info(f"Backfill {job_id}: job already active, skipping re-seed")
+            return {"job_id": job_id, "already_active": True}
 
     # Resolve each individual's backfill end from its steady-state coverage
     # floor. Backfill fills [start, end); the pull owns [end, +inf).
@@ -790,11 +808,14 @@ async def action_backfill_events_for_individual(integration, action_config: Back
             )
         remaining = await job.decr_in_flight()
         if remaining == 0:
-            # Last in-flight unit: nothing else will ever touch this job's keys
-            # (pending/configs were dropped at cancel time), so remove them.
-            await job.clear()
+            # Last in-flight unit: drop the working state, but keep the cancelled
+            # flag as a TTL'd tombstone. A duplicate delivery of an
+            # already-processed step can still arrive (at-least-once), and
+            # without the flag it would read "not cancelled" and resume the
+            # backfill from this individual's retained watermark.
+            await job.retire_cancelled(ttl_seconds=settings.CANCELLED_JOB_TOMBSTONE_SECONDS)
             logger.info(f"Backfill {log_reference}: job cancelled; last in-flight individual "
-                        "stopped — job state cleared")
+                        "stopped — job retired with a tombstone")
         else:
             logger.info(f"Backfill {log_reference}: job cancelled; stopping "
                         f"({remaining} still in flight)")

@@ -1,74 +1,11 @@
-from unittest.mock import AsyncMock, MagicMock
-
 import pytest
 
 from app.actions.backfill_queue import BackfillJob
 
 
 @pytest.fixture
-def fake_redis():
-    # Minimal in-memory stand-in for the subset of redis.asyncio used here.
-    # Hashes are keyed by their Redis key so distinct hashes (meta vs. the
-    # per-individual configs hash) don't collide on field names.
-    store = {"hashes": {}, "list": []}
-
-    client = MagicMock()
-
-    async def hincrby(key, field, n):
-        h = store["hashes"].setdefault(key, {})
-        h[field] = int(h.get(field, 0)) + n
-        return h[field]
-
-    async def hset(key, mapping=None, **kw):
-        h = store["hashes"].setdefault(key, {})
-        h.update(mapping or kw)
-
-    async def hgetall(key):
-        return {k: str(v) for k, v in store["hashes"].get(key, {}).items()}
-
-    async def hget(key, field):
-        return store["hashes"].get(key, {}).get(field)
-
-    async def hdel(key, *fields):
-        h = store["hashes"].get(key, {})
-        for f in fields:
-            h.pop(f, None)
-
-    async def exists(key):
-        return 1 if store["hashes"].get(key) else 0
-
-    async def rpush(key, *vals):
-        store["list"].extend(vals)
-        return len(store["list"])
-
-    async def lpop(key):
-        return store["list"].pop(0) if store["list"] else None
-
-    async def llen(key):
-        return len(store["list"])
-
-    async def delete(*keys):
-        for key in keys:
-            store["hashes"].pop(key, None)
-            if key.endswith(".pending"):
-                store["list"].clear()
-
-    client.hincrby = AsyncMock(side_effect=hincrby)
-    client.delete = AsyncMock(side_effect=delete)
-    client.hset = AsyncMock(side_effect=hset)
-    client.hgetall = AsyncMock(side_effect=hgetall)
-    client.hget = AsyncMock(side_effect=hget)
-    client.hdel = AsyncMock(side_effect=hdel)
-    client.exists = AsyncMock(side_effect=exists)
-    client.rpush = AsyncMock(side_effect=rpush)
-    client.lpop = AsyncMock(side_effect=lpop)
-    client.llen = AsyncMock(side_effect=llen)
-    return client
-
-
-@pytest.fixture
-def job(mocker, fake_redis):
-    mocker.patch("app.actions.backfill_queue._client", return_value=fake_redis)
+def job(mocker, fake_backfill_redis):
+    mocker.patch("app.actions.backfill_queue._client", return_value=fake_backfill_redis)
     return BackfillJob("int-1", "job-1")
 
 
@@ -196,3 +133,32 @@ async def test_requeue_returns_individual_to_pending(job):
     assert await job.next_individual() == "b"
     assert await job.next_individual() == "a"
     assert await job.next_individual() is None
+
+
+@pytest.mark.asyncio
+async def test_retire_cancelled_keeps_flag_and_expires_the_meta_hash(job, fake_backfill_redis):
+    # The last in-flight step of a cancelled job retires it: working state goes
+    # away, but the cancelled flag SURVIVES so a late/duplicate PubSub delivery
+    # for the same job still short-circuits instead of resuming the backfill.
+    await job.seed(["a", "b"], total=2, range_repr="r")
+    await job.put_individual_config("a", '{"x": 1}')
+    await job.cancel()
+
+    await job.retire_cancelled(ttl_seconds=3600)
+
+    assert await job.is_cancelled() is True
+    assert await job.next_individual() is None
+    assert await job.get_individual_config("a") is None
+    # The tombstone is bounded — it expires rather than leaking forever.
+    assert fake_backfill_redis.store["ttls"][job._meta] == 3600
+
+
+@pytest.mark.asyncio
+async def test_retired_tombstone_stops_reporting_cancelled_once_expired(job, fake_backfill_redis):
+    await job.seed(["a"], total=1, range_repr="r")
+    await job.cancel()
+    await job.retire_cancelled(ttl_seconds=3600)
+    # Simulate Redis expiring the tombstone: the job is simply gone again.
+    fake_backfill_redis.store["hashes"].pop(job._meta)
+    assert await job.is_cancelled() is False
+    assert await job.exists() is False
