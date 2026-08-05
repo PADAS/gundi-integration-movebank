@@ -448,7 +448,9 @@ async def action_backfill(integration, action_config: BackfillConfig):
     # same parameters targets it. Deliberately NOT derived from the fetched
     # study membership — that can drift while a whole-study job runs, which
     # would hash a cancel to a different id than the job it's aimed at.
-    ids_repr = sorted(action_config.individual_ids) if action_config.individual_ids else "all"
+    # individual_ids arrives deduped and sorted (BackfillConfig canonicalises it),
+    # so equivalent spellings of the same request hash to the same job.
+    ids_repr = action_config.individual_ids or "all"
     job_seed = f"{action_config.study_id}:{ids_repr}:{action_config.start}"
     job_id = "job-" + hashlib.sha256(job_seed.encode()).hexdigest()[:12]
     job = BackfillJob(integration_id, job_id)

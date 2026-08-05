@@ -86,7 +86,8 @@ class BackfillJob:
         """Mark the job cancelled and drop its pending queue + configs so
         nothing new can dispatch. The meta hash (with the flag) survives so
         in-flight steps observe it at their next trigger and unwind; the last
-        one to drain clears the job (see action_backfill_events_for_individual)."""
+        one to drain calls retire_cancelled(), which keeps the flag as a TTL'd
+        tombstone (see action_backfill_events_for_individual)."""
         await self.db.hset(self._meta, mapping={"cancelled": 1})
         await self.db.delete(self._pending, f"{self._meta}.configs")
 

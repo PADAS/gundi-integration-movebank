@@ -2516,3 +2516,39 @@ async def test_backfill_reseeds_fresh_after_cancelled_job_fully_drained(
     mock_seed.assert_awaited_once()            # fresh seed, not already_active
     assert result.get("already_active") is None
     assert result["individuals"] == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_cancel_targets_job_despite_duplicate_individual_ids(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    # A pasted list with a duplicate executes for the same effective individuals,
+    # so it must hash to the same job — otherwise a cancel typed without the
+    # duplicate reports "no active job" while the job keeps running.
+    rows = [{**INDIVIDUAL_ROW, "id": "111"}, {**INDIVIDUAL_ROW, "id": "222"}]
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=rows)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    started = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", individual_ids=["111", "111"]),
+    )
+
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_cancelled", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 0, "observations_sent": 0,
+                                         "in_flight": 1, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.cancel", AsyncMock())
+
+    cancelled = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", individual_ids=["111"], cancel=True),
+    )
+
+    assert cancelled["cancelled"] is True
+    assert cancelled["job_id"] == started["job_id"]

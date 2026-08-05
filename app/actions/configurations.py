@@ -81,6 +81,16 @@ class BackfillConfig(GenericActionConfiguration, ExecutableActionMixin):
         order=["study_id", "individual_ids", "start", "backfill_max_concurrency", "restart", "cancel"],
     )
 
+    @validator("individual_ids")
+    def _canonical_individual_ids(cls, value):
+        # Canonical form: deduped and sorted. The job_id is hashed from these,
+        # and execution filters with set(individual_ids) — so two spellings that
+        # run identically (e.g. a pasted list with a repeat) must hash
+        # identically, or a later cancel/restart won't target the running job.
+        if not value:
+            return value
+        return sorted(set(value))
+
     @root_validator
     def _cancel_xor_restart(cls, values):
         if values.get("cancel") and values.get("restart"):
