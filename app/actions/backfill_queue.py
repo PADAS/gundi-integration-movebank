@@ -82,6 +82,35 @@ class BackfillJob:
         double-clicked command hashing to the same job_id."""
         return bool(await self.db.exists(self._meta))
 
+    async def cancel(self) -> None:
+        """Mark the job cancelled and drop its pending queue + configs so
+        nothing new can dispatch. The meta hash (with the flag) survives so
+        in-flight steps observe it at their next trigger and unwind; the last
+        one to drain calls retire_cancelled(), which keeps the flag as a TTL'd
+        tombstone (see action_backfill_events_for_individual)."""
+        await self.db.hset(self._meta, mapping={"cancelled": 1})
+        await self.db.delete(self._pending, f"{self._meta}.configs")
+
+    async def retire_cancelled(self, *, ttl_seconds: int) -> None:
+        """Retire a cancelled job whose in-flight work has drained: drop the
+        working state but leave the meta hash — carrying `cancelled=1` — as a
+        TTL'd tombstone.
+
+        The tombstone is what stops a late or duplicate PubSub delivery (the
+        commands topic is at-least-once, and main.py always acks) from resuming
+        a cancelled backfill: without it `is_cancelled()` would read a missing
+        key as False and the step would fetch from its retained watermark and
+        cascade onward. Bounded by the TTL so it can't leak, and dropped up
+        front by an intentional re-run or restart."""
+        await self.db.delete(self._pending, f"{self._meta}.configs")
+        await self.db.expire(self._meta, ttl_seconds)
+
+    async def is_cancelled(self) -> bool:
+        value = await self.db.hget(self._meta, "cancelled")
+        if isinstance(value, bytes):
+            value = value.decode()
+        return value in ("1", 1)
+
     async def clear(self) -> None:
         """Delete every Redis key for this job (meta hash, pending queue, and the
         per-individual configs hash). Used by a restart to wipe a stuck or

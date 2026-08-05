@@ -83,3 +83,74 @@ INDIVIDUAL_ROW = {
     "sensor_type_ids": "gps",
     "taxon_detail": "",
 }
+
+
+@pytest.fixture
+def fake_backfill_redis():
+    """Minimal in-memory stand-in for the subset of redis.asyncio that
+    BackfillJob uses. Hashes are keyed by their Redis key so distinct hashes
+    (meta vs. the per-individual configs hash) don't collide on field names.
+    Shared by the queue unit tests and the handler tests that need real
+    key-level semantics (e.g. whether a flag survives a cleanup)."""
+    store = {"hashes": {}, "list": [], "ttls": {}}
+
+    client = MagicMock()
+
+    async def hincrby(key, field, n):
+        h = store["hashes"].setdefault(key, {})
+        h[field] = int(h.get(field, 0)) + n
+        return h[field]
+
+    async def hset(key, mapping=None, **kw):
+        h = store["hashes"].setdefault(key, {})
+        h.update(mapping or kw)
+
+    async def hgetall(key):
+        return {k: str(v) for k, v in store["hashes"].get(key, {}).items()}
+
+    async def hget(key, field):
+        return store["hashes"].get(key, {}).get(field)
+
+    async def hdel(key, *fields):
+        h = store["hashes"].get(key, {})
+        for f in fields:
+            h.pop(f, None)
+
+    async def exists(key):
+        return 1 if store["hashes"].get(key) else 0
+
+    async def rpush(key, *vals):
+        store["list"].extend(vals)
+        return len(store["list"])
+
+    async def lpop(key):
+        return store["list"].pop(0) if store["list"] else None
+
+    async def llen(key):
+        return len(store["list"])
+
+    async def delete(*keys):
+        for key in keys:
+            store["hashes"].pop(key, None)
+            store["ttls"].pop(key, None)
+            if key.endswith(".pending"):
+                store["list"].clear()
+
+    async def expire(key, seconds):
+        store["ttls"][key] = seconds
+        return 1
+
+    client.hincrby = AsyncMock(side_effect=hincrby)
+    client.hset = AsyncMock(side_effect=hset)
+    client.hgetall = AsyncMock(side_effect=hgetall)
+    client.hget = AsyncMock(side_effect=hget)
+    client.hdel = AsyncMock(side_effect=hdel)
+    client.exists = AsyncMock(side_effect=exists)
+    client.rpush = AsyncMock(side_effect=rpush)
+    client.lpop = AsyncMock(side_effect=lpop)
+    client.llen = AsyncMock(side_effect=llen)
+    client.delete = AsyncMock(side_effect=delete)
+    client.expire = AsyncMock(side_effect=expire)
+    # Expose the backing store so tests can assert TTLs and simulate expiry.
+    client.store = store
+    return client

@@ -99,3 +99,18 @@ def test_backfill_individual_config_is_internal_and_roundtrips():
     restored = BackfillEventsForIndividualConfig.parse_obj(cfg.dict())
     assert restored.individual.id == "111"
     assert restored.job_id == "job-1"
+
+
+def test_backfill_config_rejects_cancel_and_restart_together():
+    from app.actions.configurations import BackfillConfig
+    import pydantic
+    with pytest.raises(pydantic.ValidationError):
+        BackfillConfig(study_id="12345", start="all", cancel=True, restart=True)
+
+
+def test_backfill_config_normalizes_individual_ids():
+    from app.actions.configurations import BackfillConfig
+    # Execution dedups these via set(), so the canonical form must too — the
+    # job_id is hashed from them, and cancel/restart have to reproduce it.
+    config = BackfillConfig(study_id="12345", start="all", individual_ids=["222", "111", "222"])
+    assert config.individual_ids == ["111", "222"]

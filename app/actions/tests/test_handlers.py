@@ -81,6 +81,17 @@ def _make_individual(**overrides):
     return Individual.parse_obj({**INDIVIDUAL_ROW, **overrides})
 
 
+@pytest.fixture(autouse=True)
+def job_not_cancelled(mocker, request):
+    """The per-individual step checks the job's cancelled flag in Redis at
+    entry; stub it False by default so handler tests don't need a live Redis.
+    Cancellation tests re-patch it explicitly, and tests that request
+    fake_backfill_redis drive the real BackfillJob against the in-memory fake."""
+    if "fake_backfill_redis" in request.fixturenames:
+        return
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_cancelled", AsyncMock(return_value=False))
+
+
 @pytest.fixture
 def mock_state_store(mocker):
     """In-memory stand-in for the module-level state_manager in handlers."""
@@ -2208,3 +2219,336 @@ async def test_merge_into_pull_cursor_skips_write_when_unchanged(mocker, integra
         coverage_start=end, lower_only=True, create_if_missing=False,
     )
     assert set_state.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_cancel_flags_active_job_and_stops_dispatch(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 5, "completed": 1, "observations_sent": 10,
+                                         "in_flight": 2, "pending_remaining": 2, "range": "r"}))
+    mock_cancel = mocker.patch("app.actions.backfill_queue.BackfillJob.cancel", AsyncMock())
+    mock_clear = mocker.patch("app.actions.backfill_queue.BackfillJob.clear", AsyncMock())
+    mock_seed = mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", cancel=True),
+    )
+
+    assert result["cancelled"] is True
+    assert result["in_flight"] == 2
+    assert result["pending_cleared"] == 2
+    mock_cancel.assert_awaited_once()
+    # In-flight steps observe the flag and drain/clear the job themselves.
+    assert not mock_clear.called
+    assert not mock_seed.called
+    assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_cancel_idle_job_retires_it_with_a_tombstone(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    # Nothing in flight -> no step will ever observe the flag and retire the
+    # job, so cancel retires it here. Still a TTL'd tombstone rather than an
+    # outright delete: a duplicate delivery of an already-finalized step can
+    # arrive after in_flight hit 0 and must not restart the cascade.
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 5, "completed": 2, "observations_sent": 10,
+                                         "in_flight": 0, "pending_remaining": 3, "range": "r"}))
+    mock_cancel = mocker.patch("app.actions.backfill_queue.BackfillJob.cancel", AsyncMock())
+    mock_retire = mocker.patch("app.actions.backfill_queue.BackfillJob.retire_cancelled", AsyncMock())
+    mock_clear = mocker.patch("app.actions.backfill_queue.BackfillJob.clear", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", cancel=True),
+    )
+
+    assert result["cancelled"] is True
+    mock_cancel.assert_awaited_once()
+    mock_retire.assert_awaited_once()
+    assert not mock_clear.called       # the flag must survive, so never a bare delete
+    assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_cancel_without_active_job_reports_inactive(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    mock_cancel = mocker.patch("app.actions.backfill_queue.BackfillJob.cancel", AsyncMock())
+    mock_clear = mocker.patch("app.actions.backfill_queue.BackfillJob.clear", AsyncMock())
+    mock_seed = mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", cancel=True),
+    )
+
+    assert result["cancelled"] is False
+    assert not mock_cancel.called
+    assert not mock_clear.called
+    assert not mock_seed.called
+    assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_cancelled_job_stops_and_keeps_partial_coverage(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 10, tzinfo=timezone.utc)
+    iid = str(integration.id)
+    # The reverse descent reached 2024-01-04: [01-04 .. 01-10) already sent.
+    mock_state_store[(iid, "backfill_watermark", "job-1.111")] = {
+        "individual_id": "111", "study_id": "12345", "local_identifier": "tag-1",
+        "sensor_states": {"653": {"latest_timestamp": "2024-01-09T00:00:00+00:00", "highest_event_id": 50}},
+        "scan_from": "2024-01-04T00:00:00+00:00",
+    }
+    # Existing pull cursor: coverage floor still at the job's end boundary.
+    mock_state_store[(iid, "pull_events_for_individual", "111")] = {
+        "individual_id": "111", "study_id": "12345",
+        "sensor_states": {"653": {"latest_timestamp": "2024-01-08T00:00:00+00:00", "highest_event_id": 40}},
+        "coverage_start": "2024-01-10T00:00:00+00:00",
+    }
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_cancelled", AsyncMock(return_value=True))
+    mock_decr = mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=1))
+    mock_clear = mocker.patch("app.actions.backfill_queue.BackfillJob.clear", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    fetch = AsyncMock()
+    mock_movebank_client.get_individual_events_by_time = fetch
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "cancelled"
+    mock_decr.assert_awaited_once()
+    assert not fetch.called                # no Movebank traffic
+    assert not mock_trigger.called         # no re-trigger, no dispatch-next
+    assert not mock_clear.called           # not the last in-flight unit
+    cursor = IndividualState.parse_obj(mock_state_store[(iid, "pull_events_for_individual", "111")])
+    # Coverage floor lowered to the reached descent position, not to `start`.
+    assert cursor.coverage_start == datetime(2024, 1, 4, tzinfo=timezone.utc)
+    # Sent windows' maxima carried forward so the pull's settling re-read dedups the seam.
+    assert cursor.get_sensor_state(653).highest_event_id == 50
+    # Watermark kept so a re-run of the same job resumes this individual.
+    assert (iid, "backfill_watermark", "job-1.111") in mock_state_store
+
+
+@pytest.mark.asyncio
+async def test_backfill_individual_cancel_retires_job_when_last_in_flight(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 10, tzinfo=timezone.utc)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_cancelled", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mock_retire = mocker.patch("app.actions.backfill_queue.BackfillJob.retire_cancelled", AsyncMock())
+    mock_clear = mocker.patch("app.actions.backfill_queue.BackfillJob.clear", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+        ),
+    )
+
+    assert result["status"] == "cancelled"
+    # The last in-flight unit drops the working state but KEEPS the cancelled
+    # flag, so a late duplicate delivery still short-circuits.
+    mock_retire.assert_awaited_once()
+    assert not mock_clear.called
+    assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_cancel_job_id_stable_across_study_membership_drift(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    # Seed a whole-study job while the study has 2 individuals.
+    rows = [{**INDIVIDUAL_ROW, "id": "1"}, {**INDIVIDUAL_ROW, "id": "2"}]
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=rows)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    started = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    # Study membership changed since the job started. Cancel must hash to the
+    # SAME job from the user-supplied parameters alone — it must not depend on
+    # a live Movebank fetch (which could also be down mid-incident).
+    mock_movebank_client.get_individuals_by_study = AsyncMock(
+        side_effect=AssertionError("cancel must not fetch study individuals")
+    )
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 2, "completed": 0, "observations_sent": 0,
+                                         "in_flight": 1, "pending_remaining": 1, "range": "r"}))
+    mock_cancel = mocker.patch("app.actions.backfill_queue.BackfillJob.cancel", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", cancel=True),
+    )
+
+    assert result["cancelled"] is True
+    assert result["job_id"] == started["job_id"]
+    mock_cancel.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_delivery_after_cancelled_job_drains_still_stops(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store,
+        fake_backfill_redis,
+):
+    # PubSub is at-least-once and main.py always acks, so a duplicate delivery
+    # of an already-processed step can arrive after the cancelled job drained.
+    # It must NOT resume the backfill (the watermark is deliberately kept so an
+    # intentional re-run can resume, which is exactly what makes this dangerous).
+    from app.actions.backfill_queue import BackfillJob
+    mocker.patch("app.actions.backfill_queue._client", return_value=fake_backfill_redis)
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 10, tzinfo=timezone.utc)
+    iid = str(integration.id)
+    mock_state_store[(iid, "backfill_watermark", "job-1.111")] = {
+        "individual_id": "111", "study_id": "12345", "local_identifier": "tag-1",
+        "sensor_states": {"653": {"latest_timestamp": "2024-01-09T00:00:00+00:00", "highest_event_id": 50}},
+        "scan_from": "2024-01-04T00:00:00+00:00",
+    }
+    job = BackfillJob(iid, "job-1")
+    await job.seed(["111"], total=1, range_repr="r")
+    await job.incr_in_flight()
+    await job.cancel()
+
+    fetch = AsyncMock()
+    mock_movebank_client.get_individual_events_by_time = fetch
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    cfg = BackfillEventsForIndividualConfig(
+        study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", start=start, end=end,
+    )
+
+    first = await action_backfill_events_for_individual(integration=integration, action_config=cfg)
+    assert first["status"] == "cancelled"
+
+    # Duplicate delivery of the SAME message, after the job has fully drained.
+    second = await action_backfill_events_for_individual(integration=integration, action_config=cfg)
+
+    assert second["status"] == "cancelled"
+    assert not fetch.called          # no Movebank traffic
+    assert not mock_send.called      # no observations resent
+    assert not mock_trigger.called   # no cascade restarted
+
+
+@pytest.mark.asyncio
+async def test_backfill_refuses_to_reseed_while_cancelled_job_is_draining(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    # Re-running the same backfill while in-flight steps are still unwinding
+    # would double-dispatch those individuals. Refuse until they've drained.
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_cancelled", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 2, "completed": 0, "observations_sent": 0,
+                                         "in_flight": 2, "pending_remaining": 0, "range": "r"}))
+    mock_seed = mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mock_clear = mocker.patch("app.actions.backfill_queue.BackfillJob.clear", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    assert result["cancelled_draining"] is True
+    assert result["in_flight"] == 2
+    assert not mock_seed.called
+    assert not mock_clear.called
+    assert not mock_trigger.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_reseeds_fresh_after_cancelled_job_fully_drained(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    # Tombstone left by a fully-drained cancelled job must not block an
+    # intentional re-run: clear it and seed fresh (watermarks make it resume).
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=[INDIVIDUAL_ROW])
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_cancelled", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 0, "completed": 0, "observations_sent": 0,
+                                         "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mock_clear = mocker.patch("app.actions.backfill_queue.BackfillJob.clear", AsyncMock())
+    mock_seed = mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all"),
+    )
+
+    mock_clear.assert_awaited_once()          # tombstone dropped
+    mock_seed.assert_awaited_once()            # fresh seed, not already_active
+    assert result.get("already_active") is None
+    assert result["individuals"] == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_cancel_targets_job_despite_duplicate_individual_ids(
+        mocker, integration, mock_auth_config, mock_movebank_client
+):
+    # A pasted list with a duplicate executes for the same effective individuals,
+    # so it must hash to the same job — otherwise a cancel typed without the
+    # duplicate reports "no active job" while the job keeps running.
+    rows = [{**INDIVIDUAL_ROW, "id": "111"}, {**INDIVIDUAL_ROW, "id": "222"}]
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=rows)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    started = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", individual_ids=["111", "111"]),
+    )
+
+    mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_cancelled", AsyncMock(return_value=False))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 0, "observations_sent": 0,
+                                         "in_flight": 1, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.cancel", AsyncMock())
+
+    cancelled = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", individual_ids=["111"], cancel=True),
+    )
+
+    assert cancelled["cancelled"] is True
+    assert cancelled["job_id"] == started["job_id"]
