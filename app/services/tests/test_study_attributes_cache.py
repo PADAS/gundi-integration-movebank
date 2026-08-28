@@ -93,3 +93,26 @@ async def test_get_fails_open_on_corrupt_payload(mock_redis):
 async def test_set_fails_open_on_redis_error(mock_redis):
     mock_redis.set = AsyncMock(side_effect=redis_asyncio.RedisError("down"))
     await set_cached_study_attributes("https://www.movebank.org", "1", 653, [])
+
+
+def test_cache_key_ignores_trailing_slashes_and_whitespace():
+    # A portal-configured base_url may carry a trailing slash or stray whitespace.
+    # Those must not split one study's entry across several keys.
+    canonical = cache_key("https://www.movebank.org", "1", 653)
+    assert cache_key("https://www.movebank.org/", "1", 653) == canonical
+    assert cache_key("https://www.movebank.org///", "1", 653) == canonical
+    assert cache_key("  https://www.movebank.org  ", "1", 653) == canonical
+
+
+@pytest.mark.asyncio
+async def test_get_rejects_a_non_list_payload(mock_redis):
+    # movebank-client iterates the result and calls item.get(...), so a dict or
+    # string would raise AttributeError mid-pull. Treat it as corruption.
+    mock_redis.get = AsyncMock(return_value=b'{"short_name": "gps_dop"}')
+    assert await get_cached_study_attributes("https://www.movebank.org", "1", 653) is None
+
+
+@pytest.mark.asyncio
+async def test_get_rejects_a_scalar_payload(mock_redis):
+    mock_redis.get = AsyncMock(return_value=b'"gps_dop"')
+    assert await get_cached_study_attributes("https://www.movebank.org", "1", 653) is None

@@ -26,10 +26,13 @@ def cache_key(base_url: str, study_id, sensor_type_id) -> str:
     integration: the list is a property of the study, so every integration
     reading that study — and every individual within it — shares one entry.
 
-    The base_url is hashed only to keep the key a fixed, punctuation-free length;
+    The base_url is normalised before hashing so a portal-configured trailing
+    slash or stray whitespace doesn't split one study's entry across several
+    keys. It is hashed only to keep the key a fixed, punctuation-free length;
     there is nothing secret about it.
     """
-    digest = hashlib.sha256((base_url or "").encode("utf-8")).hexdigest()[:16]
+    normalized_url = (base_url or "").strip().rstrip("/")
+    digest = hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()[:16]
     return f"movebank:study_attributes:{digest}:{study_id}:{sensor_type_id}"
 
 
@@ -50,10 +53,19 @@ async def get_cached_study_attributes(base_url: str, study_id, sensor_type_id):
     if raw is None:
         return None
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
     except (ValueError, TypeError) as exc:
         logger.warning(f"Discarding corrupt study attributes cache entry {key}: {exc}")
         return None
+    if not isinstance(data, list):
+        # Callers iterate the result and call item.get(...), so anything but a
+        # list would raise AttributeError mid-pull. Same class of corruption as
+        # unparseable JSON — discard it and fetch live.
+        logger.warning(
+            f"Discarding non-list study attributes cache entry {key}: got {type(data).__name__}"
+        )
+        return None
+    return data
 
 
 async def set_cached_study_attributes(base_url: str, study_id, sensor_type_id, attributes) -> None:
