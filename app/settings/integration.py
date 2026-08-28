@@ -4,6 +4,13 @@ from app.settings.base import env
 # Movebank connection budget, shared across all integrations using the same
 # Movebank username (Movebank documents ~31 simultaneous connections per user).
 MOVEBANK_MAX_CONNECTIONS = env.int("MOVEBANK_MAX_CONNECTIONS", 25)
+# How long a study's attribute list is cached in Redis. This list is study
+# configuration (which fields the study advertises for a sensor type), so it
+# changes only when a study owner reconfigures. Caching it shared-per-study
+# removes the largest source of redundant Movebank traffic: without it every
+# individual re-fetches it on every tick, because movebank-client's own cache
+# lives on the client instance and each sub-action builds a fresh client.
+MOVEBANK_STUDY_ATTRIBUTES_TTL_SECONDS = env.int("MOVEBANK_STUDY_ATTRIBUTES_TTL_SECONDS", 21600)  # 6h
 # Accessory-measurements records can arrive at Movebank hours after their
 # timestamp; the accessory query re-reads this many hours so late arrivals are
 # caught (the event-id filter drops already-sent events, so no duplicates).
