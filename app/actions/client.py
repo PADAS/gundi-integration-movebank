@@ -10,6 +10,10 @@ from movebank_client import MovebankClient as _MovebankClient
 from movebank_client.errors import MBClientError, MBForbiddenError
 
 from app.services.errors import ConfigurationNotFound
+from app.services.study_attributes_cache import (
+    get_cached_study_attributes,
+    set_cached_study_attributes,
+)
 from app.services.utils import find_config_for_action
 
 logger = logging.getLogger(__name__)
@@ -19,12 +23,48 @@ DEFAULT_MOVEBANK_BASE_URL = "https://www.movebank.org"
 
 class MovebankClient(_MovebankClient):
     """Defaults base_url to the public Movebank server when the integration
-    record leaves it unset (None or empty string)."""
+    record leaves it unset (None or empty string), and backs the study-attribute
+    lookup with a shared Redis cache."""
 
     def __init__(self, **kwargs):
         if not kwargs.get("base_url"):
             kwargs["base_url"] = DEFAULT_MOVEBANK_BASE_URL
         super().__init__(**kwargs)
+
+    async def get_study_attributes(self, study_id: str = None, sensor_type_id: str = None) -> list:
+        """Three-layer lookup: this client instance, then Redis, then Movebank.
+
+        movebank-client caches study attributes on the client instance, which is
+        never reused here — `pull_events_for_individual` builds a fresh client
+        per individual, so every individual in a study re-fetched the same list
+        on every tick. That made study-attribute requests roughly half of all
+        Movebank traffic and was the main driver of the 429s. Redis moves the
+        cache out to a scope the whole fleet shares: one fetch per study per TTL,
+        across individuals, integrations, instances and ticks.
+        """
+        instance_key = (study_id, sensor_type_id)
+        if instance_key in self.study_attributes_cache:
+            return self.study_attributes_cache[instance_key]
+
+        cached = await get_cached_study_attributes(self.base_url, study_id, sensor_type_id)
+        if cached is not None:
+            # Warm the instance cache so a multi-window loop skips Redis too.
+            self.study_attributes_cache[instance_key] = cached
+            return cached
+
+        attributes = await super().get_study_attributes(
+            study_id=study_id, sensor_type_id=sensor_type_id
+        )
+        if attributes is not None:
+            # Only a real answer is cached. A failed fetch returns None, and
+            # caching that would pin the study to attributes='all' for the TTL.
+            # Populate both layers here rather than leaning on the base class's
+            # own instance-cache write, so this method's caching is self-contained.
+            self.study_attributes_cache[instance_key] = attributes
+            await set_cached_study_attributes(
+                self.base_url, study_id, sensor_type_id, attributes
+            )
+        return attributes
 
 
 def get_auth_config(integration):
