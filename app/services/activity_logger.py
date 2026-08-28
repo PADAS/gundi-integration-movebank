@@ -26,7 +26,7 @@ from gundi_core.events import (
     CustomWebhookLog,
 )
 from app import settings
-from app.services.errors import classify_error, format_error_message
+from app.services.errors import classify_error, format_error_message, RECOVERABLE_ERROR_TYPES
 
 
 logger = logging.getLogger(__name__)
@@ -148,14 +148,15 @@ def activity_logger(on_start=True, on_completion=True, on_error=True):
             try:
                 result = await func(*args, **kwargs)
             except Exception as e:
-                # Provider rate limiting is a recoverable condition owned by
-                # the action runner, which records it as a WARNING custom log
-                # (see execute_action). Publishing IntegrationActionFailed here
-                # too would put an ERROR next to that WARNING and mark the
+                # Provider rate limiting and transport failures reaching the
+                # provider are recoverable conditions owned by the action
+                # runner, which records them as WARNING custom logs (see
+                # execute_action). Publishing IntegrationActionFailed here too
+                # would put an ERROR next to that WARNING and mark the
                 # connection unhealthy — so re-raise and let the runner report.
                 classified = classify_error(e)
-                is_recoverable_rate_limit = classified is not None and classified.error_type == "rate_limit"
-                if on_error and not is_recoverable_rate_limit:
+                is_recoverable = classified is not None and classified.error_type in RECOVERABLE_ERROR_TYPES
+                if on_error and not is_recoverable:
                     await publish_event(
                         event=IntegrationActionFailed(
                             payload=ActionExecutionFailed(

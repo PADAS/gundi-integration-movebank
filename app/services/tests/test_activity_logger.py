@@ -106,6 +106,40 @@ async def test_activity_logger_decorator_skips_failed_event_on_rate_limit(
 
 
 @pytest.mark.asyncio
+async def test_activity_logger_decorator_skips_failed_event_on_connectivity_error(
+        mocker, mock_publish_event, integration_v2, pull_observations_config
+):
+    # Same contract as the rate-limit case above: a transport failure reaching
+    # Movebank is recorded as a recoverable WARNING by the action runner, so the
+    # decorator must not also publish an IntegrationActionFailed. Pull actions
+    # fan out one sub-action per individual, so one Movebank blip would
+    # otherwise ding connection health once per individual.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+
+    # Production shape: movebank-client exhausts its transport retries and the
+    # mapped httpx.ConnectTimeout escapes _call_api. It stringifies to empty
+    # text, which is exactly the case the runner's message has to survive.
+    unreachable = httpx.ConnectTimeout("")
+
+    @activity_logger()
+    async def action_pull_observations(integration, action_config):
+        raise unreachable
+
+    with pytest.raises(httpx.ConnectTimeout):
+        await action_pull_observations(
+            integration=integration_v2,
+            action_config=pull_observations_config
+        )
+
+    # Only the start event — the exception still propagates to the action
+    # runner, which owns the WARNING activity log for connectivity failures.
+    published = [call.kwargs.get("event") for call in mock_publish_event.call_args_list]
+    assert not any(isinstance(e, IntegrationActionFailed) for e in published)
+    assert mock_publish_event.call_count == 1
+    assert isinstance(published[0], IntegrationActionStarted)
+
+
+@pytest.mark.asyncio
 async def test_webhook_activity_logger(
         mocker, mock_publish_event, integration_v2_with_webhook_generic,
         mock_webhook_request_payload_for_dynamic_schema, mock_generic_webhook_config

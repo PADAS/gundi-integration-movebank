@@ -64,6 +64,14 @@ class IntegrationBadResponseError(IntegrationError):
     default_title = "Unexpected response from the provider"
 
 
+# Classifications that mean "expected, transient, and it will be retried" —
+# provider rate limiting, and transport failures reaching the provider at all.
+# The action runner records these as WARNING activity logs instead of
+# IntegrationActionFailed events, so a Movebank blip doesn't mark the
+# connection unhealthy. See _publish_recoverable_warning in action_runner.py.
+RECOVERABLE_ERROR_TYPES = frozenset({"rate_limit", "connectivity"})
+
+
 class ClassifiedError(NamedTuple):
     error_type: str
     title: str

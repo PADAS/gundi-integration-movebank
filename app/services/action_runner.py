@@ -20,7 +20,7 @@ from app.actions.core import PullActionConfiguration
 from .config_manager import IntegrationConfigurationManager
 from .state import IntegrationStateManager
 from .activity_logger import publish_event, log_action_activity
-from .errors import classify_error, format_classified_error, IntegrationError
+from .errors import classify_error, format_classified_error, IntegrationError, RECOVERABLE_ERROR_TYPES
 
 _portal = GundiClient()
 config_manager = IntegrationConfigurationManager()
@@ -191,6 +191,49 @@ async def _handle_recoverable_rate_limit(exc, integration_id, action_id, config_
         config_data=config_data,
     )
     return {"rate_limited": True, "recoverable": True, "action_id": action_id}
+
+
+async def _handle_recoverable_connectivity(exc, integration_id, action_id, config_data=None):
+    """Record a transport failure reaching the provider (connect/read timeout,
+    connection reset, DNS blip) as a WARNING (recoverable) rather than a hard
+    failure. See _publish_recoverable_warning.
+
+    By the time one of these surfaces here the Movebank client has already
+    exhausted its own transport retries, and the work resumes on the next
+    scheduled tick from the persisted cursor. Treating it as a hard failure is
+    actively misleading: pull actions fan out one sub-action per individual, so
+    a single Movebank blip would publish an IntegrationActionFailed per
+    individual and mark an otherwise-healthy connection unhealthy.
+    """
+    # Transport exceptions routinely stringify to empty text (httpx.ConnectTimeout("")),
+    # so the type name has to carry the message — otherwise the activity-feed
+    # entry says nothing about what went wrong.
+    detail = (str(exc).splitlines() or [""])[0]
+    detail = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+    message = (
+        f"Action '{action_id}' for integration '{integration_id}' could not reach the provider ({detail})"
+    )
+    await _publish_recoverable_warning(
+        exc, integration_id, action_id,
+        title=f"Action '{action_id}' could not reach the provider; recorded as a warning (recoverable).",
+        message=message,
+        reason="connectivity",
+        config_data=config_data,
+    )
+    return {"unreachable": True, "recoverable": True, "action_id": action_id}
+
+
+# One WARNING path per recoverable classification. The activity_logger
+# decorator reads RECOVERABLE_ERROR_TYPES to know which exceptions it must
+# leave to the runner rather than publishing IntegrationActionFailed for, so
+# the two must stay in lockstep. That invariant is enforced by
+# test_recoverable_error_types_and_handlers_stay_in_lockstep — deliberately a
+# test rather than an import-time raise, which would crash-loop the service on
+# boot over a misreported log level.
+_RECOVERABLE_HANDLERS = {
+    "rate_limit": _handle_recoverable_rate_limit,
+    "connectivity": _handle_recoverable_connectivity,
+}
 
 
 def _skip_quietly(integration_id, action_id, *, reason, message, log_level=logging.INFO):
@@ -369,13 +412,20 @@ async def execute_action(
             config_data={"configurations": [c.dict() for c in integration.configurations]},
         )
     except Exception as e:
-        # Provider rate limiting (e.g. movebank-client raises after exhausting
-        # its 429 retries) is a recoverable, expected condition — the action
-        # runs again on its next tick. Record it as a WARNING instead of an
-        # IntegrationActionFailed so it doesn't mark the connection unhealthy.
+        # Provider rate limiting (movebank-client raising after exhausting its
+        # 429 retries) and transport failures reaching the provider at all
+        # (connect/read timeouts, resets) are recoverable, expected conditions —
+        # the action runs again on its next tick. Record them as WARNINGs
+        # instead of IntegrationActionFailed so they don't mark the connection
+        # unhealthy.
+        # Scoped to automated runs. A manual run has no next tick — an operator
+        # clicked "Run now" and is waiting for an answer, so a WARNING plus an
+        # HTTP 200 would read as success. Same split the runner already applies
+        # to misconfigured pull actions via skippable_pull.
         classified = classify_error(e)
-        if classified is not None and classified.error_type == "rate_limit":
-            return await _handle_recoverable_rate_limit(
+        if classified is not None and classified.error_type in RECOVERABLE_ERROR_TYPES and not is_manual:
+            recoverable_handler = _RECOVERABLE_HANDLERS[classified.error_type]
+            return await recoverable_handler(
                 e, integration_id, action_id,
                 config_data={"configurations": [c.dict() for c in integration.configurations]},
             )
