@@ -14,8 +14,8 @@ from app import settings
 from app.conftest import MockSubActionConfiguration, MockPushActionConfiguration, async_return
 from app.main import app
 from app.services.action_scheduler import trigger_action
-from app.services.action_runner import execute_action, _handle_error
-from app.services.errors import IntegrationAuthError
+from app.services.action_runner import execute_action, _handle_error, _RECOVERABLE_HANDLERS
+from app.services.errors import IntegrationAuthError, RECOVERABLE_ERROR_TYPES
 
 api_client = TestClient(app)
 
@@ -659,9 +659,15 @@ async def test_execute_action_rate_limit_logs_warning_not_failure(
     handler, _, _ = mock_action_handlers["pull_observations"]
     handler.side_effect = rate_limited
 
+    # Explicitly an automated run — /execute defaults triggered_by to "manual",
+    # and the recoverable path is scoped to automated runs.
     response = api_client.post(
         "/v1/actions/execute/",
-        json={"integration_id": str(integration_v2.id), "action_id": "pull_observations"},
+        json={
+            "integration_id": str(integration_v2.id),
+            "action_id": "pull_observations",
+            "triggered_by": "auto",
+        },
     )
 
     # API contract: rate limiting is a recoverable outcome, returned as HTTP 200
@@ -680,6 +686,14 @@ async def test_execute_action_rate_limit_logs_warning_not_failure(
         (w.payload.data or {}).get("reason") == "rate_limit"
         for w in warnings
     )
+
+
+def test_recoverable_error_types_and_handlers_stay_in_lockstep():
+    # activity_logger reads RECOVERABLE_ERROR_TYPES to decide which exceptions
+    # to leave to the runner; the runner looks the same types up in
+    # _RECOVERABLE_HANDLERS. A type in the set with no handler would raise
+    # KeyError mid-dispatch and turn a recoverable blip into a 500.
+    assert set(_RECOVERABLE_HANDLERS) == set(RECOVERABLE_ERROR_TYPES)
 
 
 @pytest.mark.asyncio
@@ -704,9 +718,16 @@ async def test_execute_action_connectivity_error_logs_warning_not_failure(
     handler, _, _ = mock_action_handlers["pull_observations"]
     handler.side_effect = httpx.ConnectTimeout("")
 
+    # Explicitly an automated run: /execute defaults triggered_by to "manual",
+    # and manual runs deliberately keep the hard-failure path (see
+    # test_execute_action_connectivity_error_on_manual_run_is_a_hard_failure).
     response = api_client.post(
         "/v1/actions/execute/",
-        json={"integration_id": str(integration_v2.id), "action_id": "pull_observations"},
+        json={
+            "integration_id": str(integration_v2.id),
+            "action_id": "pull_observations",
+            "triggered_by": "auto",
+        },
     )
 
     # API contract: unreachable provider is a recoverable outcome, returned as
@@ -730,6 +751,63 @@ async def test_execute_action_connectivity_error_logs_warning_not_failure(
         "ConnectTimeout" in ((w.payload.data or {}).get("message") or "")
         for w in warnings
     )
+
+
+@pytest.mark.asyncio
+async def test_execute_action_connectivity_error_on_manual_run_is_a_hard_failure(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    # The recoverable-WARNING path exists because an automated run will simply
+    # happen again on its next tick. A manual run has no next tick — an operator
+    # clicked "Run now" and is waiting for an answer, so returning HTTP 200
+    # {"unreachable": true} would read as success. Manual runs keep the hard
+    # failure, consistent with how the runner already treats misconfigured pull
+    # actions (skippable_pull).
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    handler, _, _ = mock_action_handlers["pull_observations"]
+    handler.side_effect = httpx.ConnectTimeout("")
+
+    # No triggered_by: /execute defaults to "manual".
+    response = api_client.post(
+        "/v1/actions/execute/",
+        json={"integration_id": str(integration_v2.id), "action_id": "pull_observations"},
+    )
+
+    assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    error_details = response.json()["detail"]
+    assert error_details["error_type"] == "connectivity"
+    assert _published_events_of_type(mock_publish_event, IntegrationActionFailed)
+
+
+@pytest.mark.asyncio
+async def test_push_data_returns_non_2xx_on_recoverable_error(
+        mocker, mock_gundi_client_v2, mock_publish_event, mock_action_handlers, mock_config_manager,
+        pubsub_message_request_headers, run_push_action_pubsub_payload, mock_push_observations_handler,
+):
+    # Push data rides in the PubSub message itself — there is no cursor to
+    # resume from and no next tick that would re-fetch it. A 2xx acks the
+    # message and the payload is gone for good, so a recoverable outcome must
+    # still return non-2xx here to make PubSub redeliver.
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.actions.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mock_push_observations_handler.side_effect = httpx.ConnectTimeout("")
+
+    response = api_client.post(
+        "/push-data",
+        headers=pubsub_message_request_headers,
+        json=run_push_action_pubsub_payload,
+    )
+
+    assert response.status_code >= 400, "a recoverable outcome must not ack the push message"
 
 
 @pytest.mark.asyncio

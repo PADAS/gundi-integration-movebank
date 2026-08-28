@@ -226,17 +226,14 @@ async def _handle_recoverable_connectivity(exc, integration_id, action_id, confi
 # One WARNING path per recoverable classification. The activity_logger
 # decorator reads RECOVERABLE_ERROR_TYPES to know which exceptions it must
 # leave to the runner rather than publishing IntegrationActionFailed for, so
-# the two must stay in lockstep — the import-time check below fails loudly if
-# a classification is added to one and not the other.
+# the two must stay in lockstep. That invariant is enforced by
+# test_recoverable_error_types_and_handlers_stay_in_lockstep — deliberately a
+# test rather than an import-time raise, which would crash-loop the service on
+# boot over a misreported log level.
 _RECOVERABLE_HANDLERS = {
     "rate_limit": _handle_recoverable_rate_limit,
     "connectivity": _handle_recoverable_connectivity,
 }
-if set(_RECOVERABLE_HANDLERS) != set(RECOVERABLE_ERROR_TYPES):
-    raise RuntimeError(
-        "RECOVERABLE_ERROR_TYPES and _RECOVERABLE_HANDLERS are out of sync: "
-        f"{set(RECOVERABLE_ERROR_TYPES) ^ set(_RECOVERABLE_HANDLERS)}"
-    )
 
 
 def _skip_quietly(integration_id, action_id, *, reason, message, log_level=logging.INFO):
@@ -421,8 +418,12 @@ async def execute_action(
         # the action runs again on its next tick. Record them as WARNINGs
         # instead of IntegrationActionFailed so they don't mark the connection
         # unhealthy.
+        # Scoped to automated runs. A manual run has no next tick — an operator
+        # clicked "Run now" and is waiting for an answer, so a WARNING plus an
+        # HTTP 200 would read as success. Same split the runner already applies
+        # to misconfigured pull actions via skippable_pull.
         classified = classify_error(e)
-        if classified is not None and classified.error_type in RECOVERABLE_ERROR_TYPES:
+        if classified is not None and classified.error_type in RECOVERABLE_ERROR_TYPES and not is_manual:
             recoverable_handler = _RECOVERABLE_HANDLERS[classified.error_type]
             return await recoverable_handler(
                 e, integration_id, action_id,

@@ -142,11 +142,27 @@ async def push_data(
         return {}
     # Push data rides in the message itself, so execution errors must propagate
     # (non-2xx) for PubSub to redeliver — acking a failed run would drop data.
-    return await execute_action(
+    result = await execute_action(
         integration_id=destination_id,
         data=json_payload,
         metadata=attributes
     )
+    # The runner's recoverable outcomes (rate limit, provider unreachable,
+    # execution timeout) return a plain dict, which FastAPI would serialize as
+    # a 200 and ack the message. That is right for pull actions — they resume
+    # from a persisted cursor on the next tick — but here the payload exists
+    # only in this message, so acking it loses the data. Return a 503 instead,
+    # so PubSub redelivers with backoff.
+    if isinstance(result, dict) and result.get("recoverable") is True:
+        logger.warning(
+            f"Recoverable outcome on push for integration {destination_id}; "
+            f"returning 503 so PubSub redelivers: {result}"
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=jsonable_encoder(result),
+        )
+    return result
 
 app.include_router(
     actions.router, prefix="/v1/actions", tags=["actions"], responses={}
