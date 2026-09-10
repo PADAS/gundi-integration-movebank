@@ -1,13 +1,26 @@
 import json
+import logging
 import stamina
-import httpx
 import redis.asyncio as redis
 from app import settings
-from gundi_core.schemas.v2 import Integration
-from gundi_client_v2 import GundiClient
+from .activity_logger import ephemeral_run
+from .retry_policies import REDIS_RETRY
+
+logger = logging.getLogger(__name__)
 
 
-_portal = GundiClient()
+def _skip_on_ephemeral_run(op: str, integration_id: str, action_id: str) -> bool:
+    """Ephemeral runs get a fresh synthetic integration id and no TTL on state
+    keys, so any write would be a permanent orphan. Every mutating method
+    no-ops behind this, with a log line: a handler that writes then reads in
+    the same run sees {} and fails in a way that looks unrelated otherwise."""
+    if not ephemeral_run.get():
+        return False
+    logger.debug(
+        f"Skipping {op} for action '{action_id}' on ephemeral integration '{integration_id}': "
+        "state is not persisted on the ephemeral path."
+    )
+    return True
 
 
 class IntegrationStateManager:
@@ -19,14 +32,16 @@ class IntegrationStateManager:
         self.db_client = redis.Redis(host=host, port=port, db=db)
 
     async def get_state(self, integration_id: str, action_id: str, source_id: str = "no-source") -> dict:
-        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
+        async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
                 json_value = await self.db_client.get(f"integration_state.{integration_id}.{action_id}.{source_id}")
         value = json.loads(json_value) if json_value else {}
         return value
 
     async def set_state(self, integration_id: str, action_id: str, state: dict, source_id: str = "no-source", expire: int = None):
-        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
+        if _skip_on_ephemeral_run("set_state", integration_id, action_id):
+            return
+        async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
                 await self.db_client.set(
                     f"integration_state.{integration_id}.{action_id}.{source_id}",
@@ -42,9 +57,13 @@ class IntegrationStateManager:
         Returns True if the key was set by this call (i.e. the caller is the
         first within the TTL window), or False if it already existed. Useful
         for rate-limiting/throttling repeated events: the first caller in each
-        window gets True, the rest get False until the key expires.
+        window gets True, the rest get False until the key expires. On the
+        ephemeral path nothing is written and the answer is False, so a
+        throttling caller treats the window as already taken.
         """
-        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
+        if _skip_on_ephemeral_run("set_if_absent", integration_id, action_id):
+            return False
+        async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
                 was_set = await self.db_client.set(
                     f"integration_state.{integration_id}.{action_id}.{source_id}",
@@ -55,7 +74,9 @@ class IntegrationStateManager:
         return bool(was_set)
 
     async def delete_state(self, integration_id: str, action_id: str, source_id: str = "no-source"):
-        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
+        if _skip_on_ephemeral_run("delete_state", integration_id, action_id):
+            return
+        async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
                 await self.db_client.delete(
                     f"integration_state.{integration_id}.{action_id}.{source_id}"
@@ -63,64 +84,6 @@ class IntegrationStateManager:
 
     def __str__(self):
         return f"IntegrationStateManager(host={self.db_client.host}, port={self.db_client.port}, db={self.db_client.db})"
-
-    def __repr__(self):
-        return self.__str__()
-
-
-class IntegrationConfigurationManager:
-
-    def __init__(self, **kwargs):
-        host = kwargs.get("host", settings.REDIS_HOST)
-        port = kwargs.get("port", settings.REDIS_PORT)
-        db = kwargs.get("db", settings.REDIS_STATE_DB)
-        self.db_client = redis.Redis(host=host, port=port, db=db)
-
-    async def get_integration_config(self, integration_id: str) -> Integration:
-        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
-            with attempt:
-                json_value = await self.db_client.get(f"integration_config.{integration_id}")
-
-        value = json.loads(json_value) if json_value else {}
-
-        if not value:
-            async for attempt in stamina.retry_context(
-                    on=httpx.HTTPError,
-                    wait_initial=1.0,
-                    wait_jitter=5.0,
-                    wait_max=32.0
-            ):
-                with attempt:
-                    # ToDo: Store configs and update it on changes (event-driven architecture)
-                    integration = await _portal.get_integration_details(integration_id=integration_id)
-                    # Save the integration data in cache (will last 1 hr)
-                    await self.set_integration_config(
-                        str(integration_id),
-                        json.loads(integration.json()),
-                        600
-                    )
-                    return integration
-
-        return Integration.parse_obj(value)
-
-    async def set_integration_config(self, integration_id: str, config: dict, expire: int = None):
-        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
-            with attempt:
-                await self.db_client.set(
-                    f"integration_config.{integration_id}",
-                    json.dumps(config, default=str),
-                    ex=expire
-                )
-
-    async def delete_integration_config(self, integration_id: str):
-        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
-            with attempt:
-                await self.db_client.delete(
-                    f"integration_config.{integration_id}"
-                )
-
-    def __str__(self):
-        return f"IntegrationConfigurationManager(host={self.db_client.host}, port={self.db_client.port}, db={self.db_client.db})"
 
     def __repr__(self):
         return self.__str__()
