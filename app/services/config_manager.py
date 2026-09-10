@@ -152,6 +152,16 @@ end
 _NEXT_GENERATION_SCRIPT = _NEXT_GENERATION_LUA + """
 return next_generation(KEYS[1], KEYS[2], ARGV[1])
 """
+# The compare-and-delete used in place of an "equals" sentinel write while
+# action absence sentinels are off (CONFIG_CACHE_ACTION_ABSENCE_SENTINELS):
+# drop the key only if it still holds exactly the value the caller read.
+_DELETE_IF_EQUALS_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
 # Write an absence sentinel, atomically with the INCR that issues its generation
 # (a generation taken separately could be written after a higher one, breaking
 # the ordering the reload relies on). KEYS[1] is the action key, KEYS[2] the
@@ -239,6 +249,14 @@ class IntegrationConfigurationManager:
         return integration_details
 
     async def _write_absence_sentinel(self, key: str, *, ttl: int, mode: str, expected: str = "") -> bool:
+        """Record an absence under `key`, or, while action absence sentinels
+        are off (settings.CONFIG_CACHE_ACTION_ABSENCE_SENTINELS), do what the
+        release before them did so that replicas still on it never see a value
+        they cannot parse: leave a missing key missing ("missing"), DEL the key
+        ("any"), or DEL it only while it still holds `expected` ("equals").
+        Returns whether the cache changed."""
+        if not settings.CONFIG_CACHE_ACTION_ABSENCE_SENTINELS:
+            return await self._drop_action_key(key, mode=mode, expected=expected)
         async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
                 written = await self.db_client.eval(
@@ -247,6 +265,17 @@ class IntegrationConfigurationManager:
                     "1" if settings.CONFIG_CACHE_SENTINEL_GENERATIONS else "0",
                 )
         return bool(written)
+
+    async def _drop_action_key(self, key: str, *, mode: str, expected: str) -> bool:
+        if mode == "missing":
+            return False  # nothing cached, and nothing to record it with
+        async for attempt in stamina.retry_context(**REDIS_RETRY):
+            with attempt:
+                if mode == "equals":
+                    dropped = await self.db_client.eval(_DELETE_IF_EQUALS_SCRIPT, 1, key, expected)
+                else:
+                    dropped = await self.db_client.delete(key)
+        return bool(dropped)
 
     async def _reload_integration_from_gundi(self, integration_id: str, ttl=None) -> Integration:
         key = self._get_integration_key(integration_id)

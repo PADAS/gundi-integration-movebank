@@ -9,6 +9,14 @@ from app.main import app
 api_client = TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def action_absence_sentinels_on(mocker):
+    """The consumer's tombstone handling is the second phase of a two-phase
+    rollout (see CONFIG_CACHE_ACTION_ABSENCE_SENTINELS); run it turned on."""
+    from app.services import config_manager as cm
+    mocker.patch.object(cm.settings, "CONFIG_CACHE_ACTION_ABSENCE_SENTINELS", True)
+
+
 @pytest.mark.asyncio
 async def test_process_event_integration_created_from_pubsub(
         mocker, mock_gundi_client_v2, mock_publish_event, mock_action_handlers, mock_config_manager,

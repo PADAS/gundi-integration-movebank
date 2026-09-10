@@ -175,6 +175,20 @@ DIAGNOSTIC_URL_ALLOWLIST = env.list("DIAGNOSTIC_URL_ALLOWLIST", [])
 EPHEMERAL_BASE_URL_BLOCK_PRIVATE_ADDRESSES = env.bool("EPHEMERAL_BASE_URL_BLOCK_PRIVATE_ADDRESSES", False)
 EPHEMERAL_BASE_URL_ALLOWLIST = env.list("EPHEMERAL_BASE_URL_ALLOWLIST", [])
 
+# Config cache: record the absence of an action configuration (a "null"
+# sentinel under the action's key) instead of leaving the key missing, so an
+# unconfigured action stops reloading the whole integration from the Gundi API
+# on every lookup (see config_manager). Off by default because a rolling
+# deployment runs old and new replicas side by side, and a replica on a release
+# without the tolerant reader (this repository before this setting existed)
+# parses any cached value as a configuration: one bare "null" fails every
+# lookup of that action there, and get_integration_details reads every action,
+# so the whole integration stops executing on the old replicas. While off, the
+# writers fall back to the previous release's behaviour (no marker on reload,
+# DEL on delete); the reader accepts sentinels either way. Roll a release with
+# the reader out everywhere first, then turn this on.
+CONFIG_CACHE_ACTION_ABSENCE_SENTINELS = env.bool("CONFIG_CACHE_ACTION_ABSENCE_SENTINELS", False)
+
 # Config cache: write absence sentinels with a Redis-issued generation
 # ("null:<epoch>:<n>:<hex>") instead of the bare "null". The generation lets a
 # concurrent delete's tombstone win over an in-flight reload's stale snapshot
@@ -182,5 +196,6 @@ EPHEMERAL_BASE_URL_ALLOWLIST = env.list("EPHEMERAL_BASE_URL_ALLOWLIST", [])
 # because a rolling deployment runs old and new replicas side by side, and a
 # replica on a release without the tolerant reader parses anything but the
 # bare "null" as a configuration and fails every lookup of that action. Roll
-# a release with the reader out everywhere first, then turn this on.
+# a release with the reader out everywhere first, then turn this on. Has no
+# effect while CONFIG_CACHE_ACTION_ABSENCE_SENTINELS is off.
 CONFIG_CACHE_SENTINEL_GENERATIONS = env.bool("CONFIG_CACHE_SENTINEL_GENERATIONS", False)

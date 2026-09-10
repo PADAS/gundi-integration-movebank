@@ -10,6 +10,16 @@ from app.services.config_manager import (
 )
 
 
+@pytest.fixture(autouse=True)
+def action_absence_sentinels_on(mocker):
+    """The sentinel machinery under test is the second phase of a two-phase
+    rollout (see CONFIG_CACHE_ACTION_ABSENCE_SENTINELS): these tests run it as
+    a deployment that has turned it on. The off-state tests at the end of this
+    module patch it back to the default."""
+    from app.services import config_manager as cm
+    mocker.patch.object(cm.settings, "CONFIG_CACHE_ACTION_ABSENCE_SENTINELS", True)
+
+
 @pytest.mark.asyncio
 async def test_get_integration_from_redis(
         mocker, mock_redis_with_integration_config, mock_gundi_client_v2_class, integration_v2,
@@ -667,6 +677,11 @@ class _FakeRedis:
         if script is cm._NEXT_GENERATION_SCRIPT:
             counter, epoch_key = keys
             return next_generation(counter, epoch_key, args[0])
+        if script is cm._DELETE_IF_EQUALS_SCRIPT:
+            if current != args[0]:
+                return 0
+            del self.data[key]
+            return 1
         if script is cm._WRITE_TOMBSTONE_SCRIPT:
             counter, epoch_key = keys[1], keys[2]
             hex_part, ttl, mode, expected, candidate_epoch, generated = args
@@ -1228,7 +1243,10 @@ async def test_by_default_tombstones_are_the_bare_value_every_replica_can_read(i
     anything else as a configuration, so a generated tombstone would raise on
     every lookup there until the rollout completes. Generated tombstones are
     therefore opt-in (CONFIG_CACHE_SENTINEL_GENERATIONS): this release ships
-    the tolerant reader everywhere; a later one turns the writer on."""
+    the tolerant reader everywhere; a later one turns the writer on. (Here the
+    sentinels themselves are on, CONFIG_CACHE_ACTION_ABSENCE_SENTINELS, which
+    a deployment coming from a release with no sentinel reader at all enables
+    first; see the off-state tests at the end of this module.)"""
     from app.services import config_manager as cm
 
     assert cm.settings.CONFIG_CACHE_SENTINEL_GENERATIONS is False
@@ -1394,3 +1412,94 @@ async def test_compare_and_set_over_a_bare_sentinel_proceeds_while_generations_a
 
     assert await config_manager.replace_cached_entry(str(integration_v2.id), "pull_observations", config=config, observed="null") is True
     assert client.eval.called
+
+
+# --- Rolling out from a release without any action-sentinel reader ----------
+#
+# This repository's previous release parses whatever is cached under an action
+# key as a configuration, so even the bare "null" fails every lookup of that
+# action on an old replica, and get_integration_details reads every action.
+# Absence sentinels are therefore off by default: this release ships the reader
+# and the writers behave as before; a later deployment turns them on.
+
+
+@pytest.fixture
+def action_absence_sentinels_off(mocker):
+    from app.services import config_manager as cm
+    mocker.patch.object(cm.settings, "CONFIG_CACHE_ACTION_ABSENCE_SENTINELS", False)
+
+
+def test_action_absence_sentinels_are_off_by_default(mocker):
+    from app.services import config_manager as cm
+    mocker.stopall()  # undo this module's autouse patch and read the real setting
+    assert cm.settings.CONFIG_CACHE_ACTION_ABSENCE_SENTINELS is False
+
+
+@pytest.mark.asyncio
+async def test_reload_writes_nothing_under_unconfigured_actions_while_sentinels_are_off(
+        action_absence_sentinels_off, mocker, integration_v2,
+):
+    """An old replica reading the same Redis must find either a configuration
+    or nothing under an action key. The lookup still answers None."""
+    from app.services import config_manager as cm
+    manager = cm.IntegrationConfigurationManager()
+    fake = _FakeRedis()
+    manager.db_client = fake
+    mocker.patch.object(manager, "_fetch_integration_from_gundi", AsyncMock(return_value=integration_v2))
+    integration_id = str(integration_v2.id)
+    configured = {c.action.value for c in integration_v2.configurations}
+    unconfigured = {a.value for a in integration_v2.type.actions} - configured
+    assert unconfigured, "fixture must declare an action without a configuration"
+    missing_action = sorted(unconfigured)[0]
+
+    assert await manager.get_action_configuration(integration_id, missing_action) is None
+
+    for action_id in unconfigured:
+        assert f"integrationconfig.{integration_id}.{action_id}" not in fake.data
+    for action_id in configured:
+        assert not fake.data[f"integrationconfig.{integration_id}.{action_id}"].startswith("null")
+    # (The webhook key's own "null" sentinel predates this release and has
+    # always had a reader; only the action keys are at issue.)
+    for action in integration_v2.type.actions:
+        value = fake.data.get(f"integrationconfig.{integration_id}.{action.value}")
+        assert value is None or not value.startswith("null"), "no value an old replica's parse_raw would choke on"
+
+
+@pytest.mark.asyncio
+async def test_delete_drops_the_key_while_sentinels_are_off(action_absence_sentinels_off, integration_v2):
+    """The previous release's behaviour: DEL, never a marker."""
+    from app.services import config_manager as cm
+    manager = cm.IntegrationConfigurationManager()
+    fake = _FakeRedis()
+    manager.db_client = fake
+    integration_id = str(integration_v2.id)
+    key = f"integrationconfig.{integration_id}.pull_events"
+    fake.data[key] = integration_v2.configurations[0].json()
+
+    await manager.delete_action_configuration(integration_id, "pull_events")
+
+    assert key not in fake.data
+
+
+@pytest.mark.asyncio
+async def test_reconciling_an_absence_drops_the_key_only_while_it_still_matches_while_sentinels_are_off(
+        action_absence_sentinels_off, integration_v2,
+):
+    """The consumer's compare-and-set semantics survive the fallback: the key
+    goes only if it still holds exactly what the caller read."""
+    from app.services import config_manager as cm
+    manager = cm.IntegrationConfigurationManager()
+    fake = _FakeRedis()
+    manager.db_client = fake
+    integration_id = str(integration_v2.id)
+    key = f"integrationconfig.{integration_id}.pull_events"
+    observed = integration_v2.configurations[0].json()
+    fake.data[key] = observed
+
+    assert await manager.replace_cached_entry_with_absence(integration_id, "pull_events", observed=observed) is True
+    assert key not in fake.data
+
+    fake.data[key] = observed
+    assert await manager.replace_cached_entry_with_absence(integration_id, "pull_events", observed="something-else") is False
+    assert fake.data[key] == observed
+
