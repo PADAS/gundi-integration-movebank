@@ -151,9 +151,11 @@ def _advance_watermarks(state, events, sensor_type_ids, sensor_type_timestamps, 
 
 @action_title("(1) Movebank Credentials")
 async def action_auth(integration, action_config: AuthenticateConfig):
-    logger.info(
-        f"Executing auth action with integration {integration} and action_config {action_config}..."
-    )
+    # Log identifiers only: the integration carries its configurations (the
+    # plaintext Movebank password among them) and the action config the same
+    # secret. Neither may reach the logs, on a saved integration or on the
+    # ephemeral path where the credentials were never persisted anywhere.
+    logger.info(f"Executing auth action for integration '{integration.id}'...")
     mb_client = client.MovebankClient(
         base_url=integration.base_url,
         username=action_config.username,
@@ -170,10 +172,10 @@ async def action_auth(integration, action_config: AuthenticateConfig):
         return {"error": "An internal error occurred while trying to test credentials. Please try again later."}
     else:
         if token:
-            logger.info(f"Auth successful for integration '{integration.name}'. Token: '{token['api-token']}'")
+            logger.info(f"Auth successful for integration '{integration.id}'.")
             return {"valid_credentials": True}
         else:
-            logger.error(f"Auth unsuccessful for integration {integration}.")
+            logger.error(f"Auth unsuccessful for integration '{integration.id}': Movebank returned no token.")
             return {"valid_credentials": False}
 
 

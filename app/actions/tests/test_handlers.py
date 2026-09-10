@@ -12,12 +12,14 @@ from app.actions.configurations import (
     PullObservationsConfig,
 )
 from app.actions.handlers import (
+    action_auth,
     action_backfill,
     action_backfill_events_for_individual,
     action_pull_events_for_individual,
     action_pull_observations,
 )
 from app.actions.tests.conftest import INDIVIDUAL_ROW, make_events_generator
+from app.actions.configurations import AuthenticateConfig
 
 
 @pytest.mark.asyncio
@@ -2552,3 +2554,32 @@ async def test_backfill_cancel_targets_job_despite_duplicate_individual_ids(
 
     assert cancelled["cancelled"] is True
     assert cancelled["job_id"] == started["job_id"]
+
+
+@pytest.mark.asyncio
+async def test_auth_logs_carry_no_credentials_or_token(mock_movebank_client, caplog):
+    """The runner's ephemeral path lets the portal test credentials for an
+    integration that was never saved, so anything the handler logs is the only
+    place those credentials would ever persist. Neither the password (in the
+    action config, and in the integration's configurations) nor the API token
+    Movebank returns may reach the logs; identifiers are enough."""
+    import logging
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    password, token = "s3cret-pw-9f8e7d", "tok-6c5b4a3-SECRET"
+    integration = SimpleNamespace(
+        id=uuid4(), name="Draft Movebank", base_url="https://www.movebank.org",
+        configurations=[{"action": "auth", "data": {"username": "user", "password": password}}],
+    )
+    mock_movebank_client.get_token = AsyncMock(return_value={"api-token": token})
+
+    with caplog.at_level(logging.DEBUG, logger="app.actions.handlers"):
+        result = await action_auth(integration, AuthenticateConfig(username="user", password=password))
+
+    assert result == {"valid_credentials": True}
+    assert caplog.text, "the handler still logs the attempt"
+    assert password not in caplog.text
+    assert token not in caplog.text
+    assert str(integration.id) in caplog.text
+
