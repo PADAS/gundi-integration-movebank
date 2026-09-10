@@ -40,6 +40,16 @@ ephemeral_run: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "ephemeral_run", default=False
 )
 
+# Set by the action runner for the duration of a handler call. The runner
+# reports every exception that escapes the handler itself — an
+# IntegrationActionFailed carrying the traceback and request/response details,
+# or a WARNING custom log for recoverable conditions — so the decorator must
+# not publish a second IntegrationActionFailed for the same failure. A handler
+# invoked outside the runner still gets the decorator's report.
+runner_reports_failures: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "runner_reports_failures", default=False
+)
+
 
 # Publish events for other services or system components
 @stamina.retry(
@@ -159,15 +169,17 @@ def activity_logger(on_start=True, on_completion=True, on_error=True):
             try:
                 result = await func(*args, **kwargs)
             except Exception as e:
-                # Provider rate limiting and transport failures reaching the
-                # provider are recoverable conditions owned by the action
-                # runner, which records them as WARNING custom logs (see
-                # execute_action). Publishing IntegrationActionFailed here too
-                # would put an ERROR next to that WARNING and mark the
-                # connection unhealthy — so re-raise and let the runner report.
+                # Inside the runner, every failure is the runner's to report:
+                # ordinary ones as IntegrationActionFailed from _handle_error
+                # (publishing here too showed each failure twice in the portal
+                # and dinged health twice), provider rate limiting and
+                # transport failures as WARNING custom logs (an ERROR next to
+                # that WARNING would mark the connection unhealthy). The
+                # recoverable check still matters for a handler invoked
+                # outside the runner — so re-raise and let the runner report.
                 classified = classify_error(e)
                 is_recoverable = classified is not None and classified.error_type in RECOVERABLE_ERROR_TYPES
-                if on_error and not is_recoverable:
+                if on_error and not is_recoverable and not runner_reports_failures.get():
                     await publish_event(
                         event=IntegrationActionFailed(
                             payload=ActionExecutionFailed(

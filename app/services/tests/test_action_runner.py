@@ -2624,3 +2624,41 @@ async def test_execute_action_handles_httpx_error_carrying_no_request(
     error_details = json.loads(response.body)["detail"]
     assert error_details["error"] == "Could not reach the provider — connection failed"
     assert error_details["error_type"] == "connectivity"
+
+
+@pytest.mark.asyncio
+async def test_handler_failure_publishes_exactly_one_failed_event(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    # Real handlers wear @activity_logger(), which used to publish an
+    # IntegrationActionFailed of its own before re-raising, and the runner's
+    # _handle_error then published a second one for the same exception. The
+    # portal showed every failure twice (and health was dinged twice). Only the
+    # runner's event survives: it is the one carrying the traceback and the
+    # request/response details.
+    from app.services.activity_logger import activity_logger
+
+    @activity_logger()
+    async def action_pull_observations(integration, action_config):
+        raise ValueError("boom")
+
+    _, config_model, data_model = mock_action_handlers["pull_observations"]
+    handlers = {**mock_action_handlers, "pull_observations": (action_pull_observations, config_model, data_model)}
+    mocker.patch("app.services.action_runner.action_handlers", handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    response = api_client.post(
+        "/v1/actions/execute/",
+        json={"integration_id": str(integration_v2.id), "action_id": "pull_observations"},
+    )
+
+    assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    failed = _published_events_of_type(mock_publish_event, IntegrationActionFailed)
+    assert len(failed) == 1, [e.payload.error for e in failed]
+    assert failed[0].payload.error_traceback
+    # The started event is still published; nothing else changed.
+    assert mock_publish_event.call_count == 2
