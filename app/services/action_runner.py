@@ -27,7 +27,7 @@ from app.api_schemas import IntegrationState
 from .config_manager import IntegrationConfigurationManager
 from .state import IntegrationStateManager
 from .utils import find_config_for_action
-from .activity_logger import publish_event, log_action_activity, ephemeral_run
+from .activity_logger import publish_event, log_action_activity, ephemeral_run, runner_reports_failures
 from .errors import classify_error, format_classified_error, source_status_code, IntegrationError, IntegrationConfigurationError, RECOVERABLE_ERROR_TYPES
 from .url_policy import validate_outbound_url
 from .gundi import EphemeralWriteBlocked
@@ -727,10 +727,17 @@ async def _execute_action_impl(
             handler_kwargs["data"] = parsed_data
         if metadata is not None:
             handler_kwargs["metadata"] = metadata
-        result = await asyncio.wait_for(
-            handler(**handler_kwargs),
-            timeout=settings.MAX_ACTION_EXECUTION_TIME
-        )
+        # Whatever escapes the handler is reported below, once; tell the
+        # @activity_logger decorator on the handler not to publish its own
+        # IntegrationActionFailed for the same exception.
+        reports_token = runner_reports_failures.set(True)
+        try:
+            result = await asyncio.wait_for(
+                handler(**handler_kwargs),
+                timeout=settings.MAX_ACTION_EXECUTION_TIME
+            )
+        finally:
+            runner_reports_failures.reset(reports_token)
     except asyncio.TimeoutError as exc:
         if ephemeral_run.get():
             # An ephemeral run is interactive by construction (a portal draft

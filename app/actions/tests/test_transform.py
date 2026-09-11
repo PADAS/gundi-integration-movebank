@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.actions.transform import build_observation, chunks, human_friendly_timedelta
 
 
@@ -97,3 +99,27 @@ def test_chunks_rejects_non_positive_size():
         list(chunks([1, 2, 3], 0))
     with _pytest.raises(ValueError, match="positive integer"):
         list(chunks([1, 2, 3], -1))
+
+
+def test_build_observation_fudges_out_of_range_coordinates():
+    # Gundi's Sensors API validates lat/lon against +-90/+-180 and rejects the
+    # WHOLE batch (HTTP 400) when a single observation fails, which wedged an
+    # individual in production: the send failed before its cursors were saved,
+    # so every tick refetched the same window and failed again. A fix outside
+    # the valid range is no fix at all, so treat it like missing coordinates.
+    event = {**GPS_EVENT, "location_lat": "91.0", "location_long": "2.5"}
+    obs = build_observation(event=event, device_name="Aquila")
+    assert obs["location"] == {"lat": 0.0, "lon": 0.0}
+    assert obs["recorded_at"] == "2026-01-01T10:00:00.001000+00:00"
+    # The raw values stay available for diagnosis in the destination.
+    assert obs["additional"]["location_lat"] == "91.0"
+    assert obs["additional"]["location_long"] == "2.5"
+
+
+@pytest.mark.parametrize("lat, lon", [("nan", "2.5"), ("1.5", "inf"), ("-inf", "2.5")])
+def test_build_observation_fudges_non_finite_coordinates(lat, lon):
+    # float() happily parses "nan"/"inf", and Gundi rejects both.
+    event = {**GPS_EVENT, "location_lat": lat, "location_long": lon}
+    obs = build_observation(event=event, device_name="Aquila")
+    assert obs["location"] == {"lat": 0.0, "lon": 0.0}
+    assert obs["recorded_at"] == "2026-01-01T10:00:00.001000+00:00"

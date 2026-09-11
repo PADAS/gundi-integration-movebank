@@ -36,6 +36,12 @@ def chunks(items: list, n: int):
         yield items[i:i + n]
 
 
+def _is_valid_coordinate_pair(*, lat: float, lon: float) -> bool:
+    """Same acceptance rule as Gundi's Sensors API: finite values within
+    +-90 latitude and +-180 longitude (NaN fails every comparison)."""
+    return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+
+
 def build_observation(*, event: dict, device_name: str) -> Optional[dict]:
     """Transform one Movebank event record into a Gundi v2 observation dict.
 
@@ -76,6 +82,17 @@ def build_observation(*, event: dict, device_name: str) -> Optional[dict]:
         except (TypeError, ValueError):
             logger.warning(f"unable to parse coordinates: lon={lon!r} lat={lat!r}")
             return None
+        if not _is_valid_coordinate_pair(lat=y, lon=x):
+            # A fix outside +-90/+-180 (or NaN/inf, which float() accepts) is
+            # no fix at all. Gundi's Sensors API rejects the WHOLE batch over a
+            # single one, and that happens before the individual's cursors are
+            # saved, so the same window would be refetched and fail on every
+            # tick. Treat it like a missing fix, keeping the raw values in
+            # `additional` for diagnosis in the destination.
+            logger.warning(f"coordinates out of range, storing at (0, 0): lon={lon!r} lat={lat!r}")
+            additional["location_lat"], additional["location_long"] = lat, lon
+            x, y = 0.0, 0.0
+            recorded_at += timedelta(milliseconds=1)
 
     if not individual_id or recorded_at > datetime.now(tz=timezone.utc):
         return None
