@@ -653,6 +653,25 @@ async def test_execute_action_timeout_logs_warning_not_failure(
 
 
 @pytest.mark.asyncio
+async def test_execution_cap_warning_logs_the_cap_without_an_empty_traceback(mocker, integration_v2, caplog):
+    # The cap's ActionTimeoutError is built by the runner, never raised, so it
+    # has no stack: the log line carries the error text instead of exc_info.
+    from app.services.action_runner import _handle_recoverable_timeout
+    from app.services.errors import ActionTimeoutError
+    mocker.patch("app.services.action_runner.log_action_activity", AsyncMock())
+
+    with caplog.at_level("WARNING", logger="app.services.action_runner"):
+        await _handle_recoverable_timeout(
+            ActionTimeoutError("exceeded the 540 s execution limit"),
+            str(integration_v2.id), "pull_observations",
+        )
+
+    record = next(r for r in caplog.records if "timed out" in r.getMessage())
+    assert record.exc_info is None
+    assert "ActionTimeoutError: exceeded the 540 s execution limit" in record.getMessage()
+
+
+@pytest.mark.asyncio
 async def test_execute_action_rate_limit_logs_warning_not_failure(
         mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
         mock_publish_event, mock_action_handlers,

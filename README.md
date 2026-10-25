@@ -38,4 +38,8 @@ This is Gundi's integration for pulling data from Movebank Studies.
 - `ACCESSORY_SETTLING_HOURS` (default 12) — how far back accessory-measurements
   queries re-read, since those records can arrive hours late.
 - `BACKFILL_MAX_CONCURRENCY` (default 8) — individuals in flight per backfill job.
+- `PUBSUB_REDELIVER_TRANSIENT_FAILURES` (default `false`) — answer PubSub with a
+  5xx for transient action failures so the message is redelivered. Off because
+  `pull_observations` and the backfill cascade are not idempotent; every action
+  resumes from persisted state on its next tick.
 

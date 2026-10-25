@@ -64,6 +64,9 @@ def runner_mocks(mocker, mock_gundi_client_v2, mock_config_manager, mock_publish
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch.object(settings, "PROCESS_PUBSUB_MESSAGES_IN_BACKGROUND", False)
+    # Off by default in this fork (see settings); these tests cover the
+    # template's redelivery semantics with it on.
+    mocker.patch.object(settings, "PUBSUB_REDELIVER_TRANSIENT_FAILURES", True)
     return mock_config_manager
 
 
@@ -112,6 +115,28 @@ def test_transient_handler_failure_is_not_acked(mocker, runner_mocks, error, exp
     assert response.status_code == expected_status
     assert handler.called
     assert response.json()["detail"]["action_id"] == "pull_observations"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [_provider_error(503), GundiAPIError(503, "sensors api unavailable")],
+    ids=["provider_5xx", "gundi_5xx"],
+)
+def test_transient_failure_is_acked_when_redelivery_is_off(mocker, runner_mocks, error):
+    # The fork's default: pull_observations and the backfill cascade are not
+    # idempotent, so a transient failure is acked like any other and the next
+    # tick resumes from persisted state.
+    mocker.patch.object(settings, "PUBSUB_REDELIVER_TRANSIENT_FAILURES", False)
+    handler = _install_handler(mocker, AsyncMock(side_effect=error))
+
+    response = api_client.post("/", json=_pubsub_message("pull_observations"))
+
+    assert response.status_code == 200
+    assert handler.called
+
+
+def test_redelivery_is_off_by_default():
+    assert settings.PUBSUB_REDELIVER_TRANSIENT_FAILURES is False
 
 
 # This fork records provider rate limiting, provider unreachability and the

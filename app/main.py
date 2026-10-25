@@ -122,7 +122,8 @@ async def execute(
 
 
 def _should_redeliver(result) -> bool:
-    """True for an execute_action error response whose failure is transient.
+    """True for an execute_action error response whose failure is transient,
+    when PUBSUB_REDELIVER_TRANSIENT_FAILURES is on.
 
     Successful runs return the handler's own result (a dict), errors a
     JSONResponse from _handle_error whose body carries the verdict
@@ -130,6 +131,8 @@ def _should_redeliver(result) -> bool:
     Only 5xx responses qualify: the runner answers 4xx for request and
     configuration problems, which are final.
     """
+    if not settings.PUBSUB_REDELIVER_TRANSIENT_FAILURES:
+        return False
     if not isinstance(result, Response) or result.status_code < 500:
         return False
     try:

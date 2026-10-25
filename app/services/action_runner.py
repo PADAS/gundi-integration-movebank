@@ -289,7 +289,7 @@ async def _handle_error(
         # response are built from.
         "config_data": redact_config_data(
             config_data, action_id=action_id,
-            config_models={aid: model for aid, (_, model, _) in action_handlers.items()},
+            config_models=_config_models(),
         ),
         "error": message,
         # Machine-readable category. Only reaches the JSON response below;
@@ -349,6 +349,12 @@ async def _handle_error(
     )
 
 
+def _config_models():
+    """Each registered action's config model, keyed by action id, for
+    redact_config_data."""
+    return {aid: model for aid, (_, model, _) in action_handlers.items()}
+
+
 async def _publish_recoverable_warning(exc, integration_id, action_id, *, title, message, reason, config_data=None):
     """Record a recoverable, expected condition as a WARNING activity log
     instead of an IntegrationActionFailed event.
@@ -362,13 +368,18 @@ async def _publish_recoverable_warning(exc, integration_id, action_id, *, title,
     unhealthy for something we expect to recover from, so we publish a WARNING
     custom activity log for visibility instead.
 
-    `exc` must be the actual caught exception. Its traceback is logged via an
-    explicit (type, value, traceback) tuple built from the exception object
-    itself, so the log takes the traceback from `exc.__traceback__` rather than
-    the ambient `sys.exc_info()` — deterministic even if this helper is ever
-    called outside the originating `except`.
+    When `exc` was raised, its traceback is logged via an explicit (type,
+    value, traceback) tuple built from the exception object itself, so the log
+    takes the traceback from `exc.__traceback__` rather than the ambient
+    `sys.exc_info()` — deterministic even if this helper is ever called outside
+    the originating `except`. The runner's own execution cap passes an
+    ActionTimeoutError it built and never raised: there is no stack to show,
+    so only the message is logged.
     """
-    logger.warning(message, exc_info=(type(exc), exc, exc.__traceback__))
+    if exc.__traceback__ is not None:
+        logger.warning(message, exc_info=(type(exc), exc, exc.__traceback__))
+    else:
+        logger.warning(f"{message}: {type(exc).__name__}: {exc}")
     await log_action_activity(
         integration_id=integration_id,
         action_id=action_id,
@@ -379,7 +390,7 @@ async def _publish_recoverable_warning(exc, integration_id, action_id, *, title,
         # _handle_error does for the failure path.
         config_data=redact_config_data(
             config_data, action_id=action_id,
-            config_models={aid: model for aid, (_, model, _) in action_handlers.items()},
+            config_models=_config_models(),
         ),
         data={"reason": reason, "message": redact_text(message)},
     )
