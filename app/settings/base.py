@@ -148,8 +148,15 @@ gundi_client_settings.GUNDI_TOKEN_CACHE_URL = GUNDI_TOKEN_CACHE_URL
 REGISTER_ON_START = env.bool("REGISTER_ON_START", False)
 INTEGRATION_TYPE_SLUG = env.str("INTEGRATION_TYPE_SLUG", None)  # Define a string id here e.g. "my_tracker"
 INTEGRATION_TYPE_NAME = env.str("INTEGRATION_TYPE_NAME", None)  # Display name e.g. "My Tracker"; defaults to a name derived from the slug
+INTEGRATION_TYPE_DESCRIPTION = env.str("INTEGRATION_TYPE_DESCRIPTION", None)  # Shown in the portal's type picker; defaults to "Default type for integrations with <name>"
 INTEGRATION_SERVICE_URL = env.str("INTEGRATION_SERVICE_URL", None)  # Define a string id here e.g. "my_tracker"
 PROCESS_PUBSUB_MESSAGES_IN_BACKGROUND = env.bool("PROCESS_PUBSUB_MESSAGES_IN_BACKGROUND", False)
+# Answer PubSub with a non-2xx for a transient action failure so the message is
+# redelivered (foreground mode only). Off in this fork: Movebank's fan-out and
+# backfill actions are not idempotent (a redelivered pull_observations re-triggers
+# every individual; a redelivered backfill step can finalize an individual
+# twice), and every action resumes from persisted state on its next tick anyway.
+PUBSUB_REDELIVER_TRANSIENT_FAILURES = env.bool("PUBSUB_REDELIVER_TRANSIENT_FAILURES", False)
 PROCESS_WEBHOOKS_IN_BACKGROUND = env.bool("PROCESS_WEBHOOKS_IN_BACKGROUND", True)
 MAX_ACTION_EXECUTION_TIME = env.int("MAX_ACTION_EXECUTION_TIME", 60 * 9)  # 10 minutes is the maximum ack timeout
 
