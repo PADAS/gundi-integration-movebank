@@ -301,6 +301,11 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     # needlessly small windows (extra Movebank calls) for high-frequency tags.
     total_seconds = (now - ind.timestamp_start).total_seconds()
     batch_window_size = _compute_batch_window(ind.number_of_events, total_seconds)
+    if individual_state.window_seconds:
+        # A previous run found the density-based window too dense to send; keep
+        # the smaller size it settled on.
+        batch_window_size = min(batch_window_size, timedelta(seconds=individual_state.window_seconds))
+    min_window = timedelta(seconds=settings.MIN_BACKFILL_WINDOW_SECONDS)
 
     logger.info(
         f"For individual {ind.id} ({ind.nick_name}), using a window size of {batch_window_size} "
@@ -311,6 +316,9 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     auth_config = client.get_auth_config(integration)
     total_observations_sent = 0
     current_window_start = earliest_start
+    # Stop taking new windows well before the runner's hard limit: a window is
+    # fetched and sent as a whole, so it must have time to finish once started.
+    deadline = time.monotonic() + 0.5 * settings.MAX_ACTION_EXECUTION_TIME
 
     mb_client = client.MovebankClient(
         base_url=integration.base_url,
@@ -318,7 +326,9 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
         password=auth_config.password.get_secret_value(),
     )
     async with mb_client as mb:
-        while current_window_start <= highest_date and total_observations_sent < MAXIMUM_RECORDS_PER_INDIVIDUAL:
+        while (current_window_start <= highest_date
+               and total_observations_sent < MAXIMUM_RECORDS_PER_INDIVIDUAL
+               and time.monotonic() < deadline):
             end_at = min(highest_date, current_window_start + batch_window_size)
 
             # One request per sensor type, each from its own cursor.
@@ -328,7 +338,11 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
             # back on every event it returns.
             events = []
             sensor_event_counts = {}  # per-sensor counts for logging + the fetched-any check
+            window_interrupted = False
             for sensor_type_id in sensor_type_ids:
+                if time.monotonic() >= deadline:
+                    window_interrupted = True
+                    break
                 sensor_start = sensor_type_timestamps[sensor_type_id]
                 if sensor_start > end_at:
                     continue  # this sensor is already past the window
@@ -360,6 +374,12 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                     return {"skipped": "no_connection_slot", "observations_sent": total_observations_sent}
                 sensor_event_counts[sensor_type_id] = count
 
+            if window_interrupted:
+                # Out of time mid-window: nothing from it was sent, so drop the
+                # partial fetch and resume from the saved cursor next tick.
+                logger.info(f"Stopping {log_reference}: time budget used; resuming from the saved cursor.")
+                break
+
             if not sensor_event_counts:
                 # Every sensor was already past this window: advance without
                 # touching the quiet flag or the saved cursor (v1 behavior).
@@ -370,6 +390,32 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                 obs for event in events
                 if (obs := build_observation(event=event, device_name=device_name)) is not None
             ]
+
+            # Overflow guard (as in the backfill): a window too dense to send in
+            # one run is discarded, shrunk, and re-fetched; the cursor stays put.
+            if len(observations) > settings.MAX_RECORDS_PER_PULL_WINDOW and batch_window_size > min_window:
+                shrunk = (batch_window_size.total_seconds()
+                          * settings.MAX_RECORDS_PER_PULL_WINDOW / len(observations)
+                          * settings.BACKFILL_WINDOW_SHRINK_SAFETY)
+                batch_window_size = max(min_window, timedelta(seconds=shrunk))
+                individual_state.window_seconds = batch_window_size.total_seconds()
+                await state_manager.set_state(
+                    integration_id,
+                    CURSOR_STATE_ACTION_ID,
+                    json.loads(individual_state.json()),
+                    source_id=ind.id,
+                )
+                logger.info(
+                    f"Window for {log_reference} over cap ({len(observations)} > "
+                    f"{settings.MAX_RECORDS_PER_PULL_WINDOW}); shrunk to {batch_window_size.total_seconds():.0f}s, retrying"
+                )
+                continue
+            if len(observations) > settings.MAX_RECORDS_PER_PULL_WINDOW:
+                logger.warning(
+                    f"Window for {log_reference} at floor ({settings.MIN_BACKFILL_WINDOW_SECONDS}s) still over cap "
+                    f"({len(observations)} observations); sending anyway"
+                )
+
             for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
                 await send_observations_to_gundi(observations=batch, integration_id=integration_id)
 

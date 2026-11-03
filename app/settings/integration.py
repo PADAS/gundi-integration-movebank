@@ -25,6 +25,10 @@ BACKFILL_MAX_CONCURRENCY = env.int("BACKFILL_MAX_CONCURRENCY", 8)
 # finishes inside MAX_ACTION_EXECUTION_TIME. A fully-fetched window over the cap
 # is discarded and the window shrunk (see below), then retried.
 MAX_RECORDS_PER_BACKFILL_WINDOW = env.int("MAX_RECORDS_PER_BACKFILL_WINDOW", 5000)
+# Steady-state pull counterpart: a window holding more than this many
+# observations is discarded and shrunk (same floor and safety factor as the
+# backfill), so one window is always small enough to send inside the run.
+MAX_RECORDS_PER_PULL_WINDOW = env.int("MAX_RECORDS_PER_PULL_WINDOW", 2000)
 # Floor for the adaptive backfill window (seconds): it shrinks on overflow but
 # never below this. At the floor an over-cap window is sent anyway (a burst
 # denser than the floor window can hold).

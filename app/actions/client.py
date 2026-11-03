@@ -137,6 +137,9 @@ class IndividualState(pydantic.BaseModel):
     # (pull first run, or backfill seed/finalize); never advanced forward. Backfill
     # fills [start, coverage_start) for an already-cursored individual.
     coverage_start: Optional[datetime] = None
+    # Steady-state fetch window (seconds) after an overflow shrank it. Kept so the
+    # next run starts at the size that fit instead of re-fetching an over-cap window.
+    window_seconds: Optional[float] = None
 
     def get_sensor_state(self, sensor_type_id: int) -> SensorState:
         key = str(sensor_type_id)
