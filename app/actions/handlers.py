@@ -416,6 +416,12 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
             if window_interrupted:
                 # Out of time mid-window: nothing from it was sent, so drop the
                 # partial fetch and resume from the saved cursor next tick.
+                if sensor_event_counts and batch_window_size > min_window:
+                    # The fetch itself was too slow for the budget: retry a
+                    # smaller window next time so a repeat can still make progress.
+                    batch_window_size = max(min_window, batch_window_size / 2)
+                    individual_state.window_seconds = batch_window_size.total_seconds()
+                    await save_cursor_state()
                 logger.info(f"Stopping {log_reference}: time budget used; resuming from the saved cursor.")
                 break
 
