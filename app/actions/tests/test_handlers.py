@@ -2760,3 +2760,81 @@ async def test_pull_events_overflow_on_fresh_individual_keeps_its_start(
     mocker.patch("app.actions.handlers.time.monotonic", return_value=0)
     await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
     assert calls["windows"][1][0] == first_start
+
+
+@pytest.mark.asyncio
+async def test_pull_events_resumed_run_still_fetches_late_accessory_records(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    key = (str(integration.id), "pull_events_for_individual", "111")
+    accessory = 7842954
+    cursor_ts = datetime.now(tz=timezone.utc) - timedelta(days=15)
+    state = IndividualState(individual_id="111", study_id="12345")
+    state.update_sensor_state(accessory, cursor_ts, 500)
+    mock_state_store[key] = state.dict()
+
+    def accessory_event(event_id, ts):
+        return {**_gps_event(event_id, ts.strftime("%Y-%m-%d %H:%M:%S.000")), "sensor_type_id": str(accessory)}
+
+    records = []  # what Movebank holds; the generator filters like the real API
+
+    async def _gen(**kwargs):
+        for e in records:
+            ts = datetime.strptime(e["timestamp"], "%Y-%m-%d %H:%M:%S.000").replace(tzinfo=timezone.utc)
+            if (kwargs["timestamp_start"] <= ts <= kwargs["timestamp_end"]
+                    and int(e["event_id"]) >= kwargs["minimum_event_id"]):
+                yield e
+    mock_movebank_client.get_individual_events_by_time = _gen
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    accessory_individual = {"sensor_type_ids": "accessory-measurements"}
+
+    # Run 1 scans one empty window, then runs out of time.
+    clock = iter([0, 0, 0])
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: next(clock, 10_000))
+    await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config(individual_overrides=accessory_individual)
+    )
+    assert IndividualState.parse_obj(mock_state_store[key]).scan_from == cursor_ts + timedelta(days=5)
+
+    # Before run 2, a late record arrives just below the cursor, plus a newer one past the resume point.
+    late = accessory_event(900, cursor_ts - timedelta(hours=1))
+    newer = accessory_event(901, cursor_ts + timedelta(days=6))
+    records.extend([late, newer])
+    mocker.patch("app.actions.handlers.time.monotonic", return_value=0)
+    await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config(individual_overrides=accessory_individual)
+    )
+
+    sent_count = sum(len(call.kwargs["observations"]) for call in mock_send.await_args_list)
+    assert sent_count == 2  # the late record was fetched along with the newer one
+
+
+@pytest.mark.asyncio
+async def test_pull_events_keeps_scan_progress_when_slot_runs_out(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from contextlib import asynccontextmanager
+    from app.services.movebank_connections import NoConnectionSlot
+    key = (str(integration.id), "pull_events_for_individual", "111")
+    cursor_ts = datetime.now(tz=timezone.utc) - timedelta(days=15)
+    state = IndividualState(individual_id="111", study_id="12345")
+    state.update_sensor_state(653, cursor_ts, 500)
+    mock_state_store[key] = state.dict()
+    gen, calls = make_sized_events_generator([0])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    slots = {"count": 0}
+
+    @asynccontextmanager
+    async def slot_once(username):
+        slots["count"] += 1
+        if slots["count"] > 1:
+            raise NoConnectionSlot("full")
+        yield
+    mocker.patch("app.actions.handlers.movebank_slot", slot_once)
+
+    result = await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
+
+    assert result["skipped"] == "no_connection_slot"
+    assert IndividualState.parse_obj(mock_state_store[key]).scan_from == cursor_ts + timedelta(days=5)

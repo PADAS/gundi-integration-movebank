@@ -379,7 +379,10 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                 if sensor_start > end_at:
                     continue  # this sensor is already past the window
                 query_start = _query_start_for_sensor(sensor_type_id, sensor_start, minimum_event_ids[sensor_type_id])
-                if resume_from:
+                if resume_from and query_start == sensor_start:
+                    # A sensor that re-reads a settling margin keeps its full query,
+                    # so late records below the resume point are still fetched
+                    # before its event-id cursor moves past them.
                     query_start = max(query_start, resume_from)
                 count = 0
                 try:
@@ -405,6 +408,8 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                         f"Skipping {log_reference}: Movebank connection budget exhausted; "
                         "resuming from the saved cursor on the next tick."
                     )
+                    if individual_state.scan_from != saved_scan_from:
+                        await save_cursor_state()  # keep this run's empty-stretch progress
                     return {"skipped": "no_connection_slot", "observations_sent": total_observations_sent}
                 sensor_event_counts[sensor_type_id] = count
 
