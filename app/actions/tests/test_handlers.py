@@ -2701,3 +2701,62 @@ async def test_auth_logs_carry_no_credentials_or_token(mock_movebank_client, cap
     assert token not in caplog.text
     assert str(integration.id) in caplog.text
 
+
+
+@pytest.mark.asyncio
+async def test_pull_events_resumes_an_empty_stretch_across_runs(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    key = (str(integration.id), "pull_events_for_individual", "111")
+    quiet_key = (str(integration.id), "pull_events_for_individual_quiet", "111")
+    cursor_ts = datetime.now(tz=timezone.utc) - timedelta(days=15)
+    state = IndividualState(individual_id="111", study_id="12345")
+    state.update_sensor_state(653, cursor_ts, 500)
+    mock_state_store[key] = state.dict()
+    gen, calls = make_sized_events_generator([0])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    # Run 1 has time for one empty 5-day window only.
+    clock = iter([0, 0, 0])
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: next(clock, 10_000))
+    await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
+
+    saved = IndividualState.parse_obj(mock_state_store[key])
+    assert saved.scan_from == cursor_ts + timedelta(days=5)
+    assert saved.get_sensor_state(653).latest_timestamp == cursor_ts  # event cursor untouched
+    assert quiet_key not in mock_state_store  # the present was not reached yet
+
+    # Run 2 has time to spare: it starts after the stretch run 1 scanned and reaches the present.
+    mocker.patch("app.actions.handlers.time.monotonic", return_value=0)
+    await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
+
+    assert calls["windows"][1][0] == cursor_ts + timedelta(days=5)
+    assert IndividualState.parse_obj(mock_state_store[key]).scan_from is None
+    assert quiet_key in mock_state_store
+
+
+@pytest.mark.asyncio
+async def test_pull_events_overflow_on_fresh_individual_keeps_its_start(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    key = (str(integration.id), "pull_events_for_individual", "111")
+    gen, calls = make_sized_events_generator([3000, 0])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    # Run 1: the first window overflows, then time runs out before the retry.
+    clock = iter([0, 0, 0])
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: next(clock, 10_000))
+    await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
+
+    first_start = calls["windows"][0][0]
+    saved = IndividualState.parse_obj(mock_state_store[key])
+    assert saved.coverage_start == first_start
+    assert saved.get_sensor_state(653).latest_timestamp == first_start
+    assert saved.get_sensor_state(653).highest_event_id == 0
+
+    # Run 2 starts from the same point, not from a later "now - lookback".
+    mocker.patch("app.actions.handlers.time.monotonic", return_value=0)
+    await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
+    assert calls["windows"][1][0] == first_start

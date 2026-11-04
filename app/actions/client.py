@@ -140,6 +140,11 @@ class IndividualState(pydantic.BaseModel):
     # Steady-state fetch window (seconds) after an overflow shrank it. Kept so the
     # next run starts at the size that fit instead of re-fetching an over-cap window.
     window_seconds: Optional[float] = None
+    # Start of the first window not yet scanned when a run ran out of time inside
+    # a stretch with no events. The next run resumes here instead of rescanning
+    # that stretch from the sensor cursors; cleared once events are found or the
+    # scan reaches the present.
+    scan_from: Optional[datetime] = None
 
     def get_sensor_state(self, sensor_type_id: int) -> SensorState:
         key = str(sensor_type_id)
