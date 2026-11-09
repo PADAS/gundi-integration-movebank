@@ -88,6 +88,16 @@ def _compute_batch_window(number_of_events, span_seconds) -> timedelta:
     return window
 
 
+def _pin_unset_sensor_cursors(state, sensor_type_ids, sensor_type_timestamps, minimum_event_ids):
+    """Store the start position of every sensor that has no saved cursor yet, so a
+    state saved before any events arrive does not let the next run start from a
+    later `now - maximum_lookback_hours` (skipping data the backfill also leaves
+    out, since coverage_start is already saved). Event-id cursors are unchanged."""
+    for stid in sensor_type_ids:
+        if state.get_sensor_state(stid).latest_timestamp is None:
+            state.update_sensor_state(stid, sensor_type_timestamps[stid], minimum_event_ids[stid] - 1)
+
+
 def _display_name(ind) -> str:
     """Human-facing name for an individual, used as the observation's
     subject_name/source_name. Prefers the tag's local_identifier, falling
@@ -301,6 +311,11 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     # needlessly small windows (extra Movebank calls) for high-frequency tags.
     total_seconds = (now - ind.timestamp_start).total_seconds()
     batch_window_size = _compute_batch_window(ind.number_of_events, total_seconds)
+    if individual_state.window_seconds:
+        # A previous run found the density-based window too dense to send; keep
+        # the smaller size it settled on.
+        batch_window_size = min(batch_window_size, timedelta(seconds=individual_state.window_seconds))
+    min_window = timedelta(seconds=settings.MIN_BACKFILL_WINDOW_SECONDS)
 
     logger.info(
         f"For individual {ind.id} ({ind.nick_name}), using a window size of {batch_window_size} "
@@ -311,6 +326,31 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     auth_config = client.get_auth_config(integration)
     total_observations_sent = 0
     current_window_start = earliest_start
+    if individual_state.scan_from and earliest_start < individual_state.scan_from <= highest_date:
+        # A previous run ran out of time in an empty stretch: resume after it.
+        current_window_start = individual_state.scan_from
+    else:
+        individual_state.scan_from = None
+    saved_scan_from = individual_state.scan_from
+    # Only a stretch scanned by an EARLIER run is skipped; within this run each
+    # window still queries from the sensor cursors (keeping the accessory settling
+    # re-read), as before.
+    resume_from = individual_state.scan_from
+
+    async def save_cursor_state():
+        nonlocal saved_scan_from
+        _pin_unset_sensor_cursors(individual_state, sensor_type_ids, sensor_type_timestamps, minimum_event_ids)
+        await state_manager.set_state(
+            integration_id,
+            CURSOR_STATE_ACTION_ID,
+            json.loads(individual_state.json()),
+            source_id=ind.id,
+        )
+        saved_scan_from = individual_state.scan_from
+
+    # Stop taking new windows well before the runner's hard limit: a window is
+    # fetched and sent as a whole, so it must have time to finish once started.
+    deadline = time.monotonic() + 0.5 * settings.MAX_ACTION_EXECUTION_TIME
 
     mb_client = client.MovebankClient(
         base_url=integration.base_url,
@@ -318,7 +358,9 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
         password=auth_config.password.get_secret_value(),
     )
     async with mb_client as mb:
-        while current_window_start <= highest_date and total_observations_sent < MAXIMUM_RECORDS_PER_INDIVIDUAL:
+        while (current_window_start <= highest_date
+               and total_observations_sent < MAXIMUM_RECORDS_PER_INDIVIDUAL
+               and time.monotonic() < deadline):
             end_at = min(highest_date, current_window_start + batch_window_size)
 
             # One request per sensor type, each from its own cursor.
@@ -328,11 +370,20 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
             # back on every event it returns.
             events = []
             sensor_event_counts = {}  # per-sensor counts for logging + the fetched-any check
+            window_interrupted = False
             for sensor_type_id in sensor_type_ids:
+                if time.monotonic() >= deadline:
+                    window_interrupted = True
+                    break
                 sensor_start = sensor_type_timestamps[sensor_type_id]
                 if sensor_start > end_at:
                     continue  # this sensor is already past the window
                 query_start = _query_start_for_sensor(sensor_type_id, sensor_start, minimum_event_ids[sensor_type_id])
+                if resume_from and query_start == sensor_start:
+                    # A sensor that re-reads a settling margin keeps its full query,
+                    # so late records below the resume point are still fetched
+                    # before its event-id cursor moves past them.
+                    query_start = max(query_start, resume_from)
                 count = 0
                 try:
                     async with movebank_slot(auth_config.username):
@@ -357,8 +408,22 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                         f"Skipping {log_reference}: Movebank connection budget exhausted; "
                         "resuming from the saved cursor on the next tick."
                     )
+                    if individual_state.scan_from != saved_scan_from:
+                        await save_cursor_state()  # keep this run's empty-stretch progress
                     return {"skipped": "no_connection_slot", "observations_sent": total_observations_sent}
                 sensor_event_counts[sensor_type_id] = count
+
+            if window_interrupted:
+                # Out of time mid-window: nothing from it was sent, so drop the
+                # partial fetch and resume from the saved cursor next tick.
+                if sensor_event_counts and batch_window_size > min_window:
+                    # The fetch itself was too slow for the budget: retry a
+                    # smaller window next time so a repeat can still make progress.
+                    batch_window_size = max(min_window, batch_window_size / 2)
+                    individual_state.window_seconds = batch_window_size.total_seconds()
+                    await save_cursor_state()
+                logger.info(f"Stopping {log_reference}: time budget used; resuming from the saved cursor.")
+                break
 
             if not sensor_event_counts:
                 # Every sensor was already past this window: advance without
@@ -370,6 +435,27 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                 obs for event in events
                 if (obs := build_observation(event=event, device_name=device_name)) is not None
             ]
+
+            # Overflow guard (as in the backfill): a window too dense to send in
+            # one run is discarded, shrunk, and re-fetched; the cursor stays put.
+            if len(observations) > settings.MAX_RECORDS_PER_PULL_WINDOW and batch_window_size > min_window:
+                shrunk = (batch_window_size.total_seconds()
+                          * settings.MAX_RECORDS_PER_PULL_WINDOW / len(observations)
+                          * settings.BACKFILL_WINDOW_SHRINK_SAFETY)
+                batch_window_size = max(min_window, timedelta(seconds=shrunk))
+                individual_state.window_seconds = batch_window_size.total_seconds()
+                await save_cursor_state()
+                logger.info(
+                    f"Window for {log_reference} over cap ({len(observations)} > "
+                    f"{settings.MAX_RECORDS_PER_PULL_WINDOW}); shrunk to {batch_window_size.total_seconds():.0f}s, retrying"
+                )
+                continue
+            if len(observations) > settings.MAX_RECORDS_PER_PULL_WINDOW:
+                logger.warning(
+                    f"Window for {log_reference} at floor ({settings.MIN_BACKFILL_WINDOW_SECONDS}s) still over cap "
+                    f"({len(observations)} observations); sending anyway"
+                )
+
             for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
                 await send_observations_to_gundi(observations=batch, integration_id=integration_id)
 
@@ -385,24 +471,37 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                 # Persist cursors whenever events were processed — sends happened
                 # above, and even if the transform dropped every record, advancing
                 # keeps unusable events from being refetched on the next run.
+                individual_state.scan_from = None
+                resume_from = None
                 await state_manager.set_state(
                     integration_id,
                     CURSOR_STATE_ACTION_ID,
                     json.loads(individual_state.json()),
                     source_id=ind.id,
                 )
+                saved_scan_from = None
             else:
-                # No events in this window: back off from this individual for a while.
-                await state_manager.set_state(
-                    integration_id,
-                    QUIET_STATE_ACTION_ID,
-                    {"quiet": True},
-                    source_id=ind.id,
-                    expire=QUIET_PERIOD_SECONDS,
-                )
+                # Remember how far the empty stretch has been scanned, in case
+                # the run stops before reaching the present.
+                individual_state.scan_from = current_window_start + batch_window_size
+                if end_at >= highest_date:
+                    # Nothing up to the present: back off from this individual for a while.
+                    await state_manager.set_state(
+                        integration_id,
+                        QUIET_STATE_ACTION_ID,
+                        {"quiet": True},
+                        source_id=ind.id,
+                        expire=QUIET_PERIOD_SECONDS,
+                    )
 
             total_observations_sent += len(observations)
             current_window_start = current_window_start + batch_window_size
+
+        if current_window_start > highest_date:
+            # Scanned up to the present: the next run starts from the sensor cursors again.
+            individual_state.scan_from = None
+        if individual_state.scan_from != saved_scan_from:
+            await save_cursor_state()
 
     return {"observations_sent": total_observations_sent}
 

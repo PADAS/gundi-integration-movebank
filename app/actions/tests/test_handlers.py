@@ -371,6 +371,127 @@ async def test_pull_events_respects_max_records_cap(
     assert calls["count"] == 2  # third window never ran
 
 
+def make_sized_events_generator(sizes):
+    """Yields sizes[n] GPS events on the n-th call (the last size repeats) and
+    records each call's (timestamp_start, timestamp_end)."""
+    calls = {"count": 0, "windows": []}
+
+    async def _gen(**kwargs):
+        calls["windows"].append((kwargs["timestamp_start"], kwargs["timestamp_end"]))
+        size = sizes[min(calls["count"], len(sizes) - 1)]
+        base = calls["count"] * 100000
+        calls["count"] += 1
+        for i in range(size):
+            yield _gps_event(base + i, "2026-06-17 00:00:00.000")
+    return _gen, calls
+
+
+@pytest.mark.asyncio
+async def test_pull_events_shrinks_and_refetches_an_overfull_window(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # First window is too dense to send; it is dropped, shrunk, and re-fetched.
+    gen, calls = make_sized_events_generator([3000, 100])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    result = await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config(maximum_lookback_hours=360)
+    )
+
+    first_start, first_end = calls["windows"][0]
+    retry_start, retry_end = calls["windows"][1]
+    assert retry_start == first_start  # cursor did not move
+    assert (retry_end - retry_start) < (first_end - first_start)
+    sent = [obs for call in mock_send.await_args_list for obs in call.kwargs["observations"]]
+    assert len(sent) == result["observations_sent"]
+    assert 0 < result["observations_sent"] < 3000  # the overfull window was never sent
+    saved = IndividualState.parse_obj(mock_state_store[(str(integration.id), "pull_events_for_individual", "111")])
+    assert saved.window_seconds == pytest.approx((retry_end - retry_start).total_seconds())
+
+
+@pytest.mark.asyncio
+async def test_pull_events_reuses_saved_smaller_window(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    state = IndividualState(individual_id="111", study_id="12345", window_seconds=3600)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = state.dict()
+    gen, calls = make_sized_events_generator([10])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
+
+    start, end = calls["windows"][0]
+    assert end - start == timedelta(hours=1)
+
+
+@pytest.mark.asyncio
+async def test_pull_events_sends_overfull_window_at_floor(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    state = IndividualState(individual_id="111", study_id="12345", window_seconds=1)
+    mock_state_store[(str(integration.id), "pull_events_for_individual", "111")] = state.dict()
+    gen, calls = make_sized_events_generator([3000])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    result = await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config()
+    )
+
+    assert calls["count"] == 1
+    assert result["observations_sent"] == 3000
+
+
+@pytest.mark.asyncio
+async def test_pull_events_stops_taking_windows_after_time_budget(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Clock reads: deadline, first loop check, first sensor check -> 0; then past the budget.
+    clock = iter([0, 0, 0])
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: next(clock, 10_000))
+    gen, calls = make_sized_events_generator([100])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    result = await action_pull_events_for_individual(
+        integration=integration,
+        action_config=_sub_action_config(maximum_lookback_hours=360),
+    )
+
+    assert calls["count"] == 1  # the remaining windows wait for the next run
+    assert result["observations_sent"] == 100
+    assert (str(integration.id), "pull_events_for_individual", "111") in mock_state_store
+
+
+@pytest.mark.asyncio
+async def test_pull_events_drops_partial_window_when_budget_runs_out_between_sensors(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Deadline, loop check and the first sensor check fit; the second sensor check does not.
+    clock = iter([0, 0, 0])
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: next(clock, 10_000))
+    gen, calls = make_sized_events_generator([100])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    result = await action_pull_events_for_individual(
+        integration=integration,
+        action_config=_sub_action_config(
+            individual_overrides={"sensor_type_ids": "gps,accessory-measurements"}
+        ),
+    )
+
+    assert calls["count"] == 1
+    assert mock_send.await_count == 0
+    assert result["observations_sent"] == 0
+    # Only the smaller retry window is saved; the event cursor does not move.
+    saved = IndividualState.parse_obj(mock_state_store[(str(integration.id), "pull_events_for_individual", "111")])
+    assert saved.get_sensor_state(653).latest_timestamp == calls["windows"][0][0]
+    assert saved.get_sensor_state(653).highest_event_id == 0
+
+
 def test_compute_batch_window_falls_back_on_nonpositive_span():
     from app.actions.handlers import _compute_batch_window, DEFAULT_BATCH_WINDOW
     # A non-positive span (e.g. timestamp_start >= now) would give a
@@ -2583,3 +2704,173 @@ async def test_auth_logs_carry_no_credentials_or_token(mock_movebank_client, cap
     assert token not in caplog.text
     assert str(integration.id) in caplog.text
 
+
+
+@pytest.mark.asyncio
+async def test_pull_events_resumes_an_empty_stretch_across_runs(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    key = (str(integration.id), "pull_events_for_individual", "111")
+    quiet_key = (str(integration.id), "pull_events_for_individual_quiet", "111")
+    cursor_ts = datetime.now(tz=timezone.utc) - timedelta(days=15)
+    state = IndividualState(individual_id="111", study_id="12345")
+    state.update_sensor_state(653, cursor_ts, 500)
+    mock_state_store[key] = state.dict()
+    gen, calls = make_sized_events_generator([0])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    # Run 1 has time for one empty 5-day window only.
+    clock = iter([0, 0, 0])
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: next(clock, 10_000))
+    await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
+
+    saved = IndividualState.parse_obj(mock_state_store[key])
+    assert saved.scan_from == cursor_ts + timedelta(days=5)
+    assert saved.get_sensor_state(653).latest_timestamp == cursor_ts  # event cursor untouched
+    assert quiet_key not in mock_state_store  # the present was not reached yet
+
+    # Run 2 has time to spare: it starts after the stretch run 1 scanned and reaches the present.
+    mocker.patch("app.actions.handlers.time.monotonic", return_value=0)
+    await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
+
+    assert calls["windows"][1][0] == cursor_ts + timedelta(days=5)
+    assert IndividualState.parse_obj(mock_state_store[key]).scan_from is None
+    assert quiet_key in mock_state_store
+
+
+@pytest.mark.asyncio
+async def test_pull_events_overflow_on_fresh_individual_keeps_its_start(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    key = (str(integration.id), "pull_events_for_individual", "111")
+    gen, calls = make_sized_events_generator([3000, 0])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    # Run 1: the first window overflows, then time runs out before the retry.
+    clock = iter([0, 0, 0])
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: next(clock, 10_000))
+    await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
+
+    first_start = calls["windows"][0][0]
+    saved = IndividualState.parse_obj(mock_state_store[key])
+    assert saved.coverage_start == first_start
+    assert saved.get_sensor_state(653).latest_timestamp == first_start
+    assert saved.get_sensor_state(653).highest_event_id == 0
+
+    # Run 2 starts from the same point, not from a later "now - lookback".
+    mocker.patch("app.actions.handlers.time.monotonic", return_value=0)
+    await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
+    assert calls["windows"][1][0] == first_start
+
+
+@pytest.mark.asyncio
+async def test_pull_events_resumed_run_still_fetches_late_accessory_records(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    key = (str(integration.id), "pull_events_for_individual", "111")
+    accessory = 7842954
+    cursor_ts = datetime.now(tz=timezone.utc) - timedelta(days=15)
+    state = IndividualState(individual_id="111", study_id="12345")
+    state.update_sensor_state(accessory, cursor_ts, 500)
+    mock_state_store[key] = state.dict()
+
+    def accessory_event(event_id, ts):
+        return {**_gps_event(event_id, ts.strftime("%Y-%m-%d %H:%M:%S.000")), "sensor_type_id": str(accessory)}
+
+    records = []  # what Movebank holds; the generator filters like the real API
+
+    async def _gen(**kwargs):
+        for e in records:
+            ts = datetime.strptime(e["timestamp"], "%Y-%m-%d %H:%M:%S.000").replace(tzinfo=timezone.utc)
+            if (kwargs["timestamp_start"] <= ts <= kwargs["timestamp_end"]
+                    and int(e["event_id"]) >= kwargs["minimum_event_id"]):
+                yield e
+    mock_movebank_client.get_individual_events_by_time = _gen
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    accessory_individual = {"sensor_type_ids": "accessory-measurements"}
+
+    # Run 1 scans one empty window, then runs out of time.
+    clock = iter([0, 0, 0])
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: next(clock, 10_000))
+    await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config(individual_overrides=accessory_individual)
+    )
+    assert IndividualState.parse_obj(mock_state_store[key]).scan_from == cursor_ts + timedelta(days=5)
+
+    # Before run 2, a late record arrives just below the cursor, plus a newer one past the resume point.
+    late = accessory_event(900, cursor_ts - timedelta(hours=1))
+    newer = accessory_event(901, cursor_ts + timedelta(days=6))
+    records.extend([late, newer])
+    mocker.patch("app.actions.handlers.time.monotonic", return_value=0)
+    await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config(individual_overrides=accessory_individual)
+    )
+
+    sent_count = sum(len(call.kwargs["observations"]) for call in mock_send.await_args_list)
+    assert sent_count == 2  # the late record was fetched along with the newer one
+
+
+@pytest.mark.asyncio
+async def test_pull_events_keeps_scan_progress_when_slot_runs_out(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from contextlib import asynccontextmanager
+    from app.services.movebank_connections import NoConnectionSlot
+    key = (str(integration.id), "pull_events_for_individual", "111")
+    cursor_ts = datetime.now(tz=timezone.utc) - timedelta(days=15)
+    state = IndividualState(individual_id="111", study_id="12345")
+    state.update_sensor_state(653, cursor_ts, 500)
+    mock_state_store[key] = state.dict()
+    gen, calls = make_sized_events_generator([0])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    slots = {"count": 0}
+
+    @asynccontextmanager
+    async def slot_once(username):
+        slots["count"] += 1
+        if slots["count"] > 1:
+            raise NoConnectionSlot("full")
+        yield
+    mocker.patch("app.actions.handlers.movebank_slot", slot_once)
+
+    result = await action_pull_events_for_individual(integration=integration, action_config=_sub_action_config())
+
+    assert result["skipped"] == "no_connection_slot"
+    assert IndividualState.parse_obj(mock_state_store[key]).scan_from == cursor_ts + timedelta(days=5)
+
+
+@pytest.mark.asyncio
+async def test_pull_events_shrinks_window_when_time_runs_out_between_sensors(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    key = (str(integration.id), "pull_events_for_individual", "111")
+    gen, calls = make_sized_events_generator([100])
+    mock_movebank_client.get_individual_events_by_time = gen
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    config = _sub_action_config(
+        maximum_lookback_hours=360,
+        individual_overrides={"sensor_type_ids": "gps,accessory-measurements"},
+    )
+
+    # Run 1: the first sensor's fetch uses up the budget, so the window is dropped.
+    clock = iter([0, 0, 0])
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: next(clock, 10_000))
+    await action_pull_events_for_individual(integration=integration, action_config=config)
+
+    assert mock_send.await_count == 0
+    first_start, first_end = calls["windows"][0]
+    saved = IndividualState.parse_obj(mock_state_store[key])
+    assert saved.window_seconds == timedelta(days=5).total_seconds() / 2
+
+    # Run 2 retries the same start with the smaller window, and makes progress.
+    mocker.patch("app.actions.handlers.time.monotonic", return_value=0)
+    await action_pull_events_for_individual(integration=integration, action_config=config)
+
+    retry_start, retry_end = calls["windows"][1]
+    assert retry_start == first_start
+    assert retry_end - retry_start == timedelta(days=2.5)
+    assert mock_send.await_count > 0
