@@ -15,6 +15,8 @@ for that, and a second layer here would fire exactly when the client's
 replacement had already been rejected, which is the case not to retry.
 """
 import datetime
+import logging
+import time
 from typing import List
 import stamina
 # app.settings before gundi_client_v2 (see app/services/errors.py).
@@ -23,6 +25,8 @@ from gundi_client_v2.client import GundiClient, GundiDataSenderClient
 
 from .activity_logger import ephemeral_run
 from .retry_policies import is_transient_gundi_error
+
+logger = logging.getLogger(__name__)
 
 
 class EphemeralWriteBlocked(RuntimeError):
@@ -171,7 +175,15 @@ async def send_observations_to_gundi(observations: List[dict], **kwargs) -> dict
     integration_id = kwargs.get("integration_id")
     assert integration_id, "integration_id is required"
     sensors_api_client = await _get_sensors_api_client(integration_id=str(integration_id))
-    return await sensors_api_client.post_observations(data=observations)
+    started = time.monotonic()
+    response = await sensors_api_client.post_observations(data=observations)
+    # Per-batch timing, so the batch size (settings.OBSERVATIONS_BATCH_SIZE) can
+    # be tuned from the logs: how much of a step goes to sending vs fetching.
+    logger.debug(
+        f"Sent {len(observations)} observations to Gundi in {time.monotonic() - started:.2f}s "
+        f"(integration {integration_id})"
+    )
+    return response
 
 
 @stamina.retry(**GUNDI_API_RETRY)
