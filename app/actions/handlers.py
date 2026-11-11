@@ -514,13 +514,35 @@ def _resolve_start(start, ind) -> datetime:
     (BackfillConfig.start). A datetime is also accepted for programmatic callers.
     """
     if isinstance(start, datetime):
-        return start
+        return _clamp_start_to_first_record(start, ind)
     if isinstance(start, str) and start.strip().lower() != "all":
-        return _ensure_utc(parse_date(start))
+        return _clamp_start_to_first_record(_ensure_utc(parse_date(start)), ind)
     # "all"
     if ind.timestamp_start:
         return ind.timestamp_start
     return datetime.now(tz=timezone.utc) - timedelta(days=3650)  # ~10y floor
+
+
+def _clamp_start_to_first_record(start: datetime, ind) -> datetime:
+    """Pull an operator's start up to the individual's first Movebank record
+    (minus BACKFILL_START_CLAMP_MARGIN_SECONDS) when it lies earlier.
+
+    Movebank reports `timestamp_start` per individual; nothing exists before
+    it, so a 2016 start on a tag deployed in 2021 would otherwise send the
+    cascade through five years of empty windows after the real data is done.
+    The margin covers the row's second-level truncation and any event that
+    predates the deployment summary.
+    """
+    if not ind.timestamp_start:
+        return start
+    floor = ind.timestamp_start - timedelta(seconds=settings.BACKFILL_START_CLAMP_MARGIN_SECONDS)
+    if start < floor:
+        logger.info(
+            f"Backfill start {start.isoformat()} for individual {ind.id} precedes its first "
+            f"Movebank record {ind.timestamp_start.isoformat()}; clamped to {floor.isoformat()}"
+        )
+        return floor
+    return start
 
 
 async def _seed_pull_cursor_at_end(integration_id: str, study_id: str, ind, end: datetime) -> None:
@@ -959,6 +981,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
             pass
     min_window = timedelta(seconds=settings.MIN_BACKFILL_WINDOW_SECONDS)
     window = max(window, min_window)
+    max_window = timedelta(seconds=settings.MAX_BACKFILL_WINDOW_SECONDS)
     observations_sent = 0
     # Reverse (recent-first): `cursor` is the LOWER edge of coverage so far — we
     # have covered [cursor, end) and still owe [start, cursor). It begins at
@@ -1067,6 +1090,14 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 _advance_watermarks(state, kept, sensor_type_ids, sensor_type_timestamps, minimum_event_ids)
                 observations_sent += len(observations)
                 cursor = window_lower       # descend
+
+                # An empty window means a data gap or the span before the tag's
+                # first record: widen the next query (bounded) so the gap is
+                # crossed in a handful of fetches. The overflow guard above
+                # shrinks the window again the moment data reappears, at the
+                # cost of one discarded fetch.
+                if not kept and window < max_window:
+                    window = min(max_window, window * settings.BACKFILL_EMPTY_WINDOW_GROWTH)
 
                 blob = json.loads(state.json())
                 blob["scan_from"] = cursor.isoformat()
