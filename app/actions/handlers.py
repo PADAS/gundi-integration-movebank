@@ -517,7 +517,10 @@ def _resolve_start(start, ind) -> datetime:
         return _clamp_start_to_first_record(start, ind)
     if isinstance(start, str) and start.strip().lower() != "all":
         return _clamp_start_to_first_record(_ensure_utc(parse_date(start)), ind)
-    # "all"
+    # "all": the individual's first record itself. Deliberately NOT the clamp
+    # margin: completed "all" runs recorded coverage_start == timestamp_start,
+    # and a margin here would re-queue a one-day sliver for every such
+    # individual on each re-run.
     if ind.timestamp_start:
         return ind.timestamp_start
     return datetime.now(tz=timezone.utc) - timedelta(days=3650)  # ~10y floor
@@ -537,7 +540,7 @@ def _clamp_start_to_first_record(start: datetime, ind) -> datetime:
         return start
     floor = ind.timestamp_start - timedelta(seconds=settings.BACKFILL_START_CLAMP_MARGIN_SECONDS)
     if start < floor:
-        logger.info(
+        logger.debug(
             f"Backfill start {start.isoformat()} for individual {ind.id} precedes its first "
             f"Movebank record {ind.timestamp_start.isoformat()}; clamped to {floor.isoformat()}"
         )
@@ -718,7 +721,16 @@ async def action_backfill(integration, action_config: BackfillConfig):
 
     # Only individuals with a non-empty range are worth queuing.
     queued = [i for i in individuals if i.id in ranges and ranges[i.id][0] < ranges[i.id][1]]
-    range_repr = f"[{action_config.start} .. per-individual coverage floor)"
+    range_repr = f"[{action_config.start} (clamped to each individual's first record) .. per-individual coverage floor)"
+    if isinstance(action_config.start, str) and action_config.start.strip().lower() != "all":
+        operator_start = _ensure_utc(parse_date(action_config.start))
+        clamped = [i for i in queued if ranges[i.id][0] > operator_start]
+        if clamped:
+            logger.info(
+                f"Backfill {job_id}: start {operator_start.date()} precedes the first Movebank record of "
+                f"{len(clamped)} of {len(queued)} individuals; their start was clamped to that record "
+                f"(earliest {min(ranges[i.id][0] for i in clamped).date()})"
+            )
     await job.seed([i.id for i in queued], total=len(queued), range_repr=range_repr)
 
     logger.info(f"Backfill {job_id} for study {action_config.study_id}: {len(queued)} individuals, range {range_repr}")
@@ -980,8 +992,15 @@ async def action_backfill_events_for_individual(integration, action_config: Back
         except (TypeError, ValueError):
             pass
     min_window = timedelta(seconds=settings.MIN_BACKFILL_WINDOW_SECONDS)
+    # Ceiling for empty-window growth: the absolute cap, but never more than a
+    # few density-sized windows, so the first fetch that lands on data again
+    # after a gap is bounded by a known multiple of the per-window record cap.
+    density_window = max(min_window, _compute_batch_window(ind.number_of_events, span_seconds))
+    max_window = max(min_window, min(
+        timedelta(seconds=settings.MAX_BACKFILL_WINDOW_SECONDS),
+        density_window * settings.BACKFILL_EMPTY_WINDOW_MAX_MULTIPLE,
+    ))
     window = max(window, min_window)
-    max_window = timedelta(seconds=settings.MAX_BACKFILL_WINDOW_SECONDS)
     observations_sent = 0
     # Reverse (recent-first): `cursor` is the LOWER edge of coverage so far — we
     # have covered [cursor, end) and still owe [start, cursor). It begins at
@@ -1007,6 +1026,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 window_upper = cursor
                 events = []
                 window_interrupted = False
+                fetched_any = False
                 for stid in sensor_type_ids:
                     # Check BETWEEN per-sensor fetches too, not just between
                     # windows: a dense window's fetches alone can exceed the
@@ -1024,6 +1044,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                             sensor_type_ids=[stid], minimum_event_id=0,
                         ):
                             events.append(event)
+                    fetched_any = True
 
                 if window_interrupted:
                     # Deadline hit mid-window (between sensors): discard the
@@ -1031,6 +1052,21 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                     # (atomicity). Cursor/scan_from stay put; the whole window is
                     # re-fetched next step. Nothing was sent, so there is no
                     # dedup floor to maintain and no duplicate on retry.
+                    if fetched_any and window > min_window:
+                        # A fetch in THIS window was too slow for the budget
+                        # (a grown window landing on dense data, or a slow
+                        # Movebank): halve it so the retry can make progress
+                        # instead of re-running the identical fetch forever.
+                        window = max(min_window, window / 2)
+                        blob = json.loads(state.json())
+                        blob["scan_from"] = cursor.isoformat()
+                        blob["window_seconds"] = window.total_seconds()
+                        await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
+                                                      blob, source_id=watermark_source)
+                        logger.info(
+                            f"Backfill {log_reference}: window fetch outran the step budget; "
+                            f"shrunk to {window.total_seconds():.0f}s for the next step"
+                        )
                     break
 
                 # Timestamp-range ownership: keep only events whose timestamp is
@@ -1097,7 +1133,8 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 # shrinks the window again the moment data reappears, at the
                 # cost of one discarded fetch.
                 if not kept and window < max_window:
-                    window = min(max_window, window * settings.BACKFILL_EMPTY_WINDOW_GROWTH)
+                    growth = max(1.0, settings.BACKFILL_EMPTY_WINDOW_GROWTH)
+                    window = max(min_window, min(max_window, window * growth))
 
                 blob = json.loads(state.json())
                 blob["scan_from"] = cursor.isoformat()

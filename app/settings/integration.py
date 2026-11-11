@@ -44,6 +44,11 @@ BACKFILL_EMPTY_WINDOW_GROWTH = env.float("BACKFILL_EMPTY_WINDOW_GROWTH", 2.0)
 # Ceiling for that growth (seconds). 90 days keeps a single Movebank query
 # bounded even when nothing comes back.
 MAX_BACKFILL_WINDOW_SECONDS = env.int("MAX_BACKFILL_WINDOW_SECONDS", 90 * 86400)
+# Second ceiling on that growth, relative to the individual's density-sized
+# window: the window never grows past this many density windows, so the first
+# fetch that lands on real data again is bounded by about this many times
+# MAX_RECORDS_PER_BACKFILL_WINDOW rows rather than 90 days of a dense tag.
+BACKFILL_EMPTY_WINDOW_MAX_MULTIPLE = env.float("BACKFILL_EMPTY_WINDOW_MAX_MULTIPLE", 8.0)
 # An operator's backfill start earlier than the individual's first Movebank
 # record is pulled up to that record minus this margin, so the cascade stops
 # when it reaches the tag's real history instead of scanning empty years.

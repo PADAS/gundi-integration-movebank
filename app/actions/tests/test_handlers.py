@@ -1284,7 +1284,8 @@ def test_resolve_start_clamps_operator_date_to_first_record(mocker):
     assert _resolve_start(datetime(2016, 1, 1, tzinfo=timezone.utc), ind) == floor
     # Inside the tag's history: untouched.
     assert _resolve_start("2025-06-01", ind) == datetime(2025, 6, 1, tzinfo=timezone.utc)
-    # "all" still means the first record itself.
+    # "all" still means the first record itself (no margin: completed "all"
+    # runs recorded coverage_start == timestamp_start).
     assert _resolve_start("all", ind) == ind.timestamp_start
     # No first record known: nothing to clamp against.
     bare = Individual.parse_obj({**INDIVIDUAL_ROW, "timestamp_start": None})
@@ -1341,6 +1342,54 @@ async def test_backfill_empty_windows_grow_up_to_the_cap(
 
 
 @pytest.mark.asyncio
+async def test_backfill_empty_window_growth_is_bounded_by_density(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # The absolute cap is huge here; growth must still stop at
+    # BACKFILL_EMPTY_WINDOW_MAX_MULTIPLE density-sized windows (60s * 4 = 240s).
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
+        **st.dict(), "scan_from": "2024-01-01T01:00:00+00:00", "window_seconds": 60.0,
+    }
+    starts, ends = [], []
+    def gen(**kwargs):
+        starts.append(kwargs.get("timestamp_start"))
+        ends.append(kwargs.get("timestamp_end"))
+        async def _agen():
+            for _ in ():
+                yield None
+        return _agen()
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 1)
+    mocker.patch("app.actions.handlers.settings.BACKFILL_EMPTY_WINDOW_GROWTH", 2.0)
+    mocker.patch("app.actions.handlers.settings.MAX_BACKFILL_WINDOW_SECONDS", 10 ** 9)
+    mocker.patch("app.actions.handlers.settings.BACKFILL_EMPTY_WINDOW_MAX_MULTIPLE", 4.0)
+    mocker.patch("app.actions.handlers.DEFAULT_BATCH_WINDOW", timedelta(seconds=60))  # density window
+
+    await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    widths = [int((e - s).total_seconds()) for s, e in zip(starts, ends)]
+    assert widths[:4] == [60, 120, 240, 240]
+    assert max(widths) == 240
+
+
+@pytest.mark.asyncio
 async def test_backfill_individual_checks_deadline_between_sensor_fetches(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
@@ -1391,11 +1440,15 @@ async def test_backfill_individual_checks_deadline_between_sensor_fetches(
     assert calls["gps"] == 1
     assert calls["accessory"] == 0  # deadline hit before this sensor's fetch
     assert mock_trigger.await_count == 1
-    # Discard-on-interrupt: the GPS event already fetched must NOT be sent,
-    # and no scan_from/window_seconds is persisted for the (retried) window —
-    # the whole window, including the sensor already fetched, is redone.
+    # Discard-on-interrupt: the GPS event already fetched must NOT be sent and
+    # the cursor must not advance — the whole window, including the sensor
+    # already fetched, is redone. But the fetch itself outran the budget, so
+    # the retry gets a halved window (persisted, like the pull path does)
+    # rather than the identical fetch again.
     assert mock_send.await_count == 0
-    assert mock_state_store.get((str(integration.id), "backfill_watermark", "job-1.111")) is None
+    saved = mock_state_store.get((str(integration.id), "backfill_watermark", "job-1.111"))
+    assert saved["scan_from"] == end.isoformat()                   # cursor unchanged
+    assert saved["window_seconds"] == timedelta(days=5).total_seconds() / 2
 
 
 @pytest.mark.asyncio
