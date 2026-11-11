@@ -1282,6 +1282,9 @@ def test_resolve_start_clamps_operator_date_to_first_record(mocker):
     # Earlier than the tag's history: pulled up to first record minus the margin.
     assert _resolve_start("2016-01-01", ind) == floor
     assert _resolve_start(datetime(2016, 1, 1, tzinfo=timezone.utc), ind) == floor
+    # A naive programmatic datetime is normalised to UTC before the comparison.
+    assert _resolve_start(datetime(2016, 1, 1), ind) == floor
+    assert _resolve_start(datetime(2025, 6, 1), ind) == datetime(2025, 6, 1, tzinfo=timezone.utc)
     # Inside the tag's history: untouched.
     assert _resolve_start("2025-06-01", ind) == datetime(2025, 6, 1, tzinfo=timezone.utc)
     # "all" still means the first record itself (no margin: completed "all"
@@ -1387,6 +1390,46 @@ async def test_backfill_empty_window_growth_is_bounded_by_density(
     widths = [int((e - s).total_seconds()) for s, e in zip(starts, ends)]
     assert widths[:4] == [60, 120, 240, 240]
     assert max(widths) == 240
+
+
+@pytest.mark.asyncio
+async def test_backfill_single_slow_fetch_is_cut_at_the_budget_and_window_halved(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # One sensor only, so there is no between-sensor deadline check: the fetch
+    # itself must be bounded by the remaining budget. An overrun discards the
+    # window, persists a halved window with the cursor unchanged, and
+    # re-triggers, instead of finishing late (and sending) or being
+    # hard-cancelled with the window still persisted.
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
+        **st.dict(), "scan_from": "2024-01-01T01:00:00+00:00", "window_seconds": 600.0,
+    }
+    async def _slow(**kwargs):
+        await asyncio.sleep(0.3)  # far past the (patched) budget
+        yield _gps_event(1, "2024-01-01 00:55:00.000")
+    mock_movebank_client.get_individual_events_by_time = _slow
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 1)
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 0.05)  # 40ms budget
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result["status"] == "continued"
+    assert mock_send.await_count == 0          # the partial window was discarded
+    assert mock_trigger.await_count == 1       # continuation scheduled
+    saved = mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")]
+    assert saved["scan_from"] == "2024-01-01T01:00:00+00:00"   # cursor unchanged
+    assert saved["window_seconds"] == 300.0                    # halved from 600
 
 
 @pytest.mark.asyncio

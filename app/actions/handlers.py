@@ -514,7 +514,7 @@ def _resolve_start(start, ind) -> datetime:
     (BackfillConfig.start). A datetime is also accepted for programmatic callers.
     """
     if isinstance(start, datetime):
-        return _clamp_start_to_first_record(start, ind)
+        return _clamp_start_to_first_record(_ensure_utc(start), ind)
     if isinstance(start, str) and start.strip().lower() != "all":
         return _clamp_start_to_first_record(_ensure_utc(parse_date(start)), ind)
     # "all": the individual's first record itself. Deliberately NOT the clamp
@@ -1034,16 +1034,34 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                     # task would leak in_flight and leave a permanent data gap
                     # (main.py's PubSub endpoint always acks — there is no
                     # redelivery to recover a killed step).
-                    if time.monotonic() >= deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         window_interrupted = True
                         break
-                    async with movebank_slot(auth_config.username):
-                        async for event in mb.get_individual_events_by_time(
-                            study_id=action_config.study_id, individual_id=ind.id,
-                            timestamp_start=window_lower, timestamp_end=window_upper,
-                            sensor_type_ids=[stid], minimum_event_id=0,
-                        ):
-                            events.append(event)
+
+                    async def _fetch_sensor(sensor_type_id=stid):
+                        async with movebank_slot(auth_config.username):
+                            async for event in mb.get_individual_events_by_time(
+                                study_id=action_config.study_id, individual_id=ind.id,
+                                timestamp_start=window_lower, timestamp_end=window_upper,
+                                sensor_type_ids=[sensor_type_id], minimum_event_id=0,
+                            ):
+                                events.append(event)
+
+                    # Bound the fetch itself by the remaining soft budget. A single
+                    # slow fetch (a grown window landing on dense data, or a slow
+                    # Movebank) must not run past the budget: unbounded, it would
+                    # either finish late and proceed to sending, or reach the
+                    # runner's hard cancellation with the enlarged window
+                    # persisted and no continuation scheduled. Timing out here
+                    # routes it through the whole-window discard below, which
+                    # halves the window and re-triggers.
+                    try:
+                        await asyncio.wait_for(_fetch_sensor(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        window_interrupted = True
+                        fetched_any = True
+                        break
                     fetched_any = True
 
                 if window_interrupted:
