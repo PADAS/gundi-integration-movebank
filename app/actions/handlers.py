@@ -72,6 +72,19 @@ def _query_start_for_sensor(sensor_type_id: int, sensor_start: datetime, minimum
     return sensor_start
 
 
+def _window_fetch_outran_budget(window_started_at: float, budget_seconds: float, now: float = None) -> bool:
+    """True when fetching the current window has consumed at least
+    SLOW_WINDOW_BUDGET_FRACTION of the step budget: the window itself is too
+    big (or Movebank too slow) for the budget and should be retried smaller.
+
+    Shared by the pull and backfill loops. Running out of budget on the last
+    window of a step is the normal case and must NOT shrink the window, so
+    the decision is based on how long THIS window's fetching took, not on
+    whether a fetch happened to be in progress at the deadline."""
+    elapsed = (time.monotonic() if now is None else now) - window_started_at
+    return elapsed >= settings.SLOW_WINDOW_BUDGET_FRACTION * budget_seconds
+
+
 def _compute_batch_window(number_of_events, span_seconds) -> timedelta:
     """Shared window-sizing logic for the steady-state pull and backfill:
     high-frequency individuals get a window sized to hold roughly
@@ -371,8 +384,12 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
             events = []
             sensor_event_counts = {}  # per-sensor counts for logging + the fetched-any check
             window_interrupted = False
+            window_started_at = now = None
             for sensor_type_id in sensor_type_ids:
-                if time.monotonic() >= deadline:
+                now = time.monotonic()
+                if window_started_at is None:
+                    window_started_at = now
+                if now >= deadline:
                     window_interrupted = True
                     break
                 sensor_start = sensor_type_timestamps[sensor_type_id]
@@ -416,7 +433,8 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
             if window_interrupted:
                 # Out of time mid-window: nothing from it was sent, so drop the
                 # partial fetch and resume from the saved cursor next tick.
-                if sensor_event_counts and batch_window_size > min_window:
+                if (sensor_event_counts and batch_window_size > min_window
+                        and _window_fetch_outran_budget(window_started_at, 0.5 * settings.MAX_ACTION_EXECUTION_TIME, now=now)):
                     # The fetch itself was too slow for the budget: retry a
                     # smaller window next time so a repeat can still make progress.
                     batch_window_size = max(min_window, batch_window_size / 2)
@@ -687,6 +705,11 @@ async def action_backfill(integration, action_config: BackfillConfig):
     #   - coverage_start set   -> end = coverage_start (fill history behind the pull)
     #   - legacy seed (all event_id 0, no coverage_start) -> end = its timestamp
     #   - legacy real cursor (event_id > 0, no coverage_start) -> skip (unknown floor)
+    # Parse the operator's start once; "all" stays the literal and resolves
+    # per individual to its first record.
+    operator_start = action_config.start
+    if isinstance(operator_start, str) and operator_start.strip().lower() != "all":
+        operator_start = _ensure_utc(parse_date(operator_start))
     ranges = {}
     seed_needed = set()
     skipped_existing = []
@@ -712,7 +735,7 @@ async def action_backfill(integration, action_config: BackfillConfig):
                     f"Backfill {job_id}/{i.id}: coverage span is below the accessory settling "
                     "margin; accessory rows near the boundary may duplicate."
                 )
-        ranges[i.id] = (_resolve_start(action_config.start, i), end_dt)
+        ranges[i.id] = (_resolve_start(operator_start, i), end_dt)
     if skipped_existing:
         logger.warning(
             f"Backfill {job_id}: skipped {len(skipped_existing)} individuals with existing collection "
@@ -721,9 +744,8 @@ async def action_backfill(integration, action_config: BackfillConfig):
 
     # Only individuals with a non-empty range are worth queuing.
     queued = [i for i in individuals if i.id in ranges and ranges[i.id][0] < ranges[i.id][1]]
-    range_repr = f"[{action_config.start} (clamped to each individual's first record) .. per-individual coverage floor)"
-    if isinstance(action_config.start, str) and action_config.start.strip().lower() != "all":
-        operator_start = _ensure_utc(parse_date(action_config.start))
+    if isinstance(operator_start, datetime):
+        range_repr = f"[{action_config.start} (clamped to each individual's first record) .. per-individual coverage floor)"
         clamped = [i for i in queued if ranges[i.id][0] > operator_start]
         if clamped:
             logger.info(
@@ -731,6 +753,8 @@ async def action_backfill(integration, action_config: BackfillConfig):
                 f"{len(clamped)} of {len(queued)} individuals; their start was clamped to that record "
                 f"(earliest {min(ranges[i.id][0] for i in clamped).date()})"
             )
+    else:
+        range_repr = "[each individual's first record .. per-individual coverage floor)"
     await job.seed([i.id for i in queued], total=len(queued), range_repr=range_repr)
 
     logger.info(f"Backfill {job_id} for study {action_config.study_id}: {len(queued)} individuals, range {range_repr}")
@@ -1024,9 +1048,10 @@ async def action_backfill_events_for_individual(integration, action_config: Back
             while cursor > action_config.start and time.monotonic() < deadline:
                 window_lower = max(action_config.start, cursor - window)
                 window_upper = cursor
+                window_clipped = window_lower > cursor - window  # shortened by `start`
                 events = []
                 window_interrupted = False
-                fetched_any = False
+                window_started_at = time.monotonic()
                 for stid in sensor_type_ids:
                     # Check BETWEEN per-sensor fetches too, not just between
                     # windows: a dense window's fetches alone can exceed the
@@ -1060,9 +1085,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                         await asyncio.wait_for(_fetch_sensor(), timeout=remaining)
                     except asyncio.TimeoutError:
                         window_interrupted = True
-                        fetched_any = True
                         break
-                    fetched_any = True
 
                 if window_interrupted:
                     # Deadline hit mid-window (between sensors): discard the
@@ -1070,21 +1093,33 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                     # (atomicity). Cursor/scan_from stay put; the whole window is
                     # re-fetched next step. Nothing was sent, so there is no
                     # dedup floor to maintain and no duplicate on retry.
-                    if fetched_any and window > min_window:
-                        # A fetch in THIS window was too slow for the budget
-                        # (a grown window landing on dense data, or a slow
-                        # Movebank): halve it so the retry can make progress
-                        # instead of re-running the identical fetch forever.
-                        window = max(min_window, window / 2)
-                        blob = json.loads(state.json())
-                        blob["scan_from"] = cursor.isoformat()
-                        blob["window_seconds"] = window.total_seconds()
-                        await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
-                                                      blob, source_id=watermark_source)
-                        logger.info(
-                            f"Backfill {log_reference}: window fetch outran the step budget; "
-                            f"shrunk to {window.total_seconds():.0f}s for the next step"
-                        )
+                    if _window_fetch_outran_budget(window_started_at, 0.8 * settings.MAX_ACTION_EXECUTION_TIME):
+                        # THIS window's fetching ate most of the budget (a grown
+                        # window landing on dense data, or a slow Movebank).
+                        if window > min_window:
+                            # Halve it so the retry can make progress instead
+                            # of re-running the identical fetch.
+                            window = max(min_window, window / 2)
+                            blob = json.loads(state.json())
+                            blob["scan_from"] = cursor.isoformat()
+                            blob["window_seconds"] = window.total_seconds()
+                            await state_manager.set_state(integration_id, BACKFILL_WATERMARK_ACTION_ID,
+                                                          blob, source_id=watermark_source)
+                            logger.info(
+                                f"Backfill {log_reference}: window fetch outran the step budget; "
+                                f"shrunk to {window.total_seconds():.0f}s for the next step"
+                            )
+                        else:
+                            # Already at the floor: nothing smaller to try.
+                            # Fail the step so the attempt counter bounds the
+                            # retries (BACKFILL_MAX_ATTEMPTS) instead of
+                            # re-triggering the identical fetch forever.
+                            raise RuntimeError(
+                                f"window fetch at the {settings.MIN_BACKFILL_WINDOW_SECONDS}s floor "
+                                f"outran the step budget"
+                            )
+                    # Otherwise this is just the normal end of a step: the
+                    # window is fine, the budget was spent on earlier windows.
                     break
 
                 # Timestamp-range ownership: keep only events whose timestamp is
@@ -1150,7 +1185,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                 # crossed in a handful of fetches. The overflow guard above
                 # shrinks the window again the moment data reappears, at the
                 # cost of one discarded fetch.
-                if not kept and window < max_window:
+                if not events and not window_clipped and window < max_window:
                     growth = max(1.0, settings.BACKFILL_EMPTY_WINDOW_GROWTH)
                     window = max(min_window, min(max_window, window * growth))
 

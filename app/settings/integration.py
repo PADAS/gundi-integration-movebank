@@ -53,6 +53,12 @@ BACKFILL_EMPTY_WINDOW_MAX_MULTIPLE = env.float("BACKFILL_EMPTY_WINDOW_MAX_MULTIP
 # record is pulled up to that record minus this margin, so the cascade stops
 # when it reaches the tag's real history instead of scanning empty years.
 BACKFILL_START_CLAMP_MARGIN_SECONDS = env.int("BACKFILL_START_CLAMP_MARGIN_SECONDS", 86400)
+# A window whose fetching consumed at least this fraction of the step budget
+# before the budget ran out is "too slow" and is retried with a halved
+# window. Below it, running out of budget is just the normal end of a step
+# (the last window of every step straddles the deadline) and the window is
+# left alone, so it does not ratchet down to the floor step after step.
+SLOW_WINDOW_BUDGET_FRACTION = env.float("SLOW_WINDOW_BUDGET_FRACTION", 0.5)
 # How long a cancelled backfill job's tombstone lives after the job has drained.
 # PubSub is at-least-once, so a duplicate delivery of an already-processed step
 # can arrive after the job's working state is gone; the tombstone is what makes
