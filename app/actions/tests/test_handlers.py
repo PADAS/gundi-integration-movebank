@@ -17,6 +17,7 @@ from app.actions.handlers import (
     action_backfill_events_for_individual,
     action_pull_events_for_individual,
     action_pull_observations,
+    _resolve_start,
 )
 from app.actions.tests.conftest import INDIVIDUAL_ROW, make_events_generator
 from app.actions.configurations import AuthenticateConfig
@@ -1139,6 +1140,9 @@ async def test_backfill_individual_density_window_applies(
     mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
     mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
     mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    # This test is about the density-sized window; the generator returns no
+    # events, which would otherwise widen the window after each fetch.
+    mocker.patch("app.actions.handlers.settings.BACKFILL_EMPTY_WINDOW_GROWTH", 1.0)
 
     result = await action_backfill_events_for_individual(
         integration=integration,
@@ -1286,6 +1290,327 @@ async def test_backfill_honours_persisted_window_seconds(
     assert ends[0] == datetime(2024, 1, 1, 0, 1, tzinfo=timezone.utc)
 
 
+def test_resolve_start_clamps_operator_date_to_first_record(mocker):
+    from app.actions.client import Individual
+    mocker.patch("app.actions.handlers.settings.BACKFILL_START_CLAMP_MARGIN_SECONDS", 86400)
+    ind = Individual.parse_obj(INDIVIDUAL_ROW)  # timestamp_start 2025-01-01
+    floor = datetime(2024, 12, 31, tzinfo=timezone.utc)
+
+    # Earlier than the tag's history: pulled up to first record minus the margin.
+    assert _resolve_start("2016-01-01", ind) == floor
+    assert _resolve_start(datetime(2016, 1, 1, tzinfo=timezone.utc), ind) == floor
+    # A naive programmatic datetime is normalised to UTC before the comparison.
+    assert _resolve_start(datetime(2016, 1, 1), ind) == floor
+    assert _resolve_start(datetime(2025, 6, 1), ind) == datetime(2025, 6, 1, tzinfo=timezone.utc)
+    # Inside the tag's history: untouched.
+    assert _resolve_start("2025-06-01", ind) == datetime(2025, 6, 1, tzinfo=timezone.utc)
+    # "all" still means the first record itself (no margin: completed "all"
+    # runs recorded coverage_start == timestamp_start).
+    assert _resolve_start("all", ind) == ind.timestamp_start
+    # No first record known: nothing to clamp against.
+    bare = Individual.parse_obj({**INDIVIDUAL_ROW, "timestamp_start": None})
+    assert _resolve_start("2016-01-01", bare) == datetime(2016, 1, 1, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_backfill_empty_windows_grow_up_to_the_cap(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # Every window comes back empty: the window should double after each one
+    # (BACKFILL_EMPTY_WINDOW_GROWTH) until MAX_BACKFILL_WINDOW_SECONDS, so a gap
+    # is crossed in a few fetches instead of one per floor-sized window.
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
+        **st.dict(), "scan_from": "2024-01-01T01:00:00+00:00", "window_seconds": 60.0,
+    }
+    starts, ends = [], []
+    def gen(**kwargs):
+        starts.append(kwargs.get("timestamp_start"))
+        ends.append(kwargs.get("timestamp_end"))
+        async def _agen():
+            for _ in ():
+                yield None
+        return _agen()
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 1)
+    mocker.patch("app.actions.handlers.settings.BACKFILL_EMPTY_WINDOW_GROWTH", 2.0)
+    mocker.patch("app.actions.handlers.settings.MAX_BACKFILL_WINDOW_SECONDS", 480)
+
+    await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 1, 1, tzinfo=timezone.utc),  # 1-hour range
+        ),
+    )
+
+    widths = [int((e - s).total_seconds()) for s, e in zip(starts, ends)]
+    # 60 -> 120 -> 240 -> 480 (cap) -> 480 ... until the hour is covered.
+    assert widths[:5] == [60, 120, 240, 480, 480]
+    assert sum(widths) == 3600
+    assert starts[-1] == datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_backfill_empty_window_growth_is_bounded_by_density(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # The absolute cap is huge here; growth must still stop at
+    # BACKFILL_EMPTY_WINDOW_MAX_MULTIPLE density-sized windows (60s * 4 = 240s).
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
+        **st.dict(), "scan_from": "2024-01-01T01:00:00+00:00", "window_seconds": 60.0,
+    }
+    starts, ends = [], []
+    def gen(**kwargs):
+        starts.append(kwargs.get("timestamp_start"))
+        ends.append(kwargs.get("timestamp_end"))
+        async def _agen():
+            for _ in ():
+                yield None
+        return _agen()
+    mock_movebank_client.get_individual_events_by_time = gen
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 1)
+    mocker.patch("app.actions.handlers.settings.BACKFILL_EMPTY_WINDOW_GROWTH", 2.0)
+    mocker.patch("app.actions.handlers.settings.MAX_BACKFILL_WINDOW_SECONDS", 10 ** 9)
+    mocker.patch("app.actions.handlers.settings.BACKFILL_EMPTY_WINDOW_MAX_MULTIPLE", 4.0)
+    mocker.patch("app.actions.handlers.DEFAULT_BATCH_WINDOW", timedelta(seconds=60))  # density window
+
+    await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    widths = [int((e - s).total_seconds()) for s, e in zip(starts, ends)]
+    assert widths[:4] == [60, 120, 240, 240]
+    assert max(widths) == 240
+
+
+@pytest.mark.asyncio
+async def test_backfill_single_slow_fetch_is_cut_at_the_budget_and_window_halved(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # One sensor only, so there is no between-sensor deadline check: the fetch
+    # itself must be bounded by the remaining budget. An overrun discards the
+    # window, persists a halved window with the cursor unchanged, and
+    # re-triggers, instead of finishing late (and sending) or being
+    # hard-cancelled with the window still persisted.
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
+        **st.dict(), "scan_from": "2024-01-01T01:00:00+00:00", "window_seconds": 600.0,
+    }
+    async def _slow(**kwargs):
+        # An in-range event is buffered BEFORE the fetch stalls, so the test
+        # proves the partial window is discarded rather than merely empty.
+        yield _gps_event(1, "2024-01-01 00:55:00.000")
+        await asyncio.sleep(0.3)  # far past the (patched) budget
+        yield _gps_event(2, "2024-01-01 00:54:00.000")
+    mock_movebank_client.get_individual_events_by_time = _slow
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 1)
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 0.05)  # 40ms budget
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result["status"] == "continued"
+    assert mock_send.await_count == 0          # the partial window was discarded
+    assert mock_trigger.await_count == 1       # continuation scheduled
+    saved = mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")]
+    assert saved["scan_from"] == "2024-01-01T01:00:00+00:00"   # cursor unchanged
+    assert saved["window_seconds"] == 300.0                    # halved from 600
+
+
+def _patch_backfill_job(mocker, **overrides):
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_attempts", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_attempts",
+                 AsyncMock(return_value=overrides.get("attempts", 1)))
+
+
+@pytest.mark.asyncio
+async def test_backfill_normal_end_of_step_does_not_shrink_the_window(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # The last window of (almost) every step straddles the deadline. That is
+    # not a slow fetch: the window must be left alone, or it would ratchet down
+    # to the floor step after step.
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
+        **st.dict(), "scan_from": "2024-06-01T00:00:00+00:00", "window_seconds": 60.0,
+    }
+    async def _quick(**kwargs):
+        await asyncio.sleep(0.002)  # fast fetch; the LOOP runs until the deadline
+        for _ in ():
+            yield None
+    mock_movebank_client.get_individual_events_by_time = _quick
+    _patch_backfill_job(mocker)
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 1)
+    mocker.patch("app.actions.handlers.settings.BACKFILL_EMPTY_WINDOW_GROWTH", 1.0)
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 0.1)  # 80ms budget
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),       # far more windows than the budget allows
+            end=datetime(2024, 6, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result["status"] == "continued"
+    saved = mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")]
+    assert saved["window_seconds"] == 60.0                       # not halved
+    assert saved["scan_from"] < "2024-06-01T00:00:00+00:00"      # and progress was made
+
+
+@pytest.mark.asyncio
+async def test_backfill_slow_fetch_at_the_floor_counts_as_an_attempt(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # At MIN_BACKFILL_WINDOW_SECONDS there is nothing smaller to try, so a fetch
+    # that outruns the budget fails the step through the attempt counter
+    # instead of re-triggering the identical fetch forever.
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
+        **st.dict(), "scan_from": "2024-01-01T01:00:00+00:00", "window_seconds": 600.0,
+    }
+    async def _slow(**kwargs):
+        await asyncio.sleep(0.3)
+        for _ in ():
+            yield None
+    mock_movebank_client.get_individual_events_by_time = _slow
+    _patch_backfill_job(mocker, attempts=1)
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 600)  # already at the floor
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 0.05)
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result == {"status": "retry", "attempts": 1}
+    saved = mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")]
+    assert saved["window_seconds"] == 600.0   # unchanged: nothing smaller to try
+
+
+@pytest.mark.asyncio
+async def test_backfill_clipped_empty_window_does_not_grow(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A window shortened by `start` says nothing about density; an empty result
+    # there must not widen the persisted window.
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
+        **st.dict(), "scan_from": "2024-01-01T00:00:30+00:00", "window_seconds": 60.0,
+    }
+    async def _empty(**kwargs):
+        for _ in ():
+            yield None
+    mock_movebank_client.get_individual_events_by_time = _empty
+    _patch_backfill_job(mocker)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.record_completion", AsyncMock())
+    mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.is_done", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 1, "observations_sent": 0,
+                                          "in_flight": 0, "pending_remaining": 0, "range": "r"}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.next_individual", AsyncMock(return_value=None))
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 1)
+    persisted = []
+    real_set = mock_state_store.__class__  # noqa: F841 (documenting intent)
+    orig = None
+    import app.actions.handlers as h
+    orig_set_state = h.state_manager.set_state
+    async def _capture(*args, **kwargs):
+        if kwargs.get("source_id") == "job-x.111" and isinstance(args[2], dict):
+            persisted.append(args[2].get("window_seconds"))
+        return await orig_set_state(*args, **kwargs)
+    mocker.patch.object(h.state_manager, "set_state", side_effect=_capture)
+
+    await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),   # only 30s left: the window is clipped
+            end=datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert persisted and all(w == 60.0 for w in persisted)
+
+
+@pytest.mark.asyncio
+async def test_backfill_provider_timeout_inside_fetch_reaches_the_retry_handler(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A TimeoutError raised BY the fetch (the provider client giving up) is a
+    # provider failure, not our budget running out: it must go through the
+    # attempt-counted handler (retry -> abandon), not the discard-and-halve
+    # path that resets the counter and would retry forever.
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
+        **st.dict(), "scan_from": "2024-01-01T01:00:00+00:00", "window_seconds": 600.0,
+    }
+    async def _provider_timeout(**kwargs):
+        raise asyncio.TimeoutError("provider read timed out")
+        yield  # pragma: no cover - makes this an async generator
+    mock_movebank_client.get_individual_events_by_time = _provider_timeout
+    _patch_backfill_job(mocker, attempts=2)
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 1)
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 540)  # plenty of budget
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result == {"status": "retry", "attempts": 2}
+    saved = mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")]
+    assert saved["window_seconds"] == 600.0                    # not halved
+    assert saved["scan_from"] == "2024-01-01T01:00:00+00:00"   # cursor unchanged
+
+
 @pytest.mark.asyncio
 async def test_backfill_individual_checks_deadline_between_sensor_fetches(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
@@ -1337,11 +1662,15 @@ async def test_backfill_individual_checks_deadline_between_sensor_fetches(
     assert calls["gps"] == 1
     assert calls["accessory"] == 0  # deadline hit before this sensor's fetch
     assert mock_trigger.await_count == 1
-    # Discard-on-interrupt: the GPS event already fetched must NOT be sent,
-    # and no scan_from/window_seconds is persisted for the (retried) window —
-    # the whole window, including the sensor already fetched, is redone.
+    # Discard-on-interrupt: the GPS event already fetched must NOT be sent and
+    # the cursor must not advance — the whole window, including the sensor
+    # already fetched, is redone. But the fetch itself outran the budget, so
+    # the retry gets a halved window (persisted, like the pull path does)
+    # rather than the identical fetch again.
     assert mock_send.await_count == 0
-    assert mock_state_store.get((str(integration.id), "backfill_watermark", "job-1.111")) is None
+    saved = mock_state_store.get((str(integration.id), "backfill_watermark", "job-1.111"))
+    assert saved["scan_from"] == end.isoformat()                   # cursor unchanged
+    assert saved["window_seconds"] == timedelta(days=5).total_seconds() / 2
 
 
 @pytest.mark.asyncio

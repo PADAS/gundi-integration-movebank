@@ -36,6 +36,29 @@ MIN_BACKFILL_WINDOW_SECONDS = env.int("MIN_BACKFILL_WINDOW_SECONDS", 300)
 # Safety factor when proportionally shrinking the window on overflow, so the
 # resized window aims comfortably below the cap rather than exactly at it.
 BACKFILL_WINDOW_SHRINK_SAFETY = env.float("BACKFILL_WINDOW_SHRINK_SAFETY", 0.8)
+# Growth factor applied to the backfill window after a window that held no
+# events, so an empty stretch (data gap, or the span before the tag's first
+# record) is crossed in a few queries instead of one per floor-sized window.
+# The overflow guard shrinks it again as soon as data reappears.
+BACKFILL_EMPTY_WINDOW_GROWTH = env.float("BACKFILL_EMPTY_WINDOW_GROWTH", 2.0)
+# Ceiling for that growth (seconds). 90 days keeps a single Movebank query
+# bounded even when nothing comes back.
+MAX_BACKFILL_WINDOW_SECONDS = env.int("MAX_BACKFILL_WINDOW_SECONDS", 90 * 86400)
+# Second ceiling on that growth, relative to the individual's density-sized
+# window: the window never grows past this many density windows, so the first
+# fetch that lands on real data again is bounded by about this many times
+# MAX_RECORDS_PER_BACKFILL_WINDOW rows rather than 90 days of a dense tag.
+BACKFILL_EMPTY_WINDOW_MAX_MULTIPLE = env.float("BACKFILL_EMPTY_WINDOW_MAX_MULTIPLE", 8.0)
+# An operator's backfill start earlier than the individual's first Movebank
+# record is pulled up to that record minus this margin, so the cascade stops
+# when it reaches the tag's real history instead of scanning empty years.
+BACKFILL_START_CLAMP_MARGIN_SECONDS = env.int("BACKFILL_START_CLAMP_MARGIN_SECONDS", 86400)
+# A window whose fetching consumed at least this fraction of the step budget
+# before the budget ran out is "too slow" and is retried with a halved
+# window. Below it, running out of budget is just the normal end of a step
+# (the last window of every step straddles the deadline) and the window is
+# left alone, so it does not ratchet down to the floor step after step.
+SLOW_WINDOW_BUDGET_FRACTION = env.float("SLOW_WINDOW_BUDGET_FRACTION", 0.5)
 # How long a cancelled backfill job's tombstone lives after the job has drained.
 # PubSub is at-least-once, so a duplicate delivery of an already-processed step
 # can arrive after the job's working state is gone; the tombstone is what makes
