@@ -1423,8 +1423,11 @@ async def test_backfill_single_slow_fetch_is_cut_at_the_budget_and_window_halved
         **st.dict(), "scan_from": "2024-01-01T01:00:00+00:00", "window_seconds": 600.0,
     }
     async def _slow(**kwargs):
-        await asyncio.sleep(0.3)  # far past the (patched) budget
+        # An in-range event is buffered BEFORE the fetch stalls, so the test
+        # proves the partial window is discarded rather than merely empty.
         yield _gps_event(1, "2024-01-01 00:55:00.000")
+        await asyncio.sleep(0.3)  # far past the (patched) budget
+        yield _gps_event(2, "2024-01-01 00:54:00.000")
     mock_movebank_client.get_individual_events_by_time = _slow
     mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
     mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())

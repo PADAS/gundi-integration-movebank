@@ -75,14 +75,17 @@ async def _cancel_fetch(task: "asyncio.Task") -> None:
     """Cancel an in-flight sensor fetch and wait for it to unwind (releasing
     its Movebank connection slot). The task's own CancelledError is expected;
     anything else it raises while unwinding is logged and dropped — the
-    window is being discarded anyway."""
+    window is being discarded anyway. Cancellation of the calling step is
+    NOT swallowed."""
     task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    except Exception as exc:  # noqa: BLE001 - best-effort unwind
-        logger.warning(f"Backfill fetch raised while being cancelled (ignored): {exc!r}")
+    # Collect the fetch's own outcome, but let cancellation of THIS step
+    # propagate: catching CancelledError around a direct await would also
+    # swallow the runner's hard-deadline cancellation of the handler, which
+    # could then persist state and publish a continuation despite being
+    # cancelled (same split as action_runner._cancel_handler).
+    (outcome,) = await asyncio.gather(task, return_exceptions=True)
+    if isinstance(outcome, Exception):
+        logger.warning(f"Backfill fetch raised while being cancelled (ignored): {outcome!r}")
 
 
 def _window_fetch_outran_budget(window_started_at: float, budget_seconds: float, now: float = None) -> bool:
