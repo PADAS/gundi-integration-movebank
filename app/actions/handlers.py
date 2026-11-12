@@ -41,7 +41,6 @@ HIGH_FREQUENCY_INDIVIDUAL_THRESHOLD = 5000  # events; above this, shrink the fet
 MAXIMUM_RECORDS_PER_INDIVIDUAL = 2000
 DEFAULT_BATCH_WINDOW = timedelta(days=5)
 QUIET_PERIOD_SECONDS = 3600  # skip an individual for this long after an empty window
-OBSERVATIONS_BATCH_SIZE = 200
 
 CURSOR_STATE_ACTION_ID = "pull_events_for_individual"
 QUIET_STATE_ACTION_ID = "pull_events_for_individual_quiet"
@@ -456,7 +455,7 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
                     f"({len(observations)} observations); sending anyway"
                 )
 
-            for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
+            for batch in chunks(observations, settings.OBSERVATIONS_BATCH_SIZE):
                 await send_observations_to_gundi(observations=batch, integration_id=integration_id)
 
             # Advance per-sensor cursors from what actually came back.
@@ -1052,7 +1051,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
 
                 device_name = _display_name(ind)
                 observations = [o for e in kept if (o := build_observation(event=e, device_name=device_name)) is not None]
-                for batch in chunks(observations, OBSERVATIONS_BATCH_SIZE):
+                for batch in chunks(observations, settings.OBSERVATIONS_BATCH_SIZE):
                     await send_observations_to_gundi(observations=batch, integration_id=integration_id)
 
                 # Advances per-sensor state from the kept events, cumulative-max

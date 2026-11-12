@@ -43,3 +43,9 @@ BACKFILL_WINDOW_SHRINK_SAFETY = env.float("BACKFILL_WINDOW_SHRINK_SAFETY", 0.8)
 # comfortably above the commands subscription's message-retention window. It is
 # one small key per cancelled job, and an intentional re-run drops it up front.
 CANCELLED_JOB_TOMBSTONE_SECONDS = env.int("CANCELLED_JOB_TOMBSTONE_SECONDS", 86400)
+
+# Observations per POST to the Gundi Sensors API. Both the steady-state pull
+# and the backfill chunk each window by this before sending. The API accepts
+# or rejects a batch as a whole and the send helper retries a whole batch, so
+# a larger value trades fewer round trips for more work lost per rejection.
+OBSERVATIONS_BATCH_SIZE = env.int("OBSERVATIONS_BATCH_SIZE", 200)
