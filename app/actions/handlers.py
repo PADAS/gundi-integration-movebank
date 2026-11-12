@@ -72,6 +72,20 @@ def _query_start_for_sensor(sensor_type_id: int, sensor_start: datetime, minimum
     return sensor_start
 
 
+async def _cancel_fetch(task: "asyncio.Task") -> None:
+    """Cancel an in-flight sensor fetch and wait for it to unwind (releasing
+    its Movebank connection slot). The task's own CancelledError is expected;
+    anything else it raises while unwinding is logged and dropped — the
+    window is being discarded anyway."""
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - best-effort unwind
+        logger.warning(f"Backfill fetch raised while being cancelled (ignored): {exc!r}")
+
+
 def _window_fetch_outran_budget(window_started_at: float, budget_seconds: float, now: float = None) -> bool:
     """True when fetching the current window has consumed at least
     SLOW_WINDOW_BUDGET_FRACTION of the step budget: the window itself is too
@@ -1078,12 +1092,24 @@ async def action_backfill_events_for_individual(integration, action_config: Back
                     # Movebank) must not run past the budget: unbounded, it would
                     # either finish late and proceed to sending, or reach the
                     # runner's hard cancellation with the enlarged window
-                    # persisted and no continuation scheduled. Timing out here
-                    # routes it through the whole-window discard below, which
-                    # halves the window and re-triggers.
+                    # persisted and no continuation scheduled. Our own deadline
+                    # routes it through the whole-window discard below (halve and
+                    # re-trigger). Deliberately asyncio.wait + task.result() rather
+                    # than wait_for: a timeout raised BY the fetch (the provider
+                    # client's own TimeoutError) is the fetch failing, not budget
+                    # exhaustion, and must reach the attempt-counted handler
+                    # below like any other provider error (same split as
+                    # action_runner's handler deadline).
+                    fetch_task = asyncio.ensure_future(_fetch_sensor())
                     try:
-                        await asyncio.wait_for(_fetch_sensor(), timeout=remaining)
-                    except asyncio.TimeoutError:
+                        done, _ = await asyncio.wait({fetch_task}, timeout=remaining)
+                    except asyncio.CancelledError:
+                        await _cancel_fetch(fetch_task)
+                        raise
+                    if done:
+                        fetch_task.result()  # re-raises the fetch's own exception unchanged
+                    else:
+                        await _cancel_fetch(fetch_task)
                         window_interrupted = True
                         break
 

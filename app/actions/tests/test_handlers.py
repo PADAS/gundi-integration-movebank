@@ -1557,6 +1557,41 @@ async def test_backfill_clipped_empty_window_does_not_grow(
 
 
 @pytest.mark.asyncio
+async def test_backfill_provider_timeout_inside_fetch_reaches_the_retry_handler(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    # A TimeoutError raised BY the fetch (the provider client giving up) is a
+    # provider failure, not our budget running out: it must go through the
+    # attempt-counted handler (retry -> abandon), not the discard-and-halve
+    # path that resets the counter and would retry forever.
+    st = IndividualState(individual_id="111", study_id="12345")
+    mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")] = {
+        **st.dict(), "scan_from": "2024-01-01T01:00:00+00:00", "window_seconds": 600.0,
+    }
+    async def _provider_timeout(**kwargs):
+        raise asyncio.TimeoutError("provider read timed out")
+        yield  # pragma: no cover - makes this an async generator
+    mock_movebank_client.get_individual_events_by_time = _provider_timeout
+    _patch_backfill_job(mocker, attempts=2)
+    mocker.patch("app.actions.handlers.settings.MIN_BACKFILL_WINDOW_SECONDS", 1)
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 540)  # plenty of budget
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-x",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result == {"status": "retry", "attempts": 2}
+    saved = mock_state_store[(str(integration.id), "backfill_watermark", "job-x.111")]
+    assert saved["window_seconds"] == 600.0                    # not halved
+    assert saved["scan_from"] == "2024-01-01T01:00:00+00:00"   # cursor unchanged
+
+
+@pytest.mark.asyncio
 async def test_backfill_individual_checks_deadline_between_sensor_fetches(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
