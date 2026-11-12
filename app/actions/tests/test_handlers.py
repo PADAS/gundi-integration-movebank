@@ -141,6 +141,23 @@ async def test_pull_events_sends_observations_and_updates_cursor(
 
 
 @pytest.mark.asyncio
+async def test_pull_events_chunks_sends_by_configured_batch_size(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    mocker.patch("app.actions.handlers.settings.OBSERVATIONS_BATCH_SIZE", 2)
+    events = [_gps_event(100 + i, f"2026-01-01 1{i}:00:00.000") for i in range(5)]
+    mock_movebank_client.get_individual_events_by_time = make_events_generator(events)
+    mock_send = mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+
+    result = await action_pull_events_for_individual(
+        integration=integration, action_config=_sub_action_config()
+    )
+
+    assert result["observations_sent"] == 5
+    assert [len(call.kwargs["observations"]) for call in mock_send.await_args_list] == [2, 2, 1]
+
+
+@pytest.mark.asyncio
 async def test_pull_events_skips_individual_in_quiet_period(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
