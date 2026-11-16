@@ -1329,6 +1329,39 @@ async def test_backfill_lease_loss_stops_the_running_step(
 
 
 @pytest.mark.asyncio
+async def test_backfill_unconfirmed_lease_stops_the_step_once_it_would_have_expired(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    """Renewals that error (Redis unreachable) keep the worker going only until
+    the last confirmed lease expiry; after that a redelivery may own the step."""
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from datetime import datetime, timezone
+    mocker.patch("app.actions.handlers.settings.BACKFILL_STEP_LEASE_SECONDS", 0.3)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.renew_step_lease", AsyncMock(side_effect=ConnectionError("redis down")))
+    mock_finish = mocker.patch("app.actions.backfill_queue.BackfillJob.finish_step", AsyncMock(return_value=True))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    async def _slow(**kwargs):
+        await asyncio.sleep(5)
+        yield _gps_event(100, "2025-06-01 10:00:00.000")
+    mock_movebank_client.get_individual_events_by_time = _slow
+
+    started = time.monotonic()
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", step_seq=2,
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    elapsed = time.monotonic() - started
+    assert result == {"status": "superseded", "step_seq": 2}
+    assert 0.3 <= elapsed < 2          # ran through the lease, not beyond it (and not for the whole fetch)
+    assert not mock_trigger.called and not mock_finish.called
+
+
+@pytest.mark.asyncio
 async def test_backfill_individual_abandoned_after_max_attempts(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):

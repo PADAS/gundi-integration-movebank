@@ -993,6 +993,9 @@ class _StepLease:
     lost: bool = False
     task: Optional[asyncio.Task] = None
     heartbeat: Optional[asyncio.Task] = None
+    # Monotonic time until which Redis last confirmed the lease is ours. Set on
+    # claim and on every successful renewal; renewals that error cannot move it.
+    expires_at: float = 0.0
 
 
 @activity_logger()
@@ -1015,6 +1018,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     if claim != STEP_ACQUIRED:
         logger.info(f"Backfill {log_reference}: duplicate delivery of step {seq} ({claim}); skipped")
         return {"status": "duplicate", "step_seq": seq}
+    lease.expires_at = time.monotonic() + settings.BACKFILL_STEP_LEASE_SECONDS
 
     lease.heartbeat = asyncio.create_task(_hold_backfill_step_lease(job, ind.id, lease, log_reference))
     try:
@@ -1080,14 +1084,23 @@ async def _hold_backfill_step_lease(job: BackfillJob, individual_id: str, lease:
         try:
             renewed = await job.renew_step_lease(individual_id, lease.token, ttl_seconds=ttl)
         except Exception as exc:
-            logger.warning(f"Backfill {log_reference}: step lease renewal failed: {exc}")
-            continue
+            # Redis did not answer. The lease is still ours until the last
+            # confirmed expiry; past that, a redelivery may already hold it, so
+            # stop exactly as if the renewal had said so.
+            if time.monotonic() < lease.expires_at:
+                logger.warning(f"Backfill {log_reference}: step lease renewal failed; "
+                               f"{lease.expires_at - time.monotonic():.0f}s of lease left: {exc}")
+                continue
+            logger.warning(f"Backfill {log_reference}: step lease renewal failed and the lease has "
+                           f"expired unconfirmed; stopping: {exc}")
+            renewed = False
         if not renewed:
             logger.warning(f"Backfill {log_reference}: step lease lost; stopping in favour of the newer delivery")
             lease.lost = True
             if lease.task is not None:
                 lease.task.cancel()
             return
+        lease.expires_at = time.monotonic() + ttl
 
 
 async def _publish_next_step(job: BackfillJob, integration_id: str,
