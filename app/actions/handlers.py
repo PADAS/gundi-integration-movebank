@@ -1097,7 +1097,11 @@ async def _hold_backfill_step_lease(job: BackfillJob, individual_id: str, lease:
     while True:
         await asyncio.sleep(ttl / 3)
         try:
-            renewed = await job.renew_step_lease(individual_id, lease.token, ttl_seconds=ttl)
+            # Bounded: a renewal that hangs (Redis not answering at all) must
+            # not keep this loop from noticing that the lease has expired.
+            renewed = await asyncio.wait_for(
+                job.renew_step_lease(individual_id, lease.token, ttl_seconds=ttl), timeout=ttl / 3
+            )
         except Exception as exc:
             # Redis did not answer. The lease is still ours until the last
             # confirmed expiry; past that, a redelivery may already hold it, so

@@ -1369,6 +1369,40 @@ async def test_backfill_unconfirmed_lease_stops_the_step_and_republishes_it(
 
 
 @pytest.mark.asyncio
+async def test_backfill_hung_lease_renewal_still_stops_the_step_at_expiry(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store, mock_step_claim_and_delay
+):
+    """A renewal call that never returns is bounded by the heartbeat interval,
+    so the expiry check still runs and the step is stopped and re-published."""
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from datetime import datetime, timezone
+    mocker.patch("app.actions.handlers.settings.BACKFILL_STEP_LEASE_SECONDS", 0.3)
+    async def _hang(*a, **k):
+        await asyncio.sleep(30)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.renew_step_lease", AsyncMock(side_effect=_hang))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.release_step", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    async def _slow(**kwargs):
+        await asyncio.sleep(5)
+        yield _gps_event(100, "2025-06-01 10:00:00.000")
+    mock_movebank_client.get_individual_events_by_time = _slow
+
+    started = time.monotonic()
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", step_seq=1,
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result == {"status": "retry", "reason": "lease_unconfirmed", "step_seq": 1}
+    assert time.monotonic() - started < 2
+    assert mock_trigger.await_args_list[0].kwargs["config"].step_seq == 1
+
+
+@pytest.mark.asyncio
 async def test_backfill_individual_abandoned_after_max_attempts(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
