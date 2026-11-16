@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import random
 import json
 import logging
 import time
@@ -9,6 +10,7 @@ from typing import Optional
 import pydantic
 from dateutil.parser import parse as parse_date
 from movebank_client import MovebankClient
+from movebank_client.errors import MBRateLimitError
 
 import app.actions.client as client
 from app.actions.core import action_title
@@ -810,6 +812,19 @@ async def action_backfill(integration, action_config: BackfillConfig):
     }
 
 
+def _next_step(action_config: BackfillEventsForIndividualConfig) -> BackfillEventsForIndividualConfig:
+    """The config to publish for this individual's next step (step_seq + 1)."""
+    return action_config.copy(update={"step_seq": action_config.step_seq + 1})
+
+
+async def _delay_before_retrigger(base_seconds: int) -> None:
+    """Wait inside the step before re-publishing it, +/-50% jitter, capped at 60s
+    so a late refusal still finishes under the step's hard cancel."""
+    if base_seconds <= 0:
+        return
+    await asyncio.sleep(min(60.0, base_seconds * random.uniform(0.5, 1.5)))
+
+
 async def _dispatch_backfill_individual(integration_id, job, individual_id):
     """Read the stored per-individual config and trigger the sub-action.
 
@@ -827,7 +842,8 @@ async def _dispatch_backfill_individual(integration_id, job, individual_id):
             return
         blob = await job.get_individual_config(individual_id)
         if blob is not None:
-            cfg = BackfillEventsForIndividualConfig.parse_raw(blob)
+            cfg = BackfillEventsForIndividualConfig.parse_raw(blob).copy(update={"step_seq": 0})
+            await job.reset_steps(individual_id)
             await job.incr_in_flight()
             try:
                 await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=cfg)
@@ -967,6 +983,14 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     job = BackfillJob(integration_id, action_config.job_id)
     watermark_source = f"{action_config.job_id}.{ind.id}"
     log_reference = f"job:{action_config.job_id},individual:{ind.id}"
+
+    # Pub/Sub is at-least-once. A second delivery of a step that already ran
+    # (or is still running) must not start a second chain: every chain is
+    # self-perpetuating, so one duplicate becomes a permanent parallel worker
+    # fetching and sending the same windows. Claim this step's number first.
+    if not await job.claim_step(ind.id, action_config.step_seq):
+        logger.info(f"Backfill {log_reference}: duplicate delivery of step {action_config.step_seq}; skipped")
+        return {"status": "duplicate", "step_seq": action_config.step_seq}
 
     if await job.is_cancelled():
         # Every continuation path (dispatch, continued, retry, backoff) re-enters
@@ -1245,13 +1269,24 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     except NoConnectionSlot:
         # No connection slot available: re-trigger THIS individual (same in-flight
         # unit continues) rather than losing the step or double-counting in-flight.
-        await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=action_config)
+        # Wait first: an immediate re-publish loops hundreds of times per pull
+        # tick while the slots are busy, and every push is a duplicate-delivery risk.
+        await _delay_before_retrigger(settings.BACKFILL_NO_SLOT_RETRY_DELAY_SECONDS)
+        await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=_next_step(action_config))
         logger.info(f"Backfill {action_config.job_id}/{ind.id}: no connection slot, backing off")
         return {"status": "backoff"}
+    except MBRateLimitError as exc:
+        # Movebank asked us to slow down. Not a failed attempt: wait, then resume
+        # from the persisted cursor without touching the attempts counter.
+        await _delay_before_retrigger(settings.BACKFILL_RATE_LIMIT_RETRY_DELAY_SECONDS)
+        await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=_next_step(action_config))
+        logger.info(f"Backfill {action_config.job_id}/{ind.id}: Movebank rate limited ({exc}); resuming after a pause")
+        return {"status": "rate_limited"}
     except Exception as exc:
         attempts = await job.incr_attempts(ind.id)
         if attempts <= BACKFILL_MAX_ATTEMPTS:
-            await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=action_config)
+            await _delay_before_retrigger(settings.BACKFILL_NO_SLOT_RETRY_DELAY_SECONDS)
+            await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=_next_step(action_config))
             logger.info(f"Backfill {action_config.job_id}/{ind.id}: attempt {attempts} failed ({exc}); retrying")
             return {"status": "retry", "attempts": attempts}
         logger.warning(f"Backfill {action_config.job_id}/{ind.id}: abandoned after {attempts} attempts: {exc}")
@@ -1277,7 +1312,7 @@ async def action_backfill_events_for_individual(integration, action_config: Back
         # Budget exhausted mid-range: continue THIS individual on the next step
         # (descending from the persisted cursor).
         await trigger_action(
-            integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=action_config,
+            integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=_next_step(action_config),
         )
         logger.info(f"Backfill {log_reference} continued at {cursor.isoformat()} ({observations_sent} obs this step)")
         return {"status": "continued", "observations_sent": observations_sent}

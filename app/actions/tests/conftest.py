@@ -25,6 +25,18 @@ def mock_connection_slot(mocker):
 
 
 @pytest.fixture(autouse=True)
+def mock_step_claim_and_delay(mocker, request):
+    """Every delivery is the legitimate next step, and re-trigger waits are
+    instant, unless a test re-patches these to exercise them. The queue's own
+    tests exercise the real claim against the fake Redis, so they are exempt."""
+    if request.module.__name__.endswith("test_backfill_queue"):
+        return None
+    mocker.patch("app.actions.backfill_queue.BackfillJob.claim_step", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.reset_steps", AsyncMock(return_value=None))
+    return mocker.patch("app.actions.handlers._delay_before_retrigger", AsyncMock(return_value=None))
+
+
+@pytest.fixture(autouse=True)
 def mock_state_manager_redis(mocker):
     """Stub the state manager's Redis calls so handler tests don't need a live
     Redis. Tests that care about specific saved state re-patch state_manager

@@ -162,3 +162,43 @@ async def test_retired_tombstone_stops_reporting_cancelled_once_expired(job, fak
     fake_backfill_redis.store["hashes"].pop(job._meta)
     assert await job.is_cancelled() is False
     assert await job.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_claim_step_accepts_each_step_once_in_order(job):
+    assert await job.claim_step("ind-1", 0) is True
+    assert await job.claim_step("ind-1", 0) is False   # duplicate delivery of step 0
+    assert await job.claim_step("ind-1", 1) is True    # the re-trigger
+    assert await job.claim_step("ind-1", 0) is False   # late duplicate of step 0
+    assert await job.claim_step("ind-1", 1) is False   # duplicate of step 1
+    assert await job.claim_step("ind-1", 2) is True
+
+
+@pytest.mark.asyncio
+async def test_claim_step_rejected_duplicate_does_not_block_the_next_step(job):
+    assert await job.claim_step("ind-1", 0) is True
+    assert await job.claim_step("ind-1", 0) is False
+    assert await job.claim_step("ind-1", 1) is True
+
+
+@pytest.mark.asyncio
+async def test_claim_step_without_a_counter_accepts_a_legacy_message(job):
+    # A chain started before step numbering existed carries no seq; whatever
+    # it sends first is accepted and counting starts there.
+    assert await job.claim_step("ind-1", 7) is True
+    assert await job.claim_step("ind-1", 7) is False
+    assert await job.claim_step("ind-1", 8) is True
+
+
+@pytest.mark.asyncio
+async def test_reset_steps_lets_a_fresh_dispatch_start_at_zero(job):
+    assert await job.claim_step("ind-1", 0) is True
+    assert await job.claim_step("ind-1", 1) is True
+    await job.reset_steps("ind-1")
+    assert await job.claim_step("ind-1", 0) is True
+
+
+@pytest.mark.asyncio
+async def test_claim_step_counters_are_per_individual(job):
+    assert await job.claim_step("ind-1", 0) is True
+    assert await job.claim_step("ind-2", 0) is True

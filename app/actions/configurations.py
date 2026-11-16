@@ -116,3 +116,9 @@ class BackfillEventsForIndividualConfig(InternalActionConfiguration):
     job_id: str
     start: datetime
     end: datetime
+    # Position of this step in the individual's chain. Each re-trigger publishes
+    # step_seq + 1; the step claims its number in Redis before running, so a
+    # duplicate Pub/Sub delivery of an already-started step is acked and skipped
+    # instead of spawning a second, parallel chain. Absent on messages published
+    # before this field existed, which the claim treats as the first step.
+    step_seq: int = 0

@@ -76,6 +76,32 @@ class BackfillJob:
     async def reset_attempts(self, individual_id: str) -> None:
         await self.db.hdel(self._meta, f"attempts.{individual_id}")
 
+    async def claim_step(self, individual_id: str, seq: int) -> bool:
+        """Claim step number `seq` of this individual's chain. Returns True when
+        `seq` is the next step to run, False for a duplicate delivery.
+
+        The meta hash keeps `seq.<id>` = number of steps already started. A
+        delivery is the legitimate next step exactly when its seq equals that
+        count; the increment-then-check keeps two deliveries of the same step
+        from both passing (the second sees count + 2 and backs out). A missing
+        counter means a chain started before step numbering existed, or a fresh
+        dispatch: accept it and start counting from its seq.
+        """
+        field = f"seq.{individual_id}"
+        if await self.db.hget(self._meta, field) is None:
+            await self.db.hset(self._meta, mapping={field: seq + 1})
+            return True
+        started = await self.db.hincrby(self._meta, field, 1)
+        if started == seq + 1:
+            return True
+        await self.db.hincrby(self._meta, field, -1)
+        return False
+
+    async def reset_steps(self, individual_id: str) -> None:
+        """Forget the chain position before a fresh dispatch, so the new chain's
+        step 0 is not mistaken for a duplicate of the old one."""
+        await self.db.hdel(self._meta, f"seq.{individual_id}")
+
     async def exists(self) -> bool:
         """Whether this job has already been seeded (i.e. is active). Used to
         make action_backfill's seed step idempotent against a redelivered or
