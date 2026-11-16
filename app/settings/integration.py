@@ -82,3 +82,11 @@ OBSERVATIONS_BATCH_SIZE = env.int("OBSERVATIONS_BATCH_SIZE", 200)
 # Both stay well inside the 540s step cancel even when raised late in a step.
 BACKFILL_NO_SLOT_RETRY_DELAY_SECONDS = env.int("BACKFILL_NO_SLOT_RETRY_DELAY_SECONDS", 15)
 BACKFILL_RATE_LIMIT_RETRY_DELAY_SECONDS = env.int("BACKFILL_RATE_LIMIT_RETRY_DELAY_SECONDS", 45)
+
+# Lease on a running backfill step (one per individual). The step renews it every
+# third of this period; a step that dies without handing off loses it after one
+# period, and a redelivery of that step then takes over. A delivery that finds
+# the lease held waits up to 1.5 periods, polling, before treating itself as a
+# duplicate; that wait counts against the step's own time budget.
+BACKFILL_STEP_LEASE_SECONDS = env.int("BACKFILL_STEP_LEASE_SECONDS", 30)
+BACKFILL_STEP_CLAIM_POLL_SECONDS = env.float("BACKFILL_STEP_CLAIM_POLL_SECONDS", 3.0)

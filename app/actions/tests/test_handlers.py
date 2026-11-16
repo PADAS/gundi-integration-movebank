@@ -19,7 +19,14 @@ from app.actions.handlers import (
     action_pull_observations,
     _resolve_start,
 )
+from app.actions.backfill_queue import BackfillJob as _BackfillJob
 from app.actions.tests.conftest import INDIVIDUAL_ROW, make_events_generator
+
+# Captured at import, before the autouse fixture stubs them for each test.
+_REAL_BACKFILL_JOB_METHODS = {
+    name: getattr(_BackfillJob, name)
+    for name in ("claim_step", "renew_step_lease", "finish_step", "release_step", "reset_steps")
+}
 from app.actions.configurations import AuthenticateConfig
 
 
@@ -990,7 +997,9 @@ async def test_backfill_individual_duplicate_delivery_is_acked_without_running(
 ):
     from app.actions.configurations import BackfillEventsForIndividualConfig
     from datetime import datetime, timezone
-    mocker.patch("app.actions.backfill_queue.BackfillJob.claim_step", AsyncMock(return_value=False))
+    from app.actions.backfill_queue import STEP_STALE
+    mocker.patch("app.actions.backfill_queue.BackfillJob.claim_step", AsyncMock(return_value=STEP_STALE))
+    mock_finish = mocker.patch("app.actions.backfill_queue.BackfillJob.finish_step", AsyncMock())
     mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
     mock_cancelled = mocker.patch("app.actions.backfill_queue.BackfillJob.is_cancelled", AsyncMock(return_value=False))
     mock_decr = mocker.patch("app.actions.backfill_queue.BackfillJob.decr_in_flight", AsyncMock(return_value=0))
@@ -1009,6 +1018,7 @@ async def test_backfill_individual_duplicate_delivery_is_acked_without_running(
     assert not mock_movebank_client.get_individual_events_by_time.called
     assert not mock_decr.called
     assert not mock_cancelled.called
+    assert not mock_finish.called    # a skipped duplicate never advances the chain
 
 
 @pytest.mark.asyncio
@@ -1021,7 +1031,10 @@ async def test_backfill_individual_retriggers_carry_the_next_step_number(
     def _raise(*a, **k):
         raise NoConnectionSlot("full")
     mocker.patch("app.actions.handlers.movebank_slot", _raise)
-    mock_claim = mocker.patch("app.actions.backfill_queue.BackfillJob.claim_step", AsyncMock(return_value=True))
+    from unittest.mock import ANY
+    from app.actions.backfill_queue import STEP_ACQUIRED
+    mock_claim = mocker.patch("app.actions.backfill_queue.BackfillJob.claim_step", AsyncMock(return_value=STEP_ACQUIRED))
+    mock_finish = mocker.patch("app.actions.backfill_queue.BackfillJob.finish_step", AsyncMock(return_value=True))
     mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
     mocker.patch("app.actions.handlers.settings.BACKFILL_NO_SLOT_RETRY_DELAY_SECONDS", 15)
 
@@ -1034,10 +1047,117 @@ async def test_backfill_individual_retriggers_carry_the_next_step_number(
     )
 
     assert result["status"] == "backoff"
-    mock_claim.assert_awaited_once_with("111", 4)
+    mock_claim.assert_awaited_once_with("111", 4, ANY, ttl_seconds=ANY)
+    # Handed off with the same lease token it claimed with.
+    token = mock_claim.await_args.args[2]
+    mock_finish.assert_awaited_once_with("111", 4, token)
     # Waited before re-publishing, and published the NEXT step, not this one again.
     mock_step_claim_and_delay.assert_awaited_once_with(15)
     assert mock_trigger.await_args_list[0].kwargs["config"].step_seq == 5
+
+
+def _real_step_lease(mocker):
+    """Undo the autouse claim stubs so the handler drives the real lease
+    scripts against fake_backfill_redis."""
+    from app.actions.backfill_queue import BackfillJob
+    for name in ("claim_step", "renew_step_lease", "finish_step", "release_step", "reset_steps"):
+        mocker.patch.object(BackfillJob, name, _REAL_BACKFILL_JOB_METHODS[name])
+
+
+@pytest.mark.asyncio
+async def test_backfill_step_that_fails_after_claiming_runs_again_on_redelivery(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store, fake_backfill_redis,
+):
+    # Review on PR 38: a step that dies after claiming (here a Redis error on the
+    # cancelled check) must not leave a permanent "started" mark that makes its
+    # redelivery look like a duplicate. No successor exists in that case, so
+    # dropping the redelivery would strand the individual with in_flight held.
+    from app.actions.backfill_queue import BackfillJob
+    _real_step_lease(mocker)
+    mocker.patch("app.actions.backfill_queue._client", return_value=fake_backfill_redis)
+    job = BackfillJob(str(integration.id), "job-1")
+    await job.seed([], total=1, range_repr="r")
+    await job.incr_in_flight()
+    mocker.patch.object(BackfillJob, "is_cancelled",
+                        AsyncMock(side_effect=[ConnectionError("redis blip"), False]))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    cfg = BackfillEventsForIndividualConfig(
+        study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", step_seq=2,
+        start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(ConnectionError):
+        await action_backfill_events_for_individual(integration=integration, action_config=cfg)
+    # The lease went back; the chain did not advance.
+    assert fake_backfill_redis.store["strings"] == {}
+
+    redelivered = await action_backfill_events_for_individual(integration=integration, action_config=cfg)
+
+    assert redelivered["status"] != "duplicate"
+    assert mock_movebank_client.get_individual_events_by_time.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_step_redelivered_while_holder_is_dead_takes_over_once_the_lease_lapses(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store, fake_backfill_redis,
+):
+    # A worker killed mid-step (OOM, instance loss) never releases its lease.
+    # The redelivery waits; the lease lapses inside that wait; the redelivery runs.
+    from app.actions.backfill_queue import BackfillJob
+    _real_step_lease(mocker)
+    mocker.patch("app.actions.backfill_queue._client", return_value=fake_backfill_redis)
+    mocker.patch("app.actions.handlers.settings.BACKFILL_STEP_CLAIM_POLL_SECONDS", 0)
+    job = BackfillJob(str(integration.id), "job-1")
+    await job.seed([], total=1, range_repr="r")
+    assert await job.claim_step("111", 2, "dead-worker", ttl_seconds=30) == "acquired"
+    lease_key = job._lease("111")
+    real_claim = _REAL_BACKFILL_JOB_METHODS["claim_step"]
+    calls = []
+
+    async def claim_then_lapse(self, *args, **kwargs):
+        calls.append(args)
+        if len(calls) == 2:
+            fake_backfill_redis.store["strings"].pop(lease_key, None)   # the TTL runs out
+        return await real_claim(self, *args, **kwargs)
+
+    mocker.patch.object(BackfillJob, "claim_step", claim_then_lapse)
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    cfg = BackfillEventsForIndividualConfig(
+        study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", step_seq=2,
+        start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    result = await action_backfill_events_for_individual(integration=integration, action_config=cfg)
+
+    assert result["status"] != "duplicate"
+    assert len(calls) == 2
+    assert mock_movebank_client.get_individual_events_by_time.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_step_held_by_a_live_worker_is_skipped_after_one_lease_period(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store, fake_backfill_redis,
+):
+    from app.actions.backfill_queue import BackfillJob
+    _real_step_lease(mocker)
+    mocker.patch("app.actions.backfill_queue._client", return_value=fake_backfill_redis)
+    mocker.patch("app.actions.handlers.settings.BACKFILL_STEP_LEASE_SECONDS", 0)
+    mocker.patch("app.actions.handlers.settings.BACKFILL_STEP_CLAIM_POLL_SECONDS", 0)
+    job = BackfillJob(str(integration.id), "job-1")
+    await job.seed([], total=1, range_repr="r")
+    assert await job.claim_step("111", 2, "live-worker", ttl_seconds=30) == "acquired"
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    cfg = BackfillEventsForIndividualConfig(
+        study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", step_seq=2,
+        start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    result = await action_backfill_events_for_individual(integration=integration, action_config=cfg)
+
+    assert result == {"status": "duplicate", "step_seq": 2}
+    assert not mock_movebank_client.get_individual_events_by_time.called
+    assert not mock_trigger.called
+    assert fake_backfill_redis.store["strings"][job._lease("111")] == "live-worker"
 
 
 @pytest.mark.asyncio

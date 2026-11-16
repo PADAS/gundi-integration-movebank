@@ -26,12 +26,17 @@ def mock_connection_slot(mocker):
 
 @pytest.fixture(autouse=True)
 def mock_step_claim_and_delay(mocker, request):
-    """Every delivery is the legitimate next step, and re-trigger waits are
-    instant, unless a test re-patches these to exercise them. The queue's own
-    tests exercise the real claim against the fake Redis, so they are exempt."""
+    """Every delivery wins its step lease, and re-trigger waits are instant,
+    unless a test re-patches these to exercise them. The queue's own tests
+    exercise the real claim against the fake (and a real) Redis, so they are
+    exempt."""
     if request.module.__name__.endswith("test_backfill_queue"):
         return None
-    mocker.patch("app.actions.backfill_queue.BackfillJob.claim_step", AsyncMock(return_value=True))
+    from app.actions.backfill_queue import STEP_ACQUIRED
+    mocker.patch("app.actions.backfill_queue.BackfillJob.claim_step", AsyncMock(return_value=STEP_ACQUIRED))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.renew_step_lease", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.finish_step", AsyncMock(return_value=True))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.release_step", AsyncMock(return_value=None))
     mocker.patch("app.actions.backfill_queue.BackfillJob.reset_steps", AsyncMock(return_value=None))
     return mocker.patch("app.actions.handlers._delay_before_retrigger", AsyncMock(return_value=None))
 
@@ -104,7 +109,7 @@ def fake_backfill_redis():
     (meta vs. the per-individual configs hash) don't collide on field names.
     Shared by the queue unit tests and the handler tests that need real
     key-level semantics (e.g. whether a flag survives a cleanup)."""
-    store = {"hashes": {}, "list": [], "ttls": {}}
+    store = {"hashes": {}, "list": [], "ttls": {}, "strings": {}}
 
     client = MagicMock()
 
@@ -145,6 +150,7 @@ def fake_backfill_redis():
         for key in keys:
             store["hashes"].pop(key, None)
             store["ttls"].pop(key, None)
+            store["strings"].pop(key, None)
             if key.endswith(".pending"):
                 store["list"].clear()
 
@@ -152,6 +158,49 @@ def fake_backfill_redis():
         store["ttls"][key] = seconds
         return 1
 
+    # The step-claim Lua scripts, mirrored in Python. Leases never lapse on
+    # their own here; a test deletes the lease key to simulate expiry. The
+    # same scenarios also run against a real Redis in test_backfill_queue.py
+    # when one is reachable, which is what checks the Lua itself.
+    from app.actions import backfill_queue as bq
+
+    async def eval_(script, numkeys, *args):
+        keys, argv = args[:numkeys], [str(a) for a in args[numkeys:]]
+        strings = store["strings"]
+        if script is bq.CLAIM_STEP_LUA:
+            meta, lease = keys
+            field, seq, token, _ttl = argv
+            current = store["hashes"].get(meta, {}).get(field)
+            if current is not None and int(seq) < int(current):
+                return 0
+            if lease in strings:
+                return -1
+            strings[lease] = token
+            if store["hashes"].get(meta):
+                store["hashes"][meta][field] = int(seq)
+            return 1
+        if script is bq.RENEW_STEP_LUA:
+            (lease,), (token, _ttl) = keys, argv
+            return 1 if strings.get(lease) == token else 0
+        if script is bq.FINISH_STEP_LUA:
+            meta, lease = keys
+            field, seq, token = argv
+            if strings.get(lease) != token:
+                return 0
+            del strings[lease]
+            h = store["hashes"].get(meta)
+            if h:
+                h[field] = max(int(h.get(field, -1)), int(seq) + 1)
+            return 1
+        if script is bq.RELEASE_STEP_LUA:
+            (lease,), (token,) = keys, argv
+            if strings.get(lease) == token:
+                del strings[lease]
+                return 1
+            return 0
+        raise NotImplementedError("fake_backfill_redis: unknown script")
+
+    client.eval = AsyncMock(side_effect=eval_)
     client.hincrby = AsyncMock(side_effect=hincrby)
     client.hset = AsyncMock(side_effect=hset)
     client.hgetall = AsyncMock(side_effect=hgetall)

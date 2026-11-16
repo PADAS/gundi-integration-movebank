@@ -4,6 +4,7 @@ import random
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -15,7 +16,7 @@ from movebank_client.errors import MBRateLimitError
 import app.actions.client as client
 from app.actions.core import action_title
 from app import settings
-from app.actions.backfill_queue import BackfillJob
+from app.actions.backfill_queue import STEP_ACQUIRED, STEP_BUSY, BackfillJob
 from app.actions.client import IndividualState, generate_individuals
 from app.actions.configurations import (
     AuthenticateConfig,
@@ -978,19 +979,81 @@ def _saved_scan_from(saved) -> Optional[datetime]:
 
 @activity_logger()
 async def action_backfill_events_for_individual(integration, action_config: BackfillEventsForIndividualConfig):
+    step_started = time.monotonic()
+    ind = action_config.individual
+    job = BackfillJob(str(integration.id), action_config.job_id)
+    log_reference = f"job:{action_config.job_id},individual:{ind.id}"
+    seq = action_config.step_seq
+
+    # Pub/Sub is at-least-once. A second delivery of a step must not start a
+    # second chain: every chain is self-perpetuating, so one duplicate becomes a
+    # permanent parallel worker fetching and sending the same windows. Take this
+    # step's lease first; it is renewed while the step runs, advanced when the
+    # step hands off, and released (or left to lapse) when the step dies, so an
+    # unfinished step can still be redelivered and run.
+    token = uuid.uuid4().hex
+    claim = await _claim_backfill_step(job, ind.id, seq, token)
+    if claim != STEP_ACQUIRED:
+        logger.info(f"Backfill {log_reference}: duplicate delivery of step {seq} ({claim}); skipped")
+        return {"status": "duplicate", "step_seq": seq}
+
+    heartbeat = asyncio.create_task(_hold_backfill_step_lease(job, ind.id, token, log_reference))
+    try:
+        result = await _run_backfill_step(integration, action_config, job, step_started)
+    except BaseException:
+        heartbeat.cancel()
+        try:
+            await job.release_step(ind.id, token)
+        except Exception as exc:
+            # The lease lapses on its own once the heartbeat stops.
+            logger.warning(f"Backfill {log_reference}: step lease release failed (lapses in "
+                           f"{settings.BACKFILL_STEP_LEASE_SECONDS}s): {exc}")
+        raise
+    heartbeat.cancel()
+    try:
+        if not await job.finish_step(ind.id, seq, token):
+            logger.warning(f"Backfill {log_reference}: step {seq} lease lapsed before hand-off")
+    except Exception as exc:
+        # The successor is already published (or the individual finalized).
+        # Raising would only invite a redelivery that re-runs this step.
+        logger.warning(f"Backfill {log_reference}: step {seq} hand-off failed: {exc}")
+    return result
+
+
+async def _claim_backfill_step(job: BackfillJob, individual_id: str, seq: int, token: str) -> str:
+    """Claim the step, waiting while another worker holds the lease. A live
+    holder renews its lease, so still BUSY after one full lease period means a
+    concurrent duplicate (drop it); a dead holder's lease lapses inside the wait
+    and this delivery takes the step over. The successor of a step also waits
+    here for the few milliseconds between its publish and the hand-off."""
+    lease = settings.BACKFILL_STEP_LEASE_SECONDS
+    give_up_at = time.monotonic() + 1.5 * lease
+    while True:
+        claim = await job.claim_step(individual_id, seq, token, ttl_seconds=lease)
+        if claim != STEP_BUSY or time.monotonic() >= give_up_at:
+            return claim
+        await asyncio.sleep(settings.BACKFILL_STEP_CLAIM_POLL_SECONDS)
+
+
+async def _hold_backfill_step_lease(job: BackfillJob, individual_id: str, token: str, log_reference: str) -> None:
+    """Renew the step lease every third of its TTL until cancelled."""
+    lease = settings.BACKFILL_STEP_LEASE_SECONDS
+    while True:
+        await asyncio.sleep(lease / 3)
+        try:
+            if not await job.renew_step_lease(individual_id, token, ttl_seconds=lease):
+                logger.warning(f"Backfill {log_reference}: step lease lost; another delivery may take over")
+                return
+        except Exception as exc:
+            logger.warning(f"Backfill {log_reference}: step lease renewal failed: {exc}")
+
+
+async def _run_backfill_step(integration, action_config: BackfillEventsForIndividualConfig,
+                             job: BackfillJob, step_started: float):
     ind = action_config.individual
     integration_id = str(integration.id)
-    job = BackfillJob(integration_id, action_config.job_id)
     watermark_source = f"{action_config.job_id}.{ind.id}"
     log_reference = f"job:{action_config.job_id},individual:{ind.id}"
-
-    # Pub/Sub is at-least-once. A second delivery of a step that already ran
-    # (or is still running) must not start a second chain: every chain is
-    # self-perpetuating, so one duplicate becomes a permanent parallel worker
-    # fetching and sending the same windows. Claim this step's number first.
-    if not await job.claim_step(ind.id, action_config.step_seq):
-        logger.info(f"Backfill {log_reference}: duplicate delivery of step {action_config.step_seq}; skipped")
-        return {"status": "duplicate", "step_seq": action_config.step_seq}
 
     if await job.is_cancelled():
         # Every continuation path (dispatch, continued, retry, backoff) re-enters
@@ -1047,7 +1110,9 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     persisted_scan_from = _saved_scan_from(saved)
 
     auth_config = client.get_auth_config(integration)
-    deadline = time.monotonic() + 0.8 * settings.MAX_ACTION_EXECUTION_TIME
+    # Measured from the start of the request, so time spent waiting on the
+    # step lease comes out of this step's budget, not on top of it.
+    deadline = step_started + 0.8 * settings.MAX_ACTION_EXECUTION_TIME
     span_seconds = (action_config.end - action_config.start).total_seconds()
     window = _compute_batch_window(ind.number_of_events, span_seconds)
     if saved and saved.get("window_seconds"):
