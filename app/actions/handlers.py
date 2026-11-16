@@ -990,7 +990,11 @@ class _StepLease:
     token: str
     seq: int
     handed_off: bool = False
+    # lost: Redis said the lease is someone else's (a redelivery took it over).
+    # unconfirmed: Redis stopped answering and the last confirmed expiry has
+    # passed; nobody is known to hold the step, so it must be re-published.
     lost: bool = False
+    unconfirmed: bool = False
     task: Optional[asyncio.Task] = None
     heartbeat: Optional[asyncio.Task] = None
     # Monotonic time until which Redis last confirmed the lease is ours. Set on
@@ -1032,6 +1036,17 @@ async def action_backfill_events_for_individual(integration, action_config: Back
             logger.info(f"Backfill {log_reference}: step {seq} superseded by a newer delivery; stopped")
             return {"status": "superseded", "step_seq": seq}
         await _release_backfill_step(job, ind.id, lease.token, log_reference)
+        if lease.unconfirmed:
+            # Redis went quiet past our lease and nobody is known to hold the
+            # step. Acking here would end the chain (main.py acks every result),
+            # so re-publish THIS step unchanged: the redelivery claims the same
+            # number once the lease is released or lapsed and resumes from the
+            # persisted cursor. Pub/Sub does not depend on Redis, and the wait
+            # gives Redis time to come back before the step is delivered again.
+            await _delay_before_retrigger(settings.BACKFILL_NO_SLOT_RETRY_DELAY_SECONDS)
+            await trigger_action(integration_id=str(integration.id), action_id=BACKFILL_ACTION_ID, config=action_config)
+            logger.warning(f"Backfill {log_reference}: step {seq} stopped with its lease unconfirmed; re-published")
+            return {"status": "retry", "reason": "lease_unconfirmed", "step_seq": seq}
         raise
     except BaseException:
         lease.heartbeat.cancel()
@@ -1092,8 +1107,11 @@ async def _hold_backfill_step_lease(job: BackfillJob, individual_id: str, lease:
                                f"{lease.expires_at - time.monotonic():.0f}s of lease left: {exc}")
                 continue
             logger.warning(f"Backfill {log_reference}: step lease renewal failed and the lease has "
-                           f"expired unconfirmed; stopping: {exc}")
-            renewed = False
+                           f"expired unconfirmed; stopping to re-publish the step: {exc}")
+            lease.unconfirmed = True
+            if lease.task is not None:
+                lease.task.cancel()
+            return
         if not renewed:
             logger.warning(f"Backfill {log_reference}: step lease lost; stopping in favour of the newer delivery")
             lease.lost = True

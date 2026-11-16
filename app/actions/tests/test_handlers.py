@@ -1329,16 +1329,20 @@ async def test_backfill_lease_loss_stops_the_running_step(
 
 
 @pytest.mark.asyncio
-async def test_backfill_unconfirmed_lease_stops_the_step_once_it_would_have_expired(
-        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+async def test_backfill_unconfirmed_lease_stops_the_step_and_republishes_it(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store, mock_step_claim_and_delay
 ):
     """Renewals that error (Redis unreachable) keep the worker going only until
-    the last confirmed lease expiry; after that a redelivery may own the step."""
+    the last confirmed lease expiry. Past that nobody is known to hold the step,
+    so it stops, releases, and re-publishes ITSELF (same step, same run) rather
+    than acking as superseded and ending the chain."""
     from app.actions.configurations import BackfillEventsForIndividualConfig
     from datetime import datetime, timezone
     mocker.patch("app.actions.handlers.settings.BACKFILL_STEP_LEASE_SECONDS", 0.3)
+    mocker.patch("app.actions.handlers.settings.BACKFILL_NO_SLOT_RETRY_DELAY_SECONDS", 15)
     mocker.patch("app.actions.backfill_queue.BackfillJob.renew_step_lease", AsyncMock(side_effect=ConnectionError("redis down")))
     mock_finish = mocker.patch("app.actions.backfill_queue.BackfillJob.finish_step", AsyncMock(return_value=True))
+    mock_release = mocker.patch("app.actions.backfill_queue.BackfillJob.release_step", AsyncMock())
     mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
     mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
     async def _slow(**kwargs):
@@ -1350,15 +1354,18 @@ async def test_backfill_unconfirmed_lease_stops_the_step_once_it_would_have_expi
     result = await action_backfill_events_for_individual(
         integration=integration,
         action_config=BackfillEventsForIndividualConfig(
-            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", step_seq=2,
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", step_seq=2, run_id="run-a",
             start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
         ),
     )
 
     elapsed = time.monotonic() - started
-    assert result == {"status": "superseded", "step_seq": 2}
+    assert result == {"status": "retry", "reason": "lease_unconfirmed", "step_seq": 2}
     assert 0.3 <= elapsed < 2          # ran through the lease, not beyond it (and not for the whole fetch)
-    assert not mock_trigger.called and not mock_finish.called
+    assert mock_release.await_count == 1 and not mock_finish.called
+    mock_step_claim_and_delay.assert_awaited_once_with(15)
+    republished = mock_trigger.await_args_list[0].kwargs["config"]
+    assert (republished.step_seq, republished.run_id) == (2, "run-a")   # the same step, not its successor
 
 
 @pytest.mark.asyncio
