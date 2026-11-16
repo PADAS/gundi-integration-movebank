@@ -38,6 +38,7 @@ def mock_step_claim_and_delay(mocker, request):
     mocker.patch("app.actions.backfill_queue.BackfillJob.finish_step", AsyncMock(return_value=True))
     mocker.patch("app.actions.backfill_queue.BackfillJob.release_step", AsyncMock(return_value=None))
     mocker.patch("app.actions.backfill_queue.BackfillJob.reset_steps", AsyncMock(return_value=None))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.run_id", AsyncMock(return_value="run-test"))
     return mocker.patch("app.actions.handlers._delay_before_retrigger", AsyncMock(return_value=None))
 
 
@@ -169,7 +170,11 @@ def fake_backfill_redis():
         strings = store["strings"]
         if script is bq.CLAIM_STEP_LUA:
             meta, lease = keys
-            field, seq, token, _ttl = argv
+            field, seq, token, _ttl = argv[:4]
+            run = argv[4] if len(argv) > 4 else ""
+            seeded_run = store["hashes"].get(meta, {}).get("run_id")
+            if seeded_run and run and run != seeded_run:
+                return -2
             current = store["hashes"].get(meta, {}).get(field)
             if current is not None and int(seq) < int(current):
                 return 0

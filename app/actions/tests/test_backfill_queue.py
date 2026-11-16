@@ -315,3 +315,15 @@ async def test_claim_does_not_recreate_a_cleared_job(step_job):
     await job.clear()
     assert await job.claim_step("ind-1", 0, "a", ttl_seconds=TTL) == "acquired"
     assert await job.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_claim_step_rejects_a_delivery_from_an_earlier_run(step_job):
+    from app.actions.backfill_queue import STEP_ACQUIRED, STEP_STALE_RUN
+    current = await step_job.run_id()
+    assert current
+    assert await step_job.claim_step("ind-1", 0, "old", ttl_seconds=30, run_id="run-before-cancel") == STEP_STALE_RUN
+    # A message from before run ids existed is not checked.
+    assert await step_job.claim_step("ind-1", 0, "legacy", ttl_seconds=30, run_id="") == STEP_ACQUIRED
+    assert await step_job.finish_step("ind-1", 0, "legacy")
+    assert await step_job.claim_step("ind-1", 1, "t", ttl_seconds=30, run_id=current) == STEP_ACQUIRED

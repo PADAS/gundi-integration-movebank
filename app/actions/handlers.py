@@ -16,6 +16,8 @@ from movebank_client.errors import MBRateLimitError
 import app.actions.client as client
 from app.actions.core import action_title
 from app import settings
+from dataclasses import dataclass, field
+
 from app.actions.backfill_queue import STEP_ACQUIRED, STEP_BUSY, BackfillJob
 from app.actions.client import IndividualState, generate_individuals
 from app.actions.configurations import (
@@ -843,7 +845,9 @@ async def _dispatch_backfill_individual(integration_id, job, individual_id):
             return
         blob = await job.get_individual_config(individual_id)
         if blob is not None:
-            cfg = BackfillEventsForIndividualConfig.parse_raw(blob).copy(update={"step_seq": 0})
+            cfg = BackfillEventsForIndividualConfig.parse_raw(blob).copy(
+                update={"step_seq": 0, "run_id": await job.run_id()}
+            )
             await job.reset_steps(individual_id)
             await job.incr_in_flight()
             try:
@@ -977,6 +981,20 @@ def _saved_scan_from(saved) -> Optional[datetime]:
     return None
 
 
+@dataclass
+class _StepLease:
+    """What the step holds while it runs: its lease token and sequence number,
+    whether it already handed the chain to its successor (sync mode), and
+    whether the lease was lost to a newer delivery (the heartbeat then cancels
+    the step task so two workers never run the same individual for long)."""
+    token: str
+    seq: int
+    handed_off: bool = False
+    lost: bool = False
+    task: Optional[asyncio.Task] = None
+    heartbeat: Optional[asyncio.Task] = None
+
+
 @activity_logger()
 async def action_backfill_events_for_individual(integration, action_config: BackfillEventsForIndividualConfig):
     step_started = time.monotonic()
@@ -990,37 +1008,53 @@ async def action_backfill_events_for_individual(integration, action_config: Back
     # permanent parallel worker fetching and sending the same windows. Take this
     # step's lease first; it is renewed while the step runs, advanced when the
     # step hands off, and released (or left to lapse) when the step dies, so an
-    # unfinished step can still be redelivered and run.
-    token = uuid.uuid4().hex
-    claim = await _claim_backfill_step(job, ind.id, seq, token)
+    # unfinished step can still be redelivered and run. A step dispatched under
+    # an earlier run of this job (before a cancel+resume or a restart) is dropped.
+    lease = _StepLease(token=uuid.uuid4().hex, seq=seq, task=asyncio.current_task())
+    claim = await _claim_backfill_step(job, ind.id, seq, lease.token, action_config.run_id)
     if claim != STEP_ACQUIRED:
         logger.info(f"Backfill {log_reference}: duplicate delivery of step {seq} ({claim}); skipped")
         return {"status": "duplicate", "step_seq": seq}
 
-    heartbeat = asyncio.create_task(_hold_backfill_step_lease(job, ind.id, token, log_reference))
+    lease.heartbeat = asyncio.create_task(_hold_backfill_step_lease(job, ind.id, lease, log_reference))
     try:
-        result = await _run_backfill_step(integration, action_config, job, step_started)
-    except BaseException:
-        heartbeat.cancel()
-        try:
-            await job.release_step(ind.id, token)
-        except Exception as exc:
-            # The lease lapses on its own once the heartbeat stops.
-            logger.warning(f"Backfill {log_reference}: step lease release failed (lapses in "
-                           f"{settings.BACKFILL_STEP_LEASE_SECONDS}s): {exc}")
+        result = await _run_backfill_step(integration, action_config, job, step_started, lease)
+    except asyncio.CancelledError:
+        lease.heartbeat.cancel()
+        if lease.lost:
+            # A newer delivery took the lease (ours lapsed, e.g. a stalled
+            # renewal) and is running this step; we stopped so the two never
+            # overlap for more than one heartbeat. Nothing to hand off.
+            logger.info(f"Backfill {log_reference}: step {seq} superseded by a newer delivery; stopped")
+            return {"status": "superseded", "step_seq": seq}
+        await _release_backfill_step(job, ind.id, lease.token, log_reference)
         raise
-    heartbeat.cancel()
-    try:
-        if not await job.finish_step(ind.id, seq, token):
-            logger.warning(f"Backfill {log_reference}: step {seq} lease lapsed before hand-off")
-    except Exception as exc:
-        # The successor is already published (or the individual finalized).
-        # Raising would only invite a redelivery that re-runs this step.
-        logger.warning(f"Backfill {log_reference}: step {seq} hand-off failed: {exc}")
+    except BaseException:
+        lease.heartbeat.cancel()
+        await _release_backfill_step(job, ind.id, lease.token, log_reference)
+        raise
+    lease.heartbeat.cancel()
+    if not lease.handed_off:
+        try:
+            if not await job.finish_step(ind.id, seq, lease.token):
+                logger.warning(f"Backfill {log_reference}: step {seq} lease lapsed before hand-off")
+        except Exception as exc:
+            # The successor is already published (or the individual finalized).
+            # Raising would only invite a redelivery that re-runs this step.
+            logger.warning(f"Backfill {log_reference}: step {seq} hand-off failed: {exc}")
     return result
 
 
-async def _claim_backfill_step(job: BackfillJob, individual_id: str, seq: int, token: str) -> str:
+async def _release_backfill_step(job: BackfillJob, individual_id: str, token: str, log_reference: str) -> None:
+    try:
+        await job.release_step(individual_id, token)
+    except Exception as exc:
+        # The lease lapses on its own once the heartbeat stops.
+        logger.warning(f"Backfill {log_reference}: step lease release failed (lapses in "
+                       f"{settings.BACKFILL_STEP_LEASE_SECONDS}s): {exc}")
+
+
+async def _claim_backfill_step(job: BackfillJob, individual_id: str, seq: int, token: str, run_id: str = "") -> str:
     """Claim the step, waiting while another worker holds the lease. A live
     holder renews its lease, so still BUSY after one full lease period means a
     concurrent duplicate (drop it); a dead holder's lease lapses inside the wait
@@ -1029,27 +1063,49 @@ async def _claim_backfill_step(job: BackfillJob, individual_id: str, seq: int, t
     lease = settings.BACKFILL_STEP_LEASE_SECONDS
     give_up_at = time.monotonic() + 1.5 * lease
     while True:
-        claim = await job.claim_step(individual_id, seq, token, ttl_seconds=lease)
+        claim = await job.claim_step(individual_id, seq, token, ttl_seconds=lease, run_id=run_id)
         if claim != STEP_BUSY or time.monotonic() >= give_up_at:
             return claim
         await asyncio.sleep(settings.BACKFILL_STEP_CLAIM_POLL_SECONDS)
 
 
-async def _hold_backfill_step_lease(job: BackfillJob, individual_id: str, token: str, log_reference: str) -> None:
-    """Renew the step lease every third of its TTL until cancelled."""
-    lease = settings.BACKFILL_STEP_LEASE_SECONDS
+async def _hold_backfill_step_lease(job: BackfillJob, individual_id: str, lease: _StepLease, log_reference: str) -> None:
+    """Renew the step lease every third of its TTL until cancelled. If the
+    lease is lost (lapsed and taken by a redelivery), cancel the step task:
+    the other worker owns the individual now, and letting both run would send
+    the same windows twice and move the shared cursors from two places."""
+    ttl = settings.BACKFILL_STEP_LEASE_SECONDS
     while True:
-        await asyncio.sleep(lease / 3)
+        await asyncio.sleep(ttl / 3)
         try:
-            if not await job.renew_step_lease(individual_id, token, ttl_seconds=lease):
-                logger.warning(f"Backfill {log_reference}: step lease lost; another delivery may take over")
-                return
+            renewed = await job.renew_step_lease(individual_id, lease.token, ttl_seconds=ttl)
         except Exception as exc:
             logger.warning(f"Backfill {log_reference}: step lease renewal failed: {exc}")
+            continue
+        if not renewed:
+            logger.warning(f"Backfill {log_reference}: step lease lost; stopping in favour of the newer delivery")
+            lease.lost = True
+            if lease.task is not None:
+                lease.task.cancel()
+            return
+
+
+async def _publish_next_step(job: BackfillJob, integration_id: str,
+                             action_config: BackfillEventsForIndividualConfig, lease: _StepLease) -> None:
+    """Publish this individual's next step. Normally the successor is published
+    first and the chain advanced after (so a failed publish leaves this step
+    redeliverable); with TRIGGER_ACTIONS_ALWAYS_SYNC the successor runs inline
+    inside trigger_action, so hand off first or it would wait on our own lease."""
+    successor = _next_step(action_config)
+    if settings.TRIGGER_ACTIONS_ALWAYS_SYNC and not lease.handed_off:
+        if lease.heartbeat is not None:
+            lease.heartbeat.cancel()
+        lease.handed_off = await job.finish_step(action_config.individual.id, action_config.step_seq, lease.token)
+    await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=successor)
 
 
 async def _run_backfill_step(integration, action_config: BackfillEventsForIndividualConfig,
-                             job: BackfillJob, step_started: float):
+                             job: BackfillJob, step_started: float, lease: _StepLease):
     ind = action_config.individual
     integration_id = str(integration.id)
     watermark_source = f"{action_config.job_id}.{ind.id}"
@@ -1326,10 +1382,14 @@ async def _run_backfill_step(integration, action_config: BackfillEventsForIndivi
         # completed window. We do not attempt async recovery here (re-trigger /
         # in_flight unwind): awaits during cancellation are themselves cancelled
         # and unreliable. Recover a job wedged by a timeout with restart=true.
-        logger.warning(
-            f"Backfill {log_reference}: step hard-cancelled at scan_from={cursor.isoformat()}; "
-            "resume on next trigger or re-run with restart=true"
-        )
+        if lease.lost:
+            logger.info(f"Backfill {log_reference}: stopping at scan_from={cursor.isoformat()}; "
+                        "a newer delivery holds this step")
+        else:
+            logger.warning(
+                f"Backfill {log_reference}: step hard-cancelled at scan_from={cursor.isoformat()}; "
+                "resume on next trigger or re-run with restart=true"
+            )
         raise
     except NoConnectionSlot:
         # No connection slot available: re-trigger THIS individual (same in-flight
@@ -1337,21 +1397,21 @@ async def _run_backfill_step(integration, action_config: BackfillEventsForIndivi
         # Wait first: an immediate re-publish loops hundreds of times per pull
         # tick while the slots are busy, and every push is a duplicate-delivery risk.
         await _delay_before_retrigger(settings.BACKFILL_NO_SLOT_RETRY_DELAY_SECONDS)
-        await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=_next_step(action_config))
+        await _publish_next_step(job, integration_id, action_config, lease)
         logger.info(f"Backfill {action_config.job_id}/{ind.id}: no connection slot, backing off")
         return {"status": "backoff"}
     except MBRateLimitError as exc:
         # Movebank asked us to slow down. Not a failed attempt: wait, then resume
         # from the persisted cursor without touching the attempts counter.
         await _delay_before_retrigger(settings.BACKFILL_RATE_LIMIT_RETRY_DELAY_SECONDS)
-        await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=_next_step(action_config))
+        await _publish_next_step(job, integration_id, action_config, lease)
         logger.info(f"Backfill {action_config.job_id}/{ind.id}: Movebank rate limited ({exc}); resuming after a pause")
         return {"status": "rate_limited"}
     except Exception as exc:
         attempts = await job.incr_attempts(ind.id)
         if attempts <= BACKFILL_MAX_ATTEMPTS:
             await _delay_before_retrigger(settings.BACKFILL_NO_SLOT_RETRY_DELAY_SECONDS)
-            await trigger_action(integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=_next_step(action_config))
+            await _publish_next_step(job, integration_id, action_config, lease)
             logger.info(f"Backfill {action_config.job_id}/{ind.id}: attempt {attempts} failed ({exc}); retrying")
             return {"status": "retry", "attempts": attempts}
         logger.warning(f"Backfill {action_config.job_id}/{ind.id}: abandoned after {attempts} attempts: {exc}")
@@ -1376,9 +1436,7 @@ async def _run_backfill_step(integration, action_config: BackfillEventsForIndivi
     if cursor > action_config.start:
         # Budget exhausted mid-range: continue THIS individual on the next step
         # (descending from the persisted cursor).
-        await trigger_action(
-            integration_id=integration_id, action_id=BACKFILL_ACTION_ID, config=_next_step(action_config),
-        )
+        await _publish_next_step(job, integration_id, action_config, lease)
         logger.info(f"Backfill {log_reference} continued at {cursor.isoformat()} ({observations_sent} obs this step)")
         return {"status": "continued", "observations_sent": observations_sent}
 

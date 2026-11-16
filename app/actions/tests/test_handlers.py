@@ -1,3 +1,5 @@
+import time
+import asyncio
 import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
@@ -1047,7 +1049,7 @@ async def test_backfill_individual_retriggers_carry_the_next_step_number(
     )
 
     assert result["status"] == "backoff"
-    mock_claim.assert_awaited_once_with("111", 4, ANY, ttl_seconds=ANY)
+    mock_claim.assert_awaited_once_with("111", 4, ANY, ttl_seconds=ANY, run_id="")
     # Handed off with the same lease token it claimed with.
     token = mock_claim.await_args.args[2]
     mock_finish.assert_awaited_once_with("111", 4, token)
@@ -1212,6 +1214,118 @@ async def test_backfill_dispatch_resets_the_chain_and_publishes_step_zero(mocker
 
     mock_reset.assert_awaited_once_with("111")
     assert mock_trigger.await_args_list[0].kwargs["config"].step_seq == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_dispatch_stamps_the_jobs_run_id_on_step_zero(mocker, integration):
+    from app.actions.backfill_queue import BackfillJob
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from app.actions.handlers import _dispatch_backfill_individual
+    from datetime import datetime, timezone
+    stored = BackfillEventsForIndividualConfig(
+        study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", step_seq=9, run_id="run-old",
+        start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    ).json()
+    mocker.patch("app.actions.backfill_queue.BackfillJob.snapshot",
+                 AsyncMock(return_value={"total": 1, "completed": 0, "observations_sent": 0, "in_flight": 0, "range": "r", "pending_remaining": 0}))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.get_individual_config", AsyncMock(return_value=stored))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.incr_in_flight", AsyncMock(return_value=1))
+    mocker.patch("app.actions.backfill_queue.BackfillJob.run_id", AsyncMock(return_value="run-new"))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    await _dispatch_backfill_individual(str(integration.id), BackfillJob(str(integration.id), "job-1"), "111")
+
+    cfg = mock_trigger.await_args_list[0].kwargs["config"]
+    assert (cfg.step_seq, cfg.run_id) == (0, "run-new")
+
+
+@pytest.mark.asyncio
+async def test_backfill_step_from_an_earlier_run_is_dropped(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.backfill_queue import STEP_STALE_RUN
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from datetime import datetime, timezone
+    mock_claim = mocker.patch("app.actions.backfill_queue.BackfillJob.claim_step", AsyncMock(return_value=STEP_STALE_RUN))
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", step_seq=12, run_id="run-old",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result == {"status": "duplicate", "step_seq": 12}
+    assert mock_claim.await_args.kwargs["run_id"] == "run-old"
+    assert not mock_trigger.called
+    assert not mock_movebank_client.get_individual_events_by_time.called
+
+
+@pytest.mark.asyncio
+async def test_backfill_sync_trigger_hands_off_before_the_successor_runs_inline(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from app.services.movebank_connections import NoConnectionSlot
+    from datetime import datetime, timezone
+    mocker.patch("app.actions.handlers.settings.TRIGGER_ACTIONS_ALWAYS_SYNC", True)
+    def _raise(*a, **k):
+        raise NoConnectionSlot("full")
+    mocker.patch("app.actions.handlers.movebank_slot", _raise)
+    order = []
+    async def _finish(*a, **k):
+        order.append("finish"); return True
+    async def _trigger(*a, **k):
+        order.append("trigger")
+    mock_finish = mocker.patch("app.actions.backfill_queue.BackfillJob.finish_step", AsyncMock(side_effect=_finish))
+    mocker.patch("app.actions.handlers.trigger_action", AsyncMock(side_effect=_trigger))
+
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1",
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result["status"] == "backoff"
+    # The chain advanced before the inline successor ran, and only once.
+    assert order == ["finish", "trigger"]
+    assert mock_finish.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_lease_loss_stops_the_running_step(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.configurations import BackfillEventsForIndividualConfig
+    from datetime import datetime, timezone
+    mocker.patch("app.actions.handlers.settings.BACKFILL_STEP_LEASE_SECONDS", 0.3)
+    mocker.patch("app.actions.backfill_queue.BackfillJob.renew_step_lease", AsyncMock(return_value=False))
+    mock_finish = mocker.patch("app.actions.backfill_queue.BackfillJob.finish_step", AsyncMock(return_value=True))
+    mock_release = mocker.patch("app.actions.backfill_queue.BackfillJob.release_step", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[]))
+    async def _slow(**kwargs):
+        await asyncio.sleep(5)   # the fetch outlives the lease
+        yield _gps_event(100, "2025-06-01 10:00:00.000")
+    mock_movebank_client.get_individual_events_by_time = _slow
+
+    started = time.monotonic()
+    result = await action_backfill_events_for_individual(
+        integration=integration,
+        action_config=BackfillEventsForIndividualConfig(
+            study_id="12345", individual=INDIVIDUAL_ROW, job_id="job-1", step_seq=2,
+            start=datetime(2024, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert result == {"status": "superseded", "step_seq": 2}
+    assert time.monotonic() - started < 3          # stopped at the first failed renewal, not after the fetch
+    assert not mock_trigger.called                 # no successor: the other holder owns the chain
+    assert not mock_finish.called and not mock_release.called
 
 
 @pytest.mark.asyncio
@@ -2094,6 +2208,7 @@ async def test_dispatch_backfill_individual_skips_missing_config_to_next_pending
     # "111"'s config is missing; "222" (next in the pending queue) has one.
     job.get_individual_config = AsyncMock(side_effect=[None, good_config.json()])
     job.reset_steps = AsyncMock()
+    job.run_id = AsyncMock(return_value="run-x")
     job.next_individual = AsyncMock(return_value="222")
     job.incr_in_flight = AsyncMock(return_value=1)
     mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())

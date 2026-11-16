@@ -1,3 +1,4 @@
+import uuid
 from typing import List, Optional
 
 import redis.asyncio as redis
@@ -8,6 +9,7 @@ from app import settings
 STEP_ACQUIRED = "acquired"
 STEP_STALE = "stale"
 STEP_BUSY = "busy"
+STEP_STALE_RUN = "stale_run"
 
 # Step claim scripts. KEYS[1] = job meta hash, KEYS[2] = the individual's lease
 # key. The meta field `seq.<id>` is the step the chain is on (the lowest step
@@ -15,6 +17,10 @@ STEP_BUSY = "busy"
 # started before step numbering: the first delivery is accepted and counting
 # starts at its number. A missing meta hash (job cleared) is never re-created.
 CLAIM_STEP_LUA = """
+local run = redis.call('HGET', KEYS[1], 'run_id')
+if run and ARGV[5] ~= '' and ARGV[5] ~= run then
+  return -2
+end
 local current = redis.call('HGET', KEYS[1], ARGV[1])
 local seq = tonumber(ARGV[2])
 if current and seq < tonumber(current) then
@@ -91,13 +97,26 @@ class BackfillJob:
     def _pending(self) -> str:
         return f"backfill.{self.integration_id}.{self.job_id}.pending"
 
-    async def seed(self, individual_ids: List[str], *, total: int, range_repr: str) -> None:
+    async def seed(self, individual_ids: List[str], *, total: int, range_repr: str) -> str:
+        """Seed the job and return its run id. Every seed (first run, restart,
+        resume after a cancel) is a new run of the same job id; steps carry the
+        run id they were dispatched under, and the claim rejects a step from an
+        earlier run, so a delivery still in flight from before a cancel or a
+        restart cannot claim the new chain or make its first step look stale."""
+        run_id = uuid.uuid4().hex[:12]
         await self.db.hset(self._meta, mapping={
             "total": total, "completed": 0, "observations_sent": 0,
-            "in_flight": 0, "range": range_repr,
+            "in_flight": 0, "range": range_repr, "run_id": run_id,
         })
         if individual_ids:
             await self.db.rpush(self._pending, *individual_ids)
+        return run_id
+
+    async def run_id(self) -> str:
+        value = await self.db.hget(self._meta, "run_id")
+        if isinstance(value, bytes):
+            value = value.decode()
+        return value or ""
 
     async def next_individual(self) -> Optional[str]:
         value = await self.db.lpop(self._pending)
@@ -133,7 +152,7 @@ class BackfillJob:
     def _lease(self, individual_id: str) -> str:
         return f"{self._meta}.lease.{individual_id}"
 
-    async def claim_step(self, individual_id: str, seq: int, token: str, *, ttl_seconds: int) -> str:
+    async def claim_step(self, individual_id: str, seq: int, token: str, *, ttl_seconds: int, run_id: str = "") -> str:
         """Try to take step `seq` of this individual's chain. Returns
         STEP_ACQUIRED (run it), STEP_STALE (an older step: a duplicate delivery
         of work already handed off; ack and drop) or STEP_BUSY (another worker
@@ -148,9 +167,9 @@ class BackfillJob:
         """
         result = await self.db.eval(
             CLAIM_STEP_LUA, 2, self._meta, self._lease(individual_id),
-            f"seq.{individual_id}", seq, token, int(ttl_seconds * 1000),
+            f"seq.{individual_id}", seq, token, int(ttl_seconds * 1000), run_id or "",
         )
-        return {1: STEP_ACQUIRED, 0: STEP_STALE}.get(int(result), STEP_BUSY)
+        return {1: STEP_ACQUIRED, 0: STEP_STALE, -2: STEP_STALE_RUN}.get(int(result), STEP_BUSY)
 
     async def renew_step_lease(self, individual_id: str, token: str, *, ttl_seconds: int) -> bool:
         """Extend our lease. False when it lapsed and someone else may hold it."""
