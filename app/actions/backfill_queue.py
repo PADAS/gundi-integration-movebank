@@ -1,8 +1,68 @@
+import uuid
 from typing import List, Optional
 
 import redis.asyncio as redis
 
 from app import settings
+
+
+STEP_ACQUIRED = "acquired"
+STEP_STALE = "stale"
+STEP_BUSY = "busy"
+STEP_STALE_RUN = "stale_run"
+
+# Step claim scripts. KEYS[1] = job meta hash, KEYS[2] = the individual's lease
+# key. The meta field `seq.<id>` is the step the chain is on (the lowest step
+# number not yet finished). A missing field means a fresh dispatch or a chain
+# started before step numbering: the first delivery is accepted and counting
+# starts at its number. A missing meta hash (job cleared) is never re-created.
+CLAIM_STEP_LUA = """
+local run = redis.call('HGET', KEYS[1], 'run_id')
+if run and ARGV[5] ~= '' and ARGV[5] ~= run then
+  return -2
+end
+local current = redis.call('HGET', KEYS[1], ARGV[1])
+local seq = tonumber(ARGV[2])
+if current and seq < tonumber(current) then
+  return 0
+end
+if not redis.call('SET', KEYS[2], ARGV[3], 'NX', 'PX', ARGV[4]) then
+  return -1
+end
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  redis.call('HSET', KEYS[1], ARGV[1], seq)
+end
+return 1
+"""
+
+RENEW_STEP_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+FINISH_STEP_LUA = """
+if redis.call('GET', KEYS[2]) ~= ARGV[3] then
+  return 0
+end
+redis.call('DEL', KEYS[2])
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  local done = tonumber(ARGV[2]) + 1
+  local current = tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '-1')
+  if current < done then
+    redis.call('HSET', KEYS[1], ARGV[1], done)
+  end
+end
+return 1
+"""
+
+RELEASE_STEP_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 # Lazily-created module-level singleton (mirrors app.services.movebank_connections'
@@ -37,13 +97,26 @@ class BackfillJob:
     def _pending(self) -> str:
         return f"backfill.{self.integration_id}.{self.job_id}.pending"
 
-    async def seed(self, individual_ids: List[str], *, total: int, range_repr: str) -> None:
+    async def seed(self, individual_ids: List[str], *, total: int, range_repr: str) -> str:
+        """Seed the job and return its run id. Every seed (first run, restart,
+        resume after a cancel) is a new run of the same job id; steps carry the
+        run id they were dispatched under, and the claim rejects a step from an
+        earlier run, so a delivery still in flight from before a cancel or a
+        restart cannot claim the new chain or make its first step look stale."""
+        run_id = uuid.uuid4().hex[:12]
         await self.db.hset(self._meta, mapping={
             "total": total, "completed": 0, "observations_sent": 0,
-            "in_flight": 0, "range": range_repr,
+            "in_flight": 0, "range": range_repr, "run_id": run_id,
         })
         if individual_ids:
             await self.db.rpush(self._pending, *individual_ids)
+        return run_id
+
+    async def run_id(self) -> str:
+        value = await self.db.hget(self._meta, "run_id")
+        if isinstance(value, bytes):
+            value = value.decode()
+        return value or ""
 
     async def next_individual(self) -> Optional[str]:
         value = await self.db.lpop(self._pending)
@@ -75,6 +148,57 @@ class BackfillJob:
 
     async def reset_attempts(self, individual_id: str) -> None:
         await self.db.hdel(self._meta, f"attempts.{individual_id}")
+
+    def _lease(self, individual_id: str) -> str:
+        return f"{self._meta}.lease.{individual_id}"
+
+    async def claim_step(self, individual_id: str, seq: int, token: str, *, ttl_seconds: int, run_id: str = "") -> str:
+        """Try to take step `seq` of this individual's chain. Returns
+        STEP_ACQUIRED (run it), STEP_STALE (an older step: a duplicate delivery
+        of work already handed off; ack and drop) or STEP_BUSY (another worker
+        holds the lease on this or the previous step; wait and ask again).
+
+        One Lua script, so the compare and the advance are atomic: two
+        deliveries can never both see themselves as next, and a rejected
+        delivery never moves the counter. The lease is a separate key with a
+        TTL that the holder renews (renew_step_lease); if the holder dies
+        without finishing, the lease lapses and a redelivery of the same step
+        takes it over instead of being dropped as a duplicate.
+        """
+        result = await self.db.eval(
+            CLAIM_STEP_LUA, 2, self._meta, self._lease(individual_id),
+            f"seq.{individual_id}", seq, token, int(ttl_seconds * 1000), run_id or "",
+        )
+        return {1: STEP_ACQUIRED, 0: STEP_STALE, -2: STEP_STALE_RUN}.get(int(result), STEP_BUSY)
+
+    async def renew_step_lease(self, individual_id: str, token: str, *, ttl_seconds: int) -> bool:
+        """Extend our lease. False when it lapsed and someone else may hold it."""
+        result = await self.db.eval(
+            RENEW_STEP_LUA, 1, self._lease(individual_id), token, int(ttl_seconds * 1000),
+        )
+        return int(result) == 1
+
+    async def finish_step(self, individual_id: str, seq: int, token: str) -> bool:
+        """Hand off: mark step `seq` done (every later delivery of it is stale)
+        and drop the lease. Called after the step published its successor or
+        finalized, so the successor waits on the lease, never the reverse.
+        False when the lease was no longer ours."""
+        result = await self.db.eval(
+            FINISH_STEP_LUA, 2, self._meta, self._lease(individual_id),
+            f"seq.{individual_id}", seq, token,
+        )
+        return int(result) == 1
+
+    async def release_step(self, individual_id: str, token: str) -> None:
+        """Drop our lease without advancing, so a redelivery of this unfinished
+        step can run it again."""
+        await self.db.eval(RELEASE_STEP_LUA, 1, self._lease(individual_id), token)
+
+    async def reset_steps(self, individual_id: str) -> None:
+        """Forget the chain position before a fresh dispatch, so the new chain's
+        step 0 is not mistaken for a duplicate of the old one."""
+        await self.db.hdel(self._meta, f"seq.{individual_id}")
+        await self.db.delete(self._lease(individual_id))
 
     async def exists(self) -> bool:
         """Whether this job has already been seeded (i.e. is active). Used to

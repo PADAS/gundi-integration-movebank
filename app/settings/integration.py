@@ -72,3 +72,21 @@ CANCELLED_JOB_TOMBSTONE_SECONDS = env.int("CANCELLED_JOB_TOMBSTONE_SECONDS", 864
 # or rejects a batch as a whole and the send helper retries a whole batch, so
 # a larger value trades fewer round trips for more work lost per rejection.
 OBSERVATIONS_BATCH_SIZE = env.int("OBSERVATIONS_BATCH_SIZE", 200)
+
+
+# How long a backfill step waits inside its request before re-publishing itself
+# after a transient refusal, with +/-50% jitter. An immediate re-publish turns a
+# busy pull tick into thousands of pushes per minute (Cloud Run 429s, and every
+# extra push is another chance for an at-least-once duplicate delivery). A
+# Movebank 429 gets the longer wait and does not count toward BACKFILL_MAX_ATTEMPTS.
+# Both stay well inside the 540s step cancel even when raised late in a step.
+BACKFILL_NO_SLOT_RETRY_DELAY_SECONDS = env.int("BACKFILL_NO_SLOT_RETRY_DELAY_SECONDS", 15)
+BACKFILL_RATE_LIMIT_RETRY_DELAY_SECONDS = env.int("BACKFILL_RATE_LIMIT_RETRY_DELAY_SECONDS", 45)
+
+# Lease on a running backfill step (one per individual). The step renews it every
+# third of this period; a step that dies without handing off loses it after one
+# period, and a redelivery of that step then takes over. A delivery that finds
+# the lease held waits up to 1.5 periods, polling, before treating itself as a
+# duplicate; that wait counts against the step's own time budget.
+BACKFILL_STEP_LEASE_SECONDS = env.int("BACKFILL_STEP_LEASE_SECONDS", 30)
+BACKFILL_STEP_CLAIM_POLL_SECONDS = env.float("BACKFILL_STEP_CLAIM_POLL_SECONDS", 3.0)

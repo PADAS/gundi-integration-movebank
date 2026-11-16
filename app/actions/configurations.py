@@ -116,3 +116,15 @@ class BackfillEventsForIndividualConfig(InternalActionConfiguration):
     job_id: str
     start: datetime
     end: datetime
+    # Position of this step in the individual's chain. Each re-trigger publishes
+    # step_seq + 1; the step claims its number in Redis before running, so a
+    # duplicate Pub/Sub delivery of an already-started step is acked and skipped
+    # instead of spawning a second, parallel chain. Absent on messages published
+    # before this field existed, which the claim treats as the first step.
+    step_seq: int = 0
+    # The job run this step was dispatched under (set by the dispatch from the
+    # job's seed). A cancel+resume or a restart re-seeds the same job id as a
+    # new run; a step from the previous run that is still in Pub/Sub is
+    # rejected by the claim instead of racing the new chain. Empty on messages
+    # published before this field existed, which the claim does not check.
+    run_id: str = ""
