@@ -545,6 +545,45 @@ async def action_pull_events_for_individual(integration, action_config: PullEven
     return {"observations_sent": total_observations_sent}
 
 
+def _backfill_dry_run_report(job_id, action_config, individuals, ranges, queued, skipped_existing, now) -> dict:
+    """What a backfill with this config would do, without doing it. One row per
+    individual: its first Movebank record, the coverage floor recorded so far
+    (None when it has never been pulled), the start the backfill would use, and
+    the span still missing. Sorted so the largest gaps come first."""
+    queued_ids = {i.id for i in queued}
+    skipped = set(skipped_existing)
+    rows = []
+    for i in individuals:
+        ts = i.timestamp_start
+        first = _ensure_utc(ts if isinstance(ts, datetime) else parse_date(ts)) if ts else None
+        if i.id in skipped:
+            rows.append({"individual_id": i.id, "local_identifier": i.local_identifier,
+                         "first_record": first.isoformat() if first else None, "coverage_floor": None,
+                         "status": "skipped_existing", "days_missing": None})
+            continue
+        start_dt, end_dt = ranges[i.id]
+        never_pulled = end_dt == now
+        missing = max(0, (end_dt - start_dt).days) if i.id in queued_ids else 0
+        rows.append({
+            "individual_id": i.id, "local_identifier": i.local_identifier,
+            "first_record": first.isoformat() if first else None,
+            "coverage_floor": None if never_pulled else end_dt.isoformat(),
+            "would_start": start_dt.isoformat(),
+            "status": "needs_backfill" if i.id in queued_ids else "covered",
+            "days_missing": missing,
+        })
+    rows.sort(key=lambda r: (-(r["days_missing"] or 0), r["local_identifier"] or ""))
+    needs = sum(1 for r in rows if r["status"] == "needs_backfill")
+    covered = sum(1 for r in rows if r["status"] == "covered")
+    logger.info(
+        f"Backfill {job_id} dry run for study {action_config.study_id}: {needs} of {len(rows)} individuals "
+        f"need a backfill ({sum(r['days_missing'] or 0 for r in rows)} individual-days missing), "
+        f"{covered} covered, {len(skipped)} skipped (history but no coverage floor)"
+    )
+    return {"job_id": job_id, "dry_run": True, "individuals": len(rows), "needs_backfill": needs,
+            "covered": covered, "skipped_existing": len(skipped), "report": rows}
+
+
 def _resolve_start(start, ind) -> datetime:
     """A concrete datetime for this individual: the operator's date, or for
     'all' the individual's earliest record (falling back to the lookback floor).
@@ -679,7 +718,7 @@ async def action_backfill(integration, action_config: BackfillConfig):
     # the SAME job_id. If that job is already active, re-seeding would
     # re-zero its counters and re-RPUSH individuals that are already in
     # flight or already dispatched — double-dispatching them. Bail out early.
-    if await job.exists():
+    if not action_config.dry_run and await job.exists():
         snap = await job.snapshot()
         if await job.is_cancelled():
             # A cancelled job (possibly just its TTL'd tombstone) occupies this
@@ -776,6 +815,11 @@ async def action_backfill(integration, action_config: BackfillConfig):
             )
     else:
         range_repr = "[each individual's first record .. per-individual coverage floor)"
+    if action_config.dry_run:
+        # Audit only: report the plan the seed below would act on, per
+        # individual, and touch nothing (no job, no cursors, no dispatch).
+        return _backfill_dry_run_report(job_id, action_config, individuals, ranges, queued, skipped_existing, now)
+
     await job.seed([i.id for i in queued], total=len(queued), range_repr=range_repr)
 
     logger.info(f"Backfill {job_id} for study {action_config.study_id}: {len(queued)} individuals, range {range_repr}")

@@ -2193,6 +2193,60 @@ async def test_backfill_individual_resets_attempts_after_successful_step(
 
 
 @pytest.mark.asyncio
+async def test_backfill_dry_run_reports_the_plan_without_seeding_or_dispatching(
+        mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
+):
+    from app.actions.configurations import BackfillConfig
+    from app.actions.client import IndividualState
+    from datetime import datetime, timezone
+    rows = [
+        {**INDIVIDUAL_ROW, "id": "fresh", "local_identifier": "never pulled", "timestamp_start": "2025-01-01 00:00:00.000"},
+        {**INDIVIDUAL_ROW, "id": "done", "local_identifier": "fully covered", "timestamp_start": "2025-01-01 00:00:00.000"},
+        {**INDIVIDUAL_ROW, "id": "part", "local_identifier": "partly covered", "timestamp_start": "2025-01-01 00:00:00.000"},
+        {**INDIVIDUAL_ROW, "id": "hist", "local_identifier": "history no floor", "timestamp_start": "2025-01-01 00:00:00.000"},
+    ]
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=rows)
+    done = IndividualState(individual_id="done", study_id="12345"); done.coverage_start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    part = IndividualState(individual_id="part", study_id="12345"); part.coverage_start = datetime(2025, 3, 2, tzinfo=timezone.utc)
+    hist = IndividualState(individual_id="hist", study_id="12345"); hist.update_sensor_state(653, datetime(2026, 1, 1, tzinfo=timezone.utc), 5)
+    for st in (done, part, hist):
+        mock_state_store[(str(integration.id), "pull_events_for_individual", st.individual_id)] = st.dict()
+    mock_exists = mocker.patch("app.actions.backfill_queue.BackfillJob.exists", AsyncMock(return_value=True))
+    mock_seed = mocker.patch("app.actions.backfill_queue.BackfillJob.seed", AsyncMock())
+    mock_put = mocker.patch("app.actions.backfill_queue.BackfillJob.put_individual_config", AsyncMock())
+    mock_trigger = mocker.patch("app.actions.handlers.trigger_action", AsyncMock())
+    mock_seed_cursor = mocker.patch("app.actions.handlers._seed_pull_cursor_at_end", AsyncMock())
+
+    result = await action_backfill(
+        integration=integration,
+        action_config=BackfillConfig(study_id="12345", start="all", dry_run=True),
+    )
+
+    assert result["dry_run"] is True
+    assert (result["individuals"], result["needs_backfill"], result["covered"], result["skipped_existing"]) == (4, 2, 1, 1)
+    by = {r["local_identifier"]: r for r in result["report"]}
+    assert by["never pulled"]["status"] == "needs_backfill" and by["never pulled"]["coverage_floor"] is None
+    assert by["never pulled"]["days_missing"] > 365
+    assert by["partly covered"]["status"] == "needs_backfill" and by["partly covered"]["days_missing"] == 60
+    assert by["fully covered"]["status"] == "covered" and by["fully covered"]["days_missing"] == 0
+    assert by["history no floor"]["status"] == "skipped_existing"
+    assert [r["local_identifier"] for r in result["report"]][:2] == ["never pulled", "partly covered"]  # largest gap first
+    # Nothing was touched: no job state, no cursors, no dispatch, and an active
+    # job for the same parameters does not block the audit.
+    assert not mock_seed.called and not mock_put.called and not mock_trigger.called and not mock_seed_cursor.called
+    assert not mock_exists.called
+
+
+def test_backfill_config_dry_run_excludes_cancel_and_restart():
+    from app.actions.configurations import BackfillConfig
+    import pydantic
+    for flag in ("cancel", "restart"):
+        with pytest.raises(pydantic.ValidationError):
+            BackfillConfig(study_id="12345", dry_run=True, **{flag: True})
+    assert BackfillConfig(study_id="12345", dry_run=True).dry_run is True
+
+
+@pytest.mark.asyncio
 async def test_backfill_skips_individuals_with_existing_cursor(
         mocker, integration, mock_auth_config, mock_movebank_client, mock_state_store
 ):
