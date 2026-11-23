@@ -30,6 +30,15 @@ This is Gundi's integration for pulling data from Movebank Studies.
   Movebank connection semaphore, sends to Gundi, and on completion hands the
   full `(timestamp, event_id)` cursor to `pull_events_for_individual` so
   steady-state collection continues without a gap or duplicates.
+- **list_studies** and **list_individuals** (reference, called by the portal) —
+  feed the searchable pickers on the Study ID and Individual IDs form fields,
+  so an operator can search by name instead of typing IDs. `list_studies`
+  searches the studies the account can see by name or ID; `list_individuals`
+  searches one study's individuals by local identifier, nick name, ring ID or
+  ID. Each returns at most 50 options. An empty study search returns nothing
+  (the list runs to thousands); an empty individual search lists the study's
+  first 50. Typing a raw ID into either field still works. Movebank has no
+  name search, so each list is fetched whole and cached in Redis per account.
 
 ### Settings
 
@@ -38,6 +47,10 @@ This is Gundi's integration for pulling data from Movebank Studies.
 - `ACCESSORY_SETTLING_HOURS` (default 12) — how far back accessory-measurements
   queries re-read, since those records can arrive hours late.
 - `BACKFILL_MAX_CONCURRENCY` (default 8) — individuals in flight per backfill job.
+- `REFERENCE_CACHE_TTL_SECONDS` (default 600) — how long the study and
+  individual lists behind the pickers are cached. The portal queries on every
+  keystroke; the cache keeps that to one Movebank request per list per TTL, so
+  lookups do not compete with pulls and backfills for connection slots.
 - `PUBSUB_REDELIVER_TRANSIENT_FAILURES` (default `false`) — answer PubSub with a
   5xx for transient action failures so the message is redelivered. Off because
   `pull_observations` and the backfill cascade are not idempotent; every action
