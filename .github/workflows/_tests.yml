@@ -4,7 +4,11 @@ on:
 
 jobs:
   run_unit_tests:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to GCC 15 (2026-11), which fails pyjq's
+    # oniguruma source build on incompatible-pointer-type errors that its
+    # configure does not let CFLAGS override. Lift when pyjq ships wheels or
+    # oniguruma is patched.
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout branch
         uses: actions/checkout@v4

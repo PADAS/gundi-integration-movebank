@@ -77,8 +77,15 @@ class BackfillConfig(GenericActionConfiguration, ExecutableActionMixin):
                     "ID, Individual IDs and Start as the running job. Data already sent is "
                     "kept; re-running the same backfill resumes where cancel stopped it.",
     )
+    dry_run: bool = Field(
+        False,
+        title="Dry run (audit only)",
+        description="Report which individuals would be backfilled and from what date, without "
+                    "starting anything. Compares each individual's first Movebank record with "
+                    "the coverage floor recorded by previous pulls and backfills.",
+    )
     ui_global_options = GlobalUISchemaOptions(
-        order=["study_id", "individual_ids", "start", "backfill_max_concurrency", "restart", "cancel"],
+        order=["study_id", "individual_ids", "start", "backfill_max_concurrency", "dry_run", "restart", "cancel"],
     )
 
     @validator("individual_ids")
@@ -95,6 +102,8 @@ class BackfillConfig(GenericActionConfiguration, ExecutableActionMixin):
     def _cancel_xor_restart(cls, values):
         if values.get("cancel") and values.get("restart"):
             raise ValueError("cancel and restart are mutually exclusive — pick one")
+        if values.get("dry_run") and (values.get("cancel") or values.get("restart")):
+            raise ValueError("dry_run only reports; it cannot be combined with cancel or restart")
         return values
 
     @validator("start")
