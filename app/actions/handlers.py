@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
 import random
 import json
@@ -14,7 +15,7 @@ from movebank_client import MovebankClient
 from movebank_client.errors import MBRateLimitError
 
 import app.actions.client as client
-from app.actions.core import action_title
+from app.actions.core import ReferenceDataResponse, action_title
 from app import settings
 from dataclasses import dataclass, field
 
@@ -24,12 +25,17 @@ from app.actions.configurations import (
     AuthenticateConfig,
     BackfillConfig,
     BackfillEventsForIndividualConfig,
+    ListIndividualsQuery,
+    ListStudiesQuery,
     PullObservationsConfig,
     PullEventsForIndividualConfig,
 )
+from app.actions import reference_data
 from app.actions.transform import _ensure_utc, build_observation, chunks
+from app.services import reference_cache
 from app.services.action_scheduler import crontab_schedule, trigger_action
 from app.services.activity_logger import activity_logger
+from app.services.errors import IntegrationConfigurationError
 from app.services.gundi import send_observations_to_gundi
 from app.services.movebank_connections import movebank_slot, NoConnectionSlot
 from app.services.state import IntegrationStateManager
@@ -221,6 +227,109 @@ async def action_auth(integration, action_config: AuthenticateConfig):
         else:
             logger.error(f"Auth unsuccessful for integration '{integration.id}': Movebank returned no token.")
             return {"valid_credentials": False}
+
+
+# --- Reference actions: the portal's study and individual pickers -----------
+#
+# The portal calls these while the user types (`q`) and to label saved values
+# (`ids`). Movebank has no name search, so each list is fetched whole, cached
+# trimmed in Redis per account, and searched here. Deliberately not wrapped in
+# @activity_logger: an activity-log entry per keystroke would bury the log.
+
+BUSY_MESSAGE = "Movebank is busy right now. Try again shortly."
+
+
+@asynccontextmanager
+async def _reference_movebank(integration):
+    """A Movebank client holding one of the account's connection slots.
+
+    A lookup never waits for a slot: when pulls or a backfill hold them all,
+    the picker reports Movebank as busy and the user retries, rather than a
+    form field queueing behind a backfill.
+    """
+    auth_config = client.get_auth_config(integration)
+    mb_client = client.MovebankClient(
+        base_url=integration.base_url,
+        username=auth_config.username,
+        password=auth_config.password.get_secret_value(),
+    )
+    try:
+        async with movebank_slot(auth_config.username):
+            async with mb_client as mb:
+                yield mb
+    except NoConnectionSlot:
+        # from None: the message is all the portal needs.
+        raise IntegrationConfigurationError(BUSY_MESSAGE) from None
+
+
+async def _cached_reference_list(integration, key: str, fetch, trim) -> list:
+    """The trimmed list under `key`: from Redis, else fetched from Movebank and
+    cached. `fetch(mb)` returns Movebank's rows; only a real answer is cached."""
+    cached = await reference_cache.get_cached_list(key)
+    if cached is not None:
+        return cached
+    async with _reference_movebank(integration) as mb:
+        rows = await fetch(mb)
+    trimmed = [trim(row) for row in rows or []]
+    await reference_cache.set_cached_list(key, trimmed)
+    return trimmed
+
+
+@action_title("Search Movebank Studies")
+async def action_list_studies(integration, action_config: ListStudiesQuery):
+    """Reference action (typeahead): studies this account can see.
+
+    With `ids` it returns those studies in the order asked, so the portal can
+    label saved values; IDs Movebank doesn't know are left out and the portal
+    keeps showing them raw. Otherwise it searches by name or ID. An empty
+    query returns nothing with truncated=True: the list runs to thousands.
+    """
+    username = client.get_auth_config(integration).username
+    key = reference_cache.studies_key(integration.base_url, username)
+    studies = await _cached_reference_list(
+        integration, key, lambda mb: mb.get_studies(), reference_data.trim_study,
+    )
+    if not action_config.ids:
+        return reference_data.search_studies(studies, action_config.q)
+
+    # A study shared with the account after the list was cached is missing
+    # from it. Ask Movebank for those directly so a saved value still gets its
+    # name; they are not written back, the list refreshes on its own TTL.
+    known = {study["id"] for study in studies}
+    missing = [study_id for study_id in action_config.ids if study_id not in known]
+    if missing:
+        logger.info(f"Resolving {len(missing)} uncached study id(s) for integration {integration.id}")
+        found = []
+        async with _reference_movebank(integration) as mb:
+            for study_id in missing:
+                row = await mb.get_study(study_id=study_id)
+                if row:
+                    found.append(reference_data.trim_study(row))
+        studies = studies + found
+    return reference_data.resolve(studies, action_config.ids, reference_data.study_option)
+
+
+@action_title("Search Individuals in a Study")
+async def action_list_individuals(integration, action_config: ListIndividualsQuery):
+    """Reference action (typeahead): the individuals of one study.
+
+    The study comes from the form field above the picker. Without one there is
+    nothing to list. An empty query lists the study's first individuals, which
+    is short enough to browse.
+    """
+    study_id = action_config.study_id
+    if not study_id:
+        return ReferenceDataResponse(options=[]).dict()
+    username = client.get_auth_config(integration).username
+    key = reference_cache.individuals_key(integration.base_url, username, study_id)
+    individuals = await _cached_reference_list(
+        integration, key,
+        lambda mb: mb.get_individuals_by_study(study_id=study_id),
+        reference_data.trim_individual,
+    )
+    if action_config.ids:
+        return reference_data.resolve(individuals, action_config.ids, reference_data.individual_option)
+    return reference_data.search_individuals(individuals, action_config.q)
 
 
 @action_title("(2) Read Movebank Data")

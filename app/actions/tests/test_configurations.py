@@ -199,7 +199,6 @@ def _annotated_actions(node):
                 yield from _annotated_actions(value)
 
 
-@pytest.mark.xfail(strict=True, reason="handlers land in the next task")
 def test_every_annotated_action_is_a_registered_reference_action():
     handlers = discover_actions("app.actions.handlers", "action_")
     annotated = set()
