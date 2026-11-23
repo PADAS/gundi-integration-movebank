@@ -21,5 +21,9 @@ jobs:
         run: pip-compile --output-file=requirements.txt requirements-base.in requirements-dev.in requirements.in
       - name: Install dependencies
         run: pip install --no-cache-dir -r requirements.txt
+        env:
+          # pyjq builds oniguruma from source; GCC 15 on ubuntu-latest turned
+          # its incompatible-pointer-type warnings into errors (2026-11-20).
+          CFLAGS: "-Wno-incompatible-pointer-types"
       - name: Run unit tests
         run: pytest
