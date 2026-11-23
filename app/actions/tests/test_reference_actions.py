@@ -1,4 +1,6 @@
 import json
+
+import redis.asyncio as redis_asyncio
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
@@ -7,7 +9,8 @@ import pytest
 from app.actions.configurations import AuthenticateConfig, ListIndividualsQuery, ListStudiesQuery
 from app.actions.core import ReferenceActionConfiguration, discover_actions
 from app.actions.handlers import action_list_individuals, action_list_studies
-from app.services.errors import IntegrationConfigurationError
+from app.services.errors import IntegrationRateLimitError
+from app.services import movebank_connections
 from app.services.movebank_connections import NoConnectionSlot
 
 USERNAME = "mb-account-name"
@@ -146,7 +149,7 @@ async def test_list_studies_when_movebank_is_busy_raises_the_busy_message(
     mocker.patch("app.actions.handlers.movebank_slot", side_effect=_no_slot)
     mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
 
-    with pytest.raises(IntegrationConfigurationError, match="Movebank is busy"):
+    with pytest.raises(IntegrationRateLimitError, match="Movebank is busy"):
         await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
 
     cache_set.assert_not_awaited()
@@ -277,3 +280,105 @@ def test_reference_actions_are_discovered_with_their_query_models():
     for action in ("list_studies", "list_individuals"):
         assert issubclass(handlers[action][1], ReferenceActionConfiguration)
         assert getattr(handlers[action][0], "action_title", None)
+
+
+# --- Final-review findings ---------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_different_password_for_the_same_username_misses_the_cache(
+        mocker, integration, mock_movebank_client, cache
+):
+    cache_get, _ = cache
+    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+
+    await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
+    mocker.patch(
+        "app.actions.client.get_auth_config",
+        return_value=AuthenticateConfig(username=USERNAME, password="someone-elses-guess"),
+    )
+    await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
+
+    first_key, second_key = (call.args[0] for call in cache_get.await_args_list)
+    assert first_key != second_key
+
+
+@pytest.mark.asyncio
+async def test_redis_outage_on_the_connection_slot_still_answers(
+        mocker, integration, mock_movebank_client, cache
+):
+    # The real slot, with Redis refusing: the cache read has already failed
+    # open, and the slot must not turn the outage into a failed lookup.
+    redis_client = mocker.MagicMock()
+    redis_client.eval = AsyncMock(side_effect=redis_asyncio.ConnectionError("redis is down"))
+    mocker.patch("app.services.movebank_connections._client", return_value=redis_client)
+    mocker.patch("app.actions.handlers.movebank_slot", movebank_connections.movebank_slot)
+    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+
+    result = await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
+
+    assert _values(result) == ["10"]
+    redis_client.eval.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_study_lookup_does_not_lose_the_other_labels(integration, mock_movebank_client, cache):
+    cache_get, _ = cache
+    cache_get.return_value = [{"id": "10", "name": "Mara Vultures"}]
+
+    async def _get_study(study_id):
+        if study_id == "500":
+            raise RuntimeError("Movebank answered 500")
+        return {"id": study_id, "name": "New Study"}
+
+    mock_movebank_client.get_study = AsyncMock(side_effect=_get_study)
+
+    result = await action_list_studies(
+        integration=integration, action_config=ListStudiesQuery(ids=["500", "10", "77"])
+    )
+
+    assert _values(result) == ["10", "77"]
+
+
+@pytest.mark.asyncio
+async def test_a_saved_value_that_is_not_an_id_is_never_sent_to_movebank(integration, mock_movebank_client, cache):
+    # allow_free_text means a saved value can be a typo; Movebank IDs are numeric.
+    cache_get, _ = cache
+    cache_get.return_value = [{"id": "10", "name": "Mara Vultures"}]
+    mock_movebank_client.get_study = AsyncMock(return_value=None)
+
+    result = await action_list_studies(integration=integration, action_config=ListStudiesQuery(ids=["12a", "10"]))
+
+    assert _values(result) == ["10"]
+    mock_movebank_client.get_study.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale", [[{"id": "1"}], [1, 2], [{"name": "no id"}]])
+async def test_a_cached_list_of_the_wrong_shape_is_refetched(integration, mock_movebank_client, cache, stale):
+    # An entry written by another revision of the code must read as a miss,
+    # not crash every lookup until its TTL runs out.
+    cache_get, cache_set = cache
+    cache_get.return_value = stale
+    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=INDIVIDUAL_ROWS)
+
+    studies = await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
+    individuals = await action_list_individuals(
+        integration=integration, action_config=ListIndividualsQuery(study_id="5", q="kit")
+    )
+
+    assert _values(studies) == ["10"] and _values(individuals) == ["7"]
+    assert cache_set.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_rows_without_an_id_are_neither_offered_nor_cached(integration, mock_movebank_client, cache):
+    # e.g. a non-CSV body parsed as rows. A blank option is useless, and a
+    # cached row without an id would make the entry read as the wrong shape.
+    _, cache_set = cache
+    mock_movebank_client.get_studies = AsyncMock(return_value=[{"name": "Mara ghost"}, *STUDY_ROWS])
+
+    result = await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
+
+    assert _values(result) == ["10"]
+    assert all(row["id"] for row in cache_set.await_args.args[1])

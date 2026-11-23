@@ -99,11 +99,15 @@ New `app/services/reference_cache.py`, modelled on
 `study_attributes_cache.py` (same Redis DB, same fail-open rules: any Redis
 error or corrupt entry falls back to a live fetch).
 
-- Study list key: normalised base URL digest + SHA-256 digest of the
-  username. The list depends on what the account can see, so it must not be
-  shared across accounts; the username is hashed so it is not readable in
-  Redis key listings.
-- Individual list key: base URL digest + username digest + study ID.
+- Study list key: normalised base URL digest + a PBKDF2 digest of the
+  credentials (salted with server and username). A cache hit answers without
+  calling Movebank, and a reference action can run against a draft
+  integration with caller-supplied credentials, so the entry must be
+  reachable only with the password that fetched it. Neither username nor
+  password is readable in the key.
+- Individual list key: the same scope + study ID.
+- A cached entry that is not the shape the current code writes reads as a
+  miss and is refetched. Rows without an ID are not cached or offered.
 - TTL: `REFERENCE_CACHE_TTL_SECONDS`, default 600. Entries hold only the
   fields the options need (ID, name; for individuals also local identifier,
   nick name, ring ID, taxon), not the full CSV rows.
@@ -112,10 +116,17 @@ error or corrupt entry falls back to a live fetch).
 ### Movebank access
 
 - Fetches go through `MovebankClient` under `movebank_slot(username)` like
-  every other call. `NoConnectionSlot` on a cache miss raises an
-  `IntegrationConfigurationError`-style message ("Movebank is busy, try again
-  shortly") so the portal shows its "couldn't load options" state; it never
-  queues behind a backfill.
+  every other call. `NoConnectionSlot` on a cache miss raises
+  `IntegrationRateLimitError("Movebank is busy right now. Try again
+  shortly.")`; it never queues behind a backfill. (Decided after review: busy
+  is retryable provider capacity, not a configuration fault. The runner still
+  reports any reference-handler failure on a saved integration as a failed
+  action; changing that is a template matter.)
+- If Redis is unreachable when taking the slot, the lookup proceeds without
+  one, matching the cache's fail-open rule.
+- A saved study ID missing from the cached list is looked up live; a lookup
+  that fails, or a value that is not numeric, is skipped without losing the
+  other labels.
 - Client purity holds: handlers unpack the auth config and call the client
   with plain values; the cache module takes plain values too.
 
@@ -153,4 +164,4 @@ portal at actions the runner does not have.
   action, params, search and resolve, and no `ui:widget`; a drift guard that
   every annotated action name is a registered reference action.
 - Handler tests: second call within the TTL makes no Movebank request;
-  `NoConnectionSlot` on a miss yields the busy error.
+  `NoConnectionSlot` on a miss yields the busy error; a Redis outage on the slot still answers.

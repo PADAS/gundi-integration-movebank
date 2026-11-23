@@ -33,6 +33,22 @@ def trim_individual(row: dict) -> dict:
     }
 
 
+STUDY_FIELDS = ("id", "name")
+INDIVIDUAL_FIELDS = ("id", "local_identifier", "nick_name", "ring_id", "taxon")
+
+
+def has_shape(rows, fields) -> bool:
+    """Whether a cached list holds the rows this revision writes: dicts with a
+    non-empty string id and every expected field as a string. A list written
+    by another revision of the code fails this and is refetched."""
+    return isinstance(rows, list) and all(
+        isinstance(row, dict)
+        and all(isinstance(row.get(field), str) for field in fields)
+        and row["id"]
+        for row in rows
+    )
+
+
 def _label(name: str, row_id: str) -> str:
     return f"{name} ({row_id})" if name else row_id
 

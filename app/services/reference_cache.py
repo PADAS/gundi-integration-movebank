@@ -33,21 +33,47 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
-def _account_scope(base_url: str, username: str) -> str:
-    """Both lists depend on what the account may see, so entries are scoped to
-    the Movebank server and the account. The username is hashed so it cannot
-    be read out of a Redis key listing; the URL only to keep the key tidy."""
+# Slow-hash work factor for the credential part of the key, and the memo that
+# keeps it off the per-keystroke path (keyed by a fast digest, so the memo
+# holds no credentials).
+_KDF_ITERATIONS = 100_000
+_scope_memo = {}
+_SCOPE_MEMO_MAX = 1024
+
+
+def _account_scope(base_url: str, username: str, password: str) -> str:
+    """Scope an entry to the Movebank server and the exact credentials that
+    fetched it.
+
+    A cache hit answers without calling Movebank, so nothing re-checks the
+    password: an entry keyed by username alone would hand one account's lists
+    to anyone naming that username (a reference action runs against a draft
+    integration with caller-supplied credentials). Binding the key to the
+    password means a caller without it cannot reach the entry.
+
+    The password goes through PBKDF2, salted with the server and username, so
+    a Redis key listing is not a cheap way to test password guesses.
+    """
     normalized_url = (base_url or "").strip().rstrip("/")
-    normalized_username = (username or "").strip().lower()
-    return f"{_digest(normalized_url)}:{_digest(normalized_username)}"
+    normalized_username = (username or "").strip()
+    salt = f"{normalized_url}|{normalized_username}".encode("utf-8")
+    secret = (password or "").encode("utf-8")
+    memo_key = hashlib.sha256(salt + b"|" + secret).digest()
+    credential_digest = _scope_memo.get(memo_key)
+    if credential_digest is None:
+        credential_digest = hashlib.pbkdf2_hmac("sha256", secret, salt, _KDF_ITERATIONS).hex()[:32]
+        if len(_scope_memo) >= _SCOPE_MEMO_MAX:
+            _scope_memo.clear()
+        _scope_memo[memo_key] = credential_digest
+    return f"{_digest(normalized_url)}:{credential_digest}"
 
 
-def studies_key(base_url: str, username: str) -> str:
-    return f"movebank:reference:studies:{_account_scope(base_url, username)}"
+def studies_key(base_url: str, username: str, password: str) -> str:
+    return f"movebank:reference:studies:{_account_scope(base_url, username, password)}"
 
 
-def individuals_key(base_url: str, username: str, study_id: str) -> str:
-    return f"movebank:reference:individuals:{_account_scope(base_url, username)}:{study_id}"
+def individuals_key(base_url: str, username: str, password: str, study_id: str) -> str:
+    return f"movebank:reference:individuals:{_account_scope(base_url, username, password)}:{study_id}"
 
 
 async def get_cached_list(key: str) -> Optional[list]:

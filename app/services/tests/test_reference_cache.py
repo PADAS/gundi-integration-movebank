@@ -29,33 +29,47 @@ def fake_redis(mocker):
     reference_cache._shared_client = None
 
 
+URL = "https://www.movebank.org"
+
+
 def test_keys_separate_accounts_and_hide_the_username():
-    a = studies_key("https://www.movebank.org", "alice")
-    b = studies_key("https://www.movebank.org/", " Alice ")
-    c = studies_key("https://www.movebank.org", "bob")
+    a = studies_key(URL, "alice", "pw")
+    b = studies_key(URL + "/", " alice ", "pw")
+    c = studies_key(URL, "bob", "pw")
     assert a.startswith("movebank:reference:studies:")
     assert a == b and a != c
     assert "alice" not in a.lower()
 
 
+def test_keys_are_bound_to_the_password():
+    # A cache hit answers without calling Movebank, so the entry must only be
+    # reachable by a caller holding the same credentials that fetched it: a
+    # draft integration naming someone else's username must miss.
+    right = studies_key(URL, "alice", "correct horse")
+    wrong = studies_key(URL, "alice", "guess")
+    assert right != wrong
+    assert "correct horse" not in right
+    assert individuals_key(URL, "alice", "correct horse", "1") != individuals_key(URL, "alice", "guess", "1")
+    # Stable across calls, so the cache is actually shared.
+    assert right == studies_key(URL, "alice", "correct horse")
+
+
 def test_keys_separate_movebank_servers():
-    assert studies_key("https://www.movebank.org", "alice") != studies_key(
-        "https://test.movebank.org", "alice"
-    )
+    assert studies_key(URL, "alice", "pw") != studies_key("https://test.movebank.org", "alice", "pw")
 
 
 def test_individuals_key_includes_the_study():
-    key = individuals_key("u", "alice", "1")
+    key = individuals_key("u", "alice", "pw", "1")
     assert key.startswith("movebank:reference:individuals:")
     assert key.endswith(":1")
-    assert key != individuals_key("u", "alice", "2")
-    assert key != individuals_key("u", "bob", "1")
+    assert key != individuals_key("u", "alice", "pw", "2")
+    assert key != individuals_key("u", "bob", "pw", "1")
     assert "alice" not in key.lower()
 
 
 @pytest.mark.asyncio
 async def test_roundtrip_uses_the_ttl_setting(fake_redis):
-    key = studies_key("u", "alice")
+    key = studies_key("u", "alice", "pw")
     await set_cached_list(key, [{"id": "1"}])
 
     args, kwargs = fake_redis.set.call_args
