@@ -6,8 +6,47 @@ from pydantic import Field, SecretStr, root_validator, validator
 
 from app.actions import AuthActionConfiguration, ExecutableActionMixin, PullActionConfiguration
 from app.actions.client import Individual
-from app.actions.core import GenericActionConfiguration, InternalActionConfiguration
+from app.actions.core import (
+    GenericActionConfiguration,
+    InternalActionConfiguration,
+    ReferenceActionConfiguration,
+)
 from app.services.utils import GlobalUISchemaOptions
+
+
+def _reference(
+    action: str,
+    params: Optional[dict] = None,
+    search: Optional[dict] = None,
+    resolve: Optional[dict] = None,
+) -> dict:
+    """Build a gundi:reference ui_schema annotation (same shape as the helper
+    in gundi-integration-inaturalist). The portal renders the annotated field
+    as a live picker fed by this runner's reference action of that name.
+    Deliberately does NOT set ui:widget: portals without reference support
+    must keep rendering plain text fields. allow_free_text stays on so a raw
+    Movebank ID can always be typed."""
+    annotation = {
+        "action": action,
+        "target": "self",
+        "params": params or {},
+        "allow_free_text": True,
+    }
+    if search:
+        annotation["search"] = search
+    if resolve:
+        annotation["resolve"] = resolve
+    return annotation
+
+
+# Typeahead contract: the portal sends the typed text as `q` once it is two
+# characters long, and sends saved values as `ids` to get their labels back.
+_SEARCH = {"param": "q", "min_chars": 2}
+_RESOLVE = {"param": "ids"}
+
+
+def _study_reference() -> dict:
+    return _reference("list_studies", search=_SEARCH, resolve=_RESOLVE)
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
@@ -32,6 +71,12 @@ class PullObservationsConfig(PullActionConfiguration):
             "Override this on a manual run to backfill historical data."
         ),
     )
+
+    @classmethod
+    def ui_schema(cls, *args, **kwargs):
+        base = super().ui_schema(*args, **kwargs)
+        base["study_id"] = {**base.get("study_id", {}), "gundi:reference": _study_reference()}
+        return base
 
 
 class PullEventsForIndividualConfig(InternalActionConfiguration):
@@ -88,6 +133,26 @@ class BackfillConfig(GenericActionConfiguration, ExecutableActionMixin):
         order=["study_id", "individual_ids", "start", "backfill_max_concurrency", "dry_run", "restart", "cancel"],
     )
 
+    @classmethod
+    def ui_schema(cls, *args, **kwargs):
+        """Study and individuals are searchable pickers. The individuals
+        lookup is scoped to the study chosen above it: '../study_id' climbs
+        from the individual_ids array to the root config, and the portal
+        holds the fetch until a study is set."""
+        base = super().ui_schema(*args, **kwargs)
+        base["study_id"] = {**base.get("study_id", {}), "gundi:reference": _study_reference()}
+        individual_ids = base.get("individual_ids", {})
+        base["individual_ids"] = {**individual_ids, "items": {
+            **individual_ids.get("items", {}),
+            "gundi:reference": _reference(
+                "list_individuals",
+                params={"study_id": {"$data": "../study_id"}},
+                search=_SEARCH,
+                resolve=_RESOLVE,
+            ),
+        }}
+        return base
+
     @validator("individual_ids")
     def _canonical_individual_ids(cls, value):
         # Canonical form: deduped and sorted. The job_id is hashed from these,
@@ -137,3 +202,54 @@ class BackfillEventsForIndividualConfig(InternalActionConfiguration):
     # rejected by the claim instead of racing the new chain. Empty on messages
     # published before this field existed, which the claim does not check.
     run_id: str = ""
+
+
+def _coerce_id_list(value):
+    """Accept a list, a scalar or a comma-separated string and return a
+    deduped list of ID strings in the order given, or None when empty. The
+    portal sends a list; anything else must still never be a 422."""
+    if value is None:
+        return None
+    items = value if isinstance(value, (list, tuple, set)) else [value]
+    ids = []
+    for item in items:
+        for part in str(item).split(","):
+            part = part.strip()
+            if part and part not in ids:
+                ids.append(part)
+    return ids or None
+
+
+class ListStudiesQuery(ReferenceActionConfiguration):
+    """Reference query: Movebank studies the account can see, by typed search.
+
+    Every param is optional: a widget that predates search support fetches
+    with none and must get a clean empty answer, never a 422.
+    """
+    q: Optional[str] = Field(None, title="Search text")
+    ids: Optional[List[str]] = Field(
+        None,
+        title="Study IDs",
+        description="Saved values to label: returns these studies instead of searching.",
+    )
+
+    _coerce_ids = validator("ids", pre=True, allow_reuse=True)(_coerce_id_list)
+
+
+class ListIndividualsQuery(ReferenceActionConfiguration):
+    """Reference query: the individuals of one study, by typed search."""
+    study_id: Optional[str] = Field(None, title="Movebank Study ID")
+    q: Optional[str] = Field(None, title="Search text")
+    ids: Optional[List[str]] = Field(
+        None,
+        title="Individual IDs",
+        description="Saved values to label: returns these individuals instead of searching.",
+    )
+
+    _coerce_ids = validator("ids", pre=True, allow_reuse=True)(_coerce_id_list)
+
+    @validator("study_id", pre=True)
+    def _clean_study_id(cls, value):
+        if value is None:
+            return None
+        return str(value).strip() or None

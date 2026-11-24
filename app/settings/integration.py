@@ -11,6 +11,11 @@ MOVEBANK_MAX_CONNECTIONS = env.int("MOVEBANK_MAX_CONNECTIONS", 25)
 # individual re-fetches it on every tick, because movebank-client's own cache
 # lives on the client instance and each sub-action builds a fresh client.
 MOVEBANK_STUDY_ATTRIBUTES_TTL_SECONDS = env.int("MOVEBANK_STUDY_ATTRIBUTES_TTL_SECONDS", 21600)  # 6h
+# How long the study and individual lists behind the portal's pickers are
+# cached in Redis, per Movebank account. The portal queries on every keystroke
+# and Movebank has no name search, so without this each keystroke would
+# download the full list and take a connection slot.
+REFERENCE_CACHE_TTL_SECONDS = env.int("REFERENCE_CACHE_TTL_SECONDS", 600)  # 10 min
 # Accessory-measurements records can arrive at Movebank hours after their
 # timestamp; the accessory query re-reads this many hours so late arrivals are
 # caught (the event-id filter drops already-sent events, so no duplicates).

@@ -114,3 +114,97 @@ def test_backfill_config_normalizes_individual_ids():
     # job_id is hashed from them, and cancel/restart have to reproduce it.
     config = BackfillConfig(study_id="12345", start="all", individual_ids=["222", "111", "222"])
     assert config.individual_ids == ["111", "222"]
+
+
+# --- Searchable reference pickers -------------------------------------------
+
+from app.actions.configurations import (  # noqa: E402
+    BackfillConfig,
+    ListIndividualsQuery,
+    ListStudiesQuery,
+)
+from app.actions.core import ReferenceActionConfiguration, discover_actions  # noqa: E402
+
+STUDY_REF = {
+    "action": "list_studies", "target": "self", "params": {}, "allow_free_text": True,
+    "search": {"param": "q", "min_chars": 2}, "resolve": {"param": "ids"},
+}
+
+
+def test_pull_config_study_id_is_a_searchable_reference():
+    ui = PullObservationsConfig.ui_schema()
+    assert ui["study_id"]["gundi:reference"] == STUDY_REF
+    # The portal picks the widget; one without reference support keeps a text field.
+    assert "ui:widget" not in ui["study_id"]
+
+
+def test_backfill_config_references_and_keeps_its_field_order():
+    ui = BackfillConfig.ui_schema()
+    assert ui["study_id"]["gundi:reference"] == STUDY_REF
+    assert "ui:widget" not in ui["study_id"]
+    assert ui["individual_ids"] == {"items": {"gundi:reference": {
+        "action": "list_individuals", "target": "self",
+        "params": {"study_id": {"$data": "../study_id"}}, "allow_free_text": True,
+        "search": {"param": "q", "min_chars": 2}, "resolve": {"param": "ids"},
+    }}}
+    assert ui["ui:order"] == [
+        "study_id", "individual_ids", "start", "backfill_max_concurrency", "dry_run", "restart", "cancel",
+    ]
+
+
+def test_reference_annotations_do_not_leak_into_the_json_schema():
+    for model in (PullObservationsConfig, BackfillConfig):
+        assert "gundi:reference" not in model.schema_json()
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("12,13", ["12", "13"]),
+    (12, ["12"]),
+    (["12", "12", " 13 "], ["12", "13"]),
+    (["12,13", 14], ["12", "13", "14"]),
+    (None, None),
+    ([], None),
+    ("", None),
+    (" , ", None),
+])
+def test_query_ids_are_coerced(raw, expected):
+    assert ListStudiesQuery(ids=raw).ids == expected
+    assert ListIndividualsQuery(study_id=1, ids=raw).ids == expected
+
+
+def test_individuals_query_study_id_is_a_stripped_string():
+    assert ListIndividualsQuery(study_id=123).study_id == "123"
+    assert ListIndividualsQuery(study_id=" 123 ").study_id == "123"
+    assert ListIndividualsQuery(study_id="  ").study_id is None
+
+
+def test_queries_accept_no_params_at_all():
+    # A widget that predates search support fetches with no params; that must
+    # be a clean empty answer, never a 422.
+    assert ListStudiesQuery().q is None and ListStudiesQuery().ids is None
+    assert ListIndividualsQuery().study_id is None
+
+
+def test_query_models_are_reference_actions():
+    assert issubclass(ListStudiesQuery, ReferenceActionConfiguration)
+    assert issubclass(ListIndividualsQuery, ReferenceActionConfiguration)
+
+
+def _annotated_actions(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "gundi:reference":
+                yield value["action"]
+            else:
+                yield from _annotated_actions(value)
+
+
+def test_every_annotated_action_is_a_registered_reference_action():
+    handlers = discover_actions("app.actions.handlers", "action_")
+    annotated = set()
+    for model in (PullObservationsConfig, BackfillConfig):
+        annotated.update(_annotated_actions(model.ui_schema()))
+    assert annotated == {"list_studies", "list_individuals"}
+    for action in annotated:
+        assert action in handlers, f"no handler for annotated action '{action}'"
+        assert issubclass(handlers[action][1], ReferenceActionConfiguration)
