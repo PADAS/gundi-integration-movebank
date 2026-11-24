@@ -53,7 +53,7 @@ def _values(result):
 @pytest.mark.asyncio
 async def test_list_studies_searches_the_fetched_list_and_caches_it(integration, mock_movebank_client, cache):
     _, cache_set = cache
-    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=STUDY_ROWS)
 
     result = await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
 
@@ -87,7 +87,7 @@ async def test_list_studies_cache_hit_makes_no_movebank_request(
 
 @pytest.mark.asyncio
 async def test_list_studies_empty_query_returns_nothing_truncated(integration, mock_movebank_client, cache):
-    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=STUDY_ROWS)
 
     result = await action_list_studies(integration=integration, action_config=ListStudiesQuery())
 
@@ -96,8 +96,8 @@ async def test_list_studies_empty_query_returns_nothing_truncated(integration, m
 
 @pytest.mark.asyncio
 async def test_list_studies_resolves_saved_ids_in_order(integration, mock_movebank_client, cache):
-    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
-    mock_movebank_client.get_study = AsyncMock()
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_accessible_study = AsyncMock()
 
     result = await action_list_studies(
         integration=integration, action_config=ListStudiesQuery(ids=["33", "10"], q="ignored")
@@ -105,7 +105,7 @@ async def test_list_studies_resolves_saved_ids_in_order(integration, mock_moveba
 
     assert _values(result) == ["33", "10"]
     assert result["truncated"] is False
-    mock_movebank_client.get_study.assert_not_awaited()
+    mock_movebank_client.get_accessible_study.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -114,13 +114,13 @@ async def test_list_studies_resolves_an_id_missing_from_the_cache_with_one_live_
 ):
     cache_get, cache_set = cache
     cache_get.return_value = [{"id": "10", "name": "Mara Vultures"}]
-    mock_movebank_client.get_study = AsyncMock(return_value={"id": "77", "name": "New Study", "citation": "x"})
+    mock_movebank_client.get_accessible_study = AsyncMock(return_value={"id": "77", "name": "New Study", "citation": "x"})
 
     result = await action_list_studies(integration=integration, action_config=ListStudiesQuery(ids=["77", "10"]))
 
     assert result["options"][0] == {"value": "77", "label": "New Study (77)", "description": None, "group": None}
     assert _values(result) == ["77", "10"]
-    mock_movebank_client.get_study.assert_awaited_once_with(study_id="77")
+    mock_movebank_client.get_accessible_study.assert_awaited_once_with(study_id="77")
     cache_set.assert_not_awaited()
 
 
@@ -128,7 +128,7 @@ async def test_list_studies_resolves_an_id_missing_from_the_cache_with_one_live_
 async def test_list_studies_unknown_id_is_left_out_not_an_error(integration, mock_movebank_client, cache):
     cache_get, _ = cache
     cache_get.return_value = [{"id": "10", "name": "Mara Vultures"}]
-    mock_movebank_client.get_study = AsyncMock(return_value=None)
+    mock_movebank_client.get_accessible_study = AsyncMock(return_value=None)
 
     result = await action_list_studies(integration=integration, action_config=ListStudiesQuery(ids=["999", "10"]))
 
@@ -147,13 +147,13 @@ async def test_list_studies_when_movebank_is_busy_raises_the_busy_message(
         yield
 
     mocker.patch("app.actions.handlers.movebank_slot", side_effect=_no_slot)
-    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=STUDY_ROWS)
 
     with pytest.raises(IntegrationRateLimitError, match="Movebank is busy"):
         await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
 
     cache_set.assert_not_awaited()
-    mock_movebank_client.get_studies.assert_not_awaited()
+    mock_movebank_client.get_accessible_studies.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -162,20 +162,20 @@ async def test_list_studies_falls_back_to_live_fetch_when_the_cache_is_unavailab
 ):
     # get_cached_list answers None on a Redis outage and set_cached_list swallows
     # its own failure, so the handler sees a miss on every call and still answers.
-    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=STUDY_ROWS)
 
     for _ in range(2):
         result = await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="eleph"))
         assert _values(result) == ["33"]
 
-    assert mock_movebank_client.get_studies.await_count == 2
+    assert mock_movebank_client.get_accessible_studies.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_list_studies_takes_a_connection_slot_for_the_account(
         integration, mock_movebank_client, mock_connection_slot, cache
 ):
-    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=STUDY_ROWS)
 
     await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
 
@@ -242,7 +242,7 @@ async def test_list_individuals_resolves_saved_ids(integration, mock_movebank_cl
 @pytest.mark.asyncio
 async def test_reference_responses_and_cache_writes_carry_no_credentials(integration, mock_movebank_client, cache):
     cache_get, cache_set = cache
-    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=STUDY_ROWS)
     mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=INDIVIDUAL_ROWS)
 
     results = [
@@ -264,7 +264,7 @@ async def test_reference_handlers_are_not_activity_logged(
     publish = mocker.patch("app.services.activity_logger.publish_event", AsyncMock(return_value=None))
     # The portal calls these on every keystroke; they must not write an
     # activity-log entry per call.
-    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=STUDY_ROWS)
     mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=INDIVIDUAL_ROWS)
 
     await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
@@ -289,7 +289,7 @@ async def test_a_different_password_for_the_same_username_misses_the_cache(
         mocker, integration, mock_movebank_client, cache
 ):
     cache_get, _ = cache
-    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=STUDY_ROWS)
 
     await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
     mocker.patch(
@@ -312,7 +312,7 @@ async def test_redis_outage_on_the_connection_slot_still_answers(
     redis_client.eval = AsyncMock(side_effect=redis_asyncio.ConnectionError("redis is down"))
     mocker.patch("app.services.movebank_connections._client", return_value=redis_client)
     mocker.patch("app.actions.handlers.movebank_slot", movebank_connections.movebank_slot)
-    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=STUDY_ROWS)
 
     result = await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
 
@@ -330,7 +330,7 @@ async def test_a_failing_study_lookup_does_not_lose_the_other_labels(integration
             raise RuntimeError("Movebank answered 500")
         return {"id": study_id, "name": "New Study"}
 
-    mock_movebank_client.get_study = AsyncMock(side_effect=_get_study)
+    mock_movebank_client.get_accessible_study = AsyncMock(side_effect=_get_study)
 
     result = await action_list_studies(
         integration=integration, action_config=ListStudiesQuery(ids=["500", "10", "77"])
@@ -344,12 +344,12 @@ async def test_a_saved_value_that_is_not_an_id_is_never_sent_to_movebank(integra
     # allow_free_text means a saved value can be a typo; Movebank IDs are numeric.
     cache_get, _ = cache
     cache_get.return_value = [{"id": "10", "name": "Mara Vultures"}]
-    mock_movebank_client.get_study = AsyncMock(return_value=None)
+    mock_movebank_client.get_accessible_study = AsyncMock(return_value=None)
 
     result = await action_list_studies(integration=integration, action_config=ListStudiesQuery(ids=["12a", "10"]))
 
     assert _values(result) == ["10"]
-    mock_movebank_client.get_study.assert_not_awaited()
+    mock_movebank_client.get_accessible_study.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -359,7 +359,7 @@ async def test_a_cached_list_of_the_wrong_shape_is_refetched(integration, mock_m
     # not crash every lookup until its TTL runs out.
     cache_get, cache_set = cache
     cache_get.return_value = stale
-    mock_movebank_client.get_studies = AsyncMock(return_value=STUDY_ROWS)
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=STUDY_ROWS)
     mock_movebank_client.get_individuals_by_study = AsyncMock(return_value=INDIVIDUAL_ROWS)
 
     studies = await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
@@ -376,9 +376,40 @@ async def test_rows_without_an_id_are_neither_offered_nor_cached(integration, mo
     # e.g. a non-CSV body parsed as rows. A blank option is useless, and a
     # cached row without an id would make the entry read as the wrong shape.
     _, cache_set = cache
-    mock_movebank_client.get_studies = AsyncMock(return_value=[{"name": "Mara ghost"}, *STUDY_ROWS])
+    mock_movebank_client.get_accessible_studies = AsyncMock(return_value=[{"name": "Mara ghost"}, *STUDY_ROWS])
 
     result = await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="mara"))
 
     assert _values(result) == ["10"]
     assert all(row["id"] for row in cache_set.await_args.args[1])
+
+
+# --- PR 41 review: partially shared studies ----------------------------------
+
+@pytest.mark.asyncio
+async def test_a_partially_shared_study_is_searchable_and_labelled(mocker, integration, cache):
+    # The real client against Movebank's CSV, not a handler mock: the pinned
+    # movebank-client filters out a study when some of its data is hidden from
+    # the account, and a mocked get_studies() would never show that.
+    import httpx
+    from movebank_client import MovebankClient as UpstreamClient
+
+    header = "id,name,i_can_see_data,there_are_data_which_i_cannot_see\n"
+    partial = "20,Shared Eagles,true,true\n"
+
+    async def _call_api(self, url="", *, params=(), cookies=None):
+        body = header + ("" if ("study_id", "99") in params else partial)
+        return httpx.Response(200, content=body.encode("utf8"))
+
+    mocker.patch.object(UpstreamClient, "_call_api", _call_api)
+    cache_get, _ = cache
+
+    searched = await action_list_studies(integration=integration, action_config=ListStudiesQuery(q="eagle"))
+    assert searched["options"] == [
+        {"value": "20", "label": "Shared Eagles (20)", "description": None, "group": None}
+    ]
+
+    # Saved value missing from a cached list: resolved by the single-study lookup.
+    cache_get.return_value = [{"id": "10", "name": "Mara Vultures"}]
+    resolved = await action_list_studies(integration=integration, action_config=ListStudiesQuery(ids=["20", "99"]))
+    assert _values(resolved) == ["20"]

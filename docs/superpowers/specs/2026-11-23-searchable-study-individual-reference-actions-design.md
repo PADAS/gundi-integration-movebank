@@ -57,7 +57,7 @@ portal sends `q` while typing and `ids` to label saved values.
 
 - `ids` given: return those studies in the order asked; unknown IDs are left
   out (the portal keeps showing the raw value). An ID missing from the cached
-  list is looked up live with `get_study` before being dropped, so a study
+  list is looked up live (one study by ID) before being dropped, so a study
   shared with the account after the list was cached still gets its label.
 - `q` empty: `options=[]`, `truncated=True`.
 - otherwise: case-insensitive substring match on study name and ID; an exact
@@ -127,6 +127,10 @@ error or corrupt entry falls back to a live fetch).
 - A saved study ID missing from the cached list is looked up live; a lookup
   that fails, or a value that is not numeric, is skipped without losing the
   other labels.
+- Study lookups use the fork client's `get_accessible_studies()` and
+  `get_accessible_study()`, not movebank-client's `get_studies()` and
+  `get_study()`: those drop a study when only part of its data is shared
+  with the account, and pulls work on such a study. (Added after PR review.)
 - Client purity holds: handlers unpack the auth config and call the client
   with plain values; the cache module takes plain values too.
 

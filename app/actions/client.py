@@ -1,3 +1,5 @@
+import csv
+import io
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Optional, Union
@@ -65,6 +67,29 @@ class MovebankClient(_MovebankClient):
                 self.base_url, study_id, sensor_type_id, attributes
             )
         return attributes
+
+    async def _read_study_rows(self, params: tuple) -> list:
+        """Movebank's study CSV for `params`, as rows the account can read.
+
+        movebank-client's get_studies() and get_study() also drop a study when
+        `there_are_data_which_i_cannot_see` is true, i.e. when only part of it
+        is shared with the account. Pulls and backfills work on such a study
+        (they fetch its individuals directly), so the lookups below keep it.
+        """
+        response = await self._call_api(url=self.direct_read_endpoint, params=params)
+        if not response:
+            return []
+        rows = csv.DictReader(io.StringIO(response.content.decode("utf8")), delimiter=",")
+        return [row for row in rows if row.get("i_can_see_data") == "true"]
+
+    async def get_accessible_studies(self) -> list:
+        """Every study the account can read data from, in whole or in part."""
+        return await self._read_study_rows((("entity_type", "study"), ("i_can_see_data", "true")))
+
+    async def get_accessible_study(self, study_id: str) -> Optional[dict]:
+        """One study by ID, or None when the account cannot read any of it."""
+        rows = await self._read_study_rows((("entity_type", "study"), ("study_id", study_id)))
+        return rows[0] if rows else None
 
 
 def get_auth_config(integration):

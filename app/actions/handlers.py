@@ -297,7 +297,7 @@ async def _lookup_uncached_studies(integration, auth_config, study_ids: list) ->
     async with _reference_movebank(integration, auth_config) as mb:
         for study_id in study_ids:
             try:
-                row = await mb.get_study(study_id=study_id)
+                row = await mb.get_accessible_study(study_id=study_id)
             except Exception as exc:
                 logger.warning(f"Could not look up study {study_id} for integration {integration.id}: {type(exc).__name__}")
                 continue
@@ -321,7 +321,7 @@ async def action_list_studies(integration, action_config: ListStudiesQuery):
     )
     studies = await _cached_reference_list(
         integration, auth_config, key,
-        lambda mb: mb.get_studies(), reference_data.trim_study, reference_data.STUDY_FIELDS,
+        lambda mb: mb.get_accessible_studies(), reference_data.trim_study, reference_data.STUDY_FIELDS,
     )
     if not action_config.ids:
         return reference_data.search_studies(studies, action_config.q)

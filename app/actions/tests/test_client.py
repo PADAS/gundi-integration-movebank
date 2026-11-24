@@ -177,3 +177,58 @@ async def test_gps_fetch_falls_back_to_two_requests_on_a_cold_cache(mb_client, h
 
     assert _entity_types(http) == ["study_attribute", "event"]
     set_cached.assert_awaited_once()  # so the next individual pays only one
+
+
+# --- Studies the account can read (reference pickers) ------------------------
+
+STUDY_CSV_HEADER = "id,name,i_can_see_data,there_are_data_which_i_cannot_see\n"
+FULL = "10,Mara Vultures,true,false\n"
+PARTIAL = "20,Shared Eagles,true,true\n"   # the account sees some of the data
+HIDDEN = "30,Private Storks,false,true\n"
+
+
+def _csv_response(body):
+    import httpx
+    return httpx.Response(200, content=(STUDY_CSV_HEADER + body).encode("utf8"))
+
+
+@pytest.fixture
+def call_api(mocker):
+    return mocker.patch.object(_MovebankClient, "_call_api", new=AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_accessible_studies_keep_partially_shared_ones(mb_client, call_api):
+    # movebank-client's get_studies() drops a study when any of its data is
+    # hidden from the account. Pulls work on such a study, so the picker must
+    # offer it.
+    call_api.return_value = _csv_response(FULL + PARTIAL + HIDDEN)
+
+    studies = await mb_client.get_accessible_studies()
+
+    assert [s["id"] for s in studies] == ["10", "20"]
+    params = call_api.await_args.kwargs["params"]
+    assert ("entity_type", "study") in params and ("i_can_see_data", "true") in params
+
+
+@pytest.mark.asyncio
+async def test_accessible_studies_is_empty_for_an_empty_answer(mb_client, call_api):
+    call_api.return_value = _csv_response("")
+    assert await mb_client.get_accessible_studies() == []
+
+
+@pytest.mark.asyncio
+async def test_accessible_study_returns_a_partially_shared_study(mb_client, call_api):
+    call_api.return_value = _csv_response(PARTIAL)
+
+    study = await mb_client.get_accessible_study(study_id="20")
+
+    assert study["name"] == "Shared Eagles"
+    assert ("study_id", "20") in call_api.await_args.kwargs["params"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [HIDDEN, ""])
+async def test_accessible_study_is_none_when_the_account_cannot_read_it(mb_client, call_api, body):
+    call_api.return_value = _csv_response(body)
+    assert await mb_client.get_accessible_study(study_id="30") is None
