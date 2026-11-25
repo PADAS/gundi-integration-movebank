@@ -40,6 +40,26 @@ This is Gundi's integration for pulling data from Movebank Studies.
   first 50. Typing a raw ID into either field still works. Movebank has no
   name search, so each list is fetched whole and cached in Redis per account.
 
+### Shared integration type
+
+The `movebank` integration type in Gundi is not this runner's alone. Other
+services read configurations on the same type, and registering this runner
+(`register_integration_in_gundi`) adds or updates only the actions it
+defines. It never removes the others.
+
+| Action | Owner | Notes |
+|---|---|---|
+| `auth` | this runner (registers it) | Also read by `gundi-movebank-dispatcher` for its Movebank credentials, through `gundi-core`'s `MBAuthActionConfig` (`username`, `password`). Renaming or adding a required field here breaks the dispatcher. |
+| `pull_observations`, `backfill`, `list_studies`, `list_individuals` | this runner | |
+| `push_observations` | `gundi-movebank-dispatcher` | The dispatcher refuses to send without this configuration. |
+| `permissions` | `cdip` (portal backend) | Builds the permissions file sent to Movebank. |
+| `pull_positions`, `fetch_study_individuals` | none found (stage only) | No service code reads them as of 2026-11-24. Left in place. |
+
+Do not remove an action from the type because this repo does not define it.
+`app/actions/tests/test_shared_type_contract.py` fails when a change here
+would break the dispatcher's read of `auth`, or would register an action
+another service owns.
+
 ### Settings
 
 - `MOVEBANK_MAX_CONNECTIONS` (default 25) — shared per-username Movebank
